@@ -68,6 +68,10 @@ impl Indexer {
         }
     }
 
+    pub fn entry_count(&self) -> usize {
+        self.shards.iter().map(|shard| shard.read().len()).sum()
+    }
+
     #[cfg_attr(
         feature = "tracing",
         fastrace::trace(name = "foyer::storage::block::indexer::insert_tombstone")
