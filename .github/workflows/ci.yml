@@ -17,7 +17,7 @@ concurrency:
     cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  RUST_TOOLCHAIN_NIGHTLY: nightly-2025-02-20
+  RUST_TOOLCHAIN_NIGHTLY: nightly-2026-01-23
   CARGO_TERM_COLOR: always
   CACHE_KEY_SUFFIX: 20260110
   CARGO_UDEPS_KEY_SUFFIX: 20260110
@@ -162,7 +162,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest, ubuntu-24.04-arm]
-        rust_toolchain: [stable, 1.85.0]
+        rust_toolchain: [stable, 1.91.0]
         serde: ["", "--features serde"]
     runs-on: ${{ matrix.os }}
     steps:
@@ -219,7 +219,7 @@ jobs:
           RUST_BACKTRACE: 1
           CI: true
         run: |
-          cargo llvm-cov --no-report nextest --features "strict_assertions"
+          cargo llvm-cov --no-report nextest --workspace --features "strict_assertions"
       - name: Run examples with coverage
         env:
           RUST_BACKTRACE: 1
@@ -249,7 +249,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        rust_toolchain: [stable, 1.85.0]
+        rust_toolchain: [stable, 1.91.0]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout

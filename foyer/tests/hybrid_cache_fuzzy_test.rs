@@ -159,7 +159,7 @@ async fn write(hybrid: HybridCache<u64, Vec<u8>>, _: Arc<RecentEvictionQueue>, i
         if key > WRITES as u64 {
             break;
         }
-        if key % INTERVAL as u64 == 0 {
+        if key.is_multiple_of(INTERVAL as u64) {
             tracing::info!("Inserted {key} items");
         }
         for k in key.saturating_sub(DUPLICATES as u64)..=key {
@@ -174,7 +174,7 @@ async fn write(hybrid: HybridCache<u64, Vec<u8>>, _: Arc<RecentEvictionQueue>, i
 }
 
 async fn fetch(hybrid: HybridCache<u64, Vec<u8>>, recent: Arc<RecentEvictionQueue>) {
-    let mut cnt = 0;
+    let mut cnt = 0_u64;
     loop {
         tokio::time::sleep(FETCH_WAIT).await;
         let key = match recent.pick() {
@@ -182,7 +182,7 @@ async fn fetch(hybrid: HybridCache<u64, Vec<u8>>, recent: Arc<RecentEvictionQueu
             None => continue,
         };
 
-        let res = if cnt % ERROR_PER_FETCHES as u64 == 0 {
+        let res = if cnt.is_multiple_of(ERROR_PER_FETCHES as u64) {
             hybrid
                 .get_or_fetch(&key, || async move { Err::<Vec<u8>, _>(Trap) })
                 .await
@@ -201,7 +201,7 @@ async fn fetch(hybrid: HybridCache<u64, Vec<u8>>, recent: Arc<RecentEvictionQueu
         }
 
         cnt += 1;
-        if cnt % INTERVAL as u64 == 0 {
+        if cnt.is_multiple_of(INTERVAL as u64) {
             tracing::info!("Fetch {cnt} items");
         }
         if cnt >= FETCHES as u64 {
@@ -211,7 +211,7 @@ async fn fetch(hybrid: HybridCache<u64, Vec<u8>>, recent: Arc<RecentEvictionQueu
 }
 
 async fn read(hybrid: HybridCache<u64, Vec<u8>>, recent: Arc<RecentEvictionQueue>) {
-    let mut cnt = 0;
+    let mut cnt = 0_u64;
     loop {
         tokio::time::sleep(READ_WAIT).await;
         let key = match recent.pick() {
@@ -230,7 +230,7 @@ async fn read(hybrid: HybridCache<u64, Vec<u8>>, recent: Arc<RecentEvictionQueue
         }
 
         cnt += 1;
-        if cnt % INTERVAL as u64 == 0 {
+        if cnt.is_multiple_of(INTERVAL as u64) {
             tracing::info!("Read {cnt} items");
         }
         if cnt >= READS as u64 {

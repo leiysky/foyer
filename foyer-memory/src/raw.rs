@@ -1231,11 +1231,10 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        // TODO(MrCroxx): Switch to `Result::flatten` after MSRV is 1.89+
-        // return waiter.poll_unpin(cx).map(|r| r.map_err(|e| e.into()).flatten());
-        this.waiter.poll_unpin(cx).map(|r| match r {
-            Ok(r) => r,
-            Err(e) => Err(Error::new(ErrorKind::ChannelClosed, "waiter channel closed").with_source(e)),
+        this.waiter.poll_unpin(cx).map(|result| {
+            result
+                .map_err(|error| Error::new(ErrorKind::ChannelClosed, "waiter channel closed").with_source(error))
+                .flatten()
         })
     }
 }

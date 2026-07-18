@@ -42,7 +42,7 @@ impl IopsCounter {
     pub fn count(&self, bytes: usize) -> usize {
         match self {
             IopsCounter::PerIo => 1,
-            IopsCounter::PerIoSize(size) => bytes / *size + if bytes % *size != 0 { 1 } else { 0 },
+            IopsCounter::PerIoSize(size) => bytes.div_ceil(size.get()),
         }
     }
 }
