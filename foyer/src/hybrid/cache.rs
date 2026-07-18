@@ -349,6 +349,11 @@ where
     S: HashBuilder + Debug,
 {
     fn drop(&mut self) {
+        // An explicit close already drained and closed storage. Avoid retaining another storage
+        // clone in a redundant asynchronous close, which can delay an immediate reopen.
+        if self.closed.load(Ordering::Relaxed) {
+            return;
+        }
         let name = self.name.clone();
         let closed = self.closed.clone();
         let memory = self.memory.clone();
