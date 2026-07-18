@@ -24,3 +24,9 @@ mod hybrid;
 
 mod prelude;
 pub use prelude::*;
+
+/// Version of the fork-specific pluggable disk-engine contract.
+///
+/// External engines use this constant as a compile-time guard against accidentally mixing an
+/// engine crate with an incompatible Foyer revision.
+pub const DISK_ENGINE_API_VERSION: u32 = 1;

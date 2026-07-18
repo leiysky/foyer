@@ -22,13 +22,14 @@ pub use crate::{
             eviction::{EvictionInfo, EvictionPicker, FifoPicker, InvalidRatioPicker},
             manager::{Block, BlockStatistics},
         },
-        Engine, EngineBuildContext, EngineConfig, Load, Populated, RecoverMode,
+        Engine, EngineBuildContext, EngineConfig, Load, Populated, RecoverMode, StorageUsage,
     },
     filter::{
         conditions::{AdmitAll, EstimatedSize, RejectAll},
         StorageFilter, StorageFilterCondition, StorageFilterResult,
     },
     io::{
+        control::IoControl,
         device::{
             combined::CombinedDeviceBuilder,
             file::FileDeviceBuilder,
@@ -45,5 +46,6 @@ pub use crate::{
             IoEngine, IoEngineConfig, IoHandle,
         },
     },
+    keeper::PieceRef,
     store::{Store, StoreBuilder},
 };

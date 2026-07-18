@@ -31,17 +31,17 @@ use foyer_common::{
 };
 use foyer_memory::{Cache, Piece};
 
-#[cfg(feature = "test_utils")]
+#[cfg(any(test, feature = "test_utils"))]
 use crate::test_utils::*;
 use crate::{
     compress::Compression,
     engine::{
         noop::{NoopEngine, NoopEngineConfig},
-        Engine, EngineBuildContext, EngineConfig, Load, Populated, RecoverMode,
+        Engine, EngineBuildContext, EngineConfig, Load, Populated, RecoverMode, StorageUsage,
     },
     io::{
-        device::{statistics::Statistics, throttle::Throttle, Device},
-        engine::{monitor::MonitoredIoEngine, psync::PsyncIoEngineConfig, IoEngineBuildContext, IoEngineConfig},
+        control::IoControl,
+        device::{statistics::Statistics, throttle::Throttle},
     },
     keeper::Keeper,
     serde::EntrySerializer,
@@ -159,7 +159,7 @@ where
     /// Load a cache entry from the disk cache.
     pub async fn load<Q>(&self, key: &Q) -> Result<Load<K, V, P>>
     where
-        Q: Hash + Equivalent<K> + ?Sized,
+        Q: Hash + Equivalent<K> + ToOwned<Owned = K> + ?Sized,
     {
         let now = Instant::now();
 
@@ -173,7 +173,7 @@ where
             });
         }
 
-        #[cfg(feature = "test_utils")]
+        #[cfg(any(test, feature = "test_utils"))]
         if self.inner.load_throttle_switch.is_throttled() {
             self.inner.metrics.storage_throttled.increase(1);
             self.inner
@@ -183,7 +183,7 @@ where
             return Ok(Load::Throttled);
         }
 
-        match self.inner.engine.load(hash).await {
+        match self.inner.engine.load(key.to_owned(), hash).await {
             Ok(Load::Entry {
                 key: k,
                 value: v,
@@ -234,12 +234,12 @@ where
     /// Delete the cache entry with the given key from the disk cache.
     pub fn delete<'a, Q>(&'a self, key: &'a Q)
     where
-        Q: Hash + Equivalent<K> + ?Sized,
+        Q: Hash + Equivalent<K> + ToOwned<Owned = K> + ?Sized,
     {
         let now = Instant::now();
 
         let hash = self.inner.hasher.hash_one(key);
-        self.inner.engine.delete(hash);
+        self.inner.engine.delete(key.to_owned(), hash);
 
         self.inner.metrics.storage_delete.increase(1);
         self.inner
@@ -264,19 +264,24 @@ where
         self.inner.engine.destroy().await
     }
 
-    /// Get the device of the disk cache.
-    pub fn device(&self) -> &Arc<dyn Device> {
-        self.inner.engine.device()
+    /// Get the storage usage reported by the disk cache engine.
+    pub fn storage_usage(&self) -> StorageUsage {
+        self.inner.engine.storage_usage()
+    }
+
+    /// Get the engine-level I/O control plane.
+    pub fn io_control(&self) -> &IoControl {
+        self.inner.engine.io_control()
     }
 
     /// Get the statistics information of the disk cache.
     pub fn statistics(&self) -> &Arc<Statistics> {
-        self.inner.engine.device().statistics()
+        self.io_control().statistics()
     }
 
     /// Get the io throttle of the disk cache.
     pub fn throttle(&self) -> &Throttle {
-        self.inner.engine.device().statistics().throttle()
+        self.io_control().throttle()
     }
 
     /// Get the spawner.
@@ -295,7 +300,7 @@ where
     }
 
     /// Get the load throttle switch for the disk cache.
-    #[cfg(feature = "test_utils")]
+    #[cfg(any(test, feature = "test_utils"))]
     pub fn load_throttle_switch(&self) -> &LoadThrottleSwitch {
         &self.inner.load_throttle_switch
     }
@@ -318,7 +323,6 @@ where
     memory: Cache<K, V, S, P>,
     metrics: Arc<Metrics>,
 
-    io_engine_config: Option<Box<dyn IoEngineConfig>>,
     engine_config: Option<Box<dyn EngineConfig<K, V, P>>>,
 
     spawner: Option<Spawner>,
@@ -342,7 +346,6 @@ where
             .field("name", &self.name)
             .field("memory", &self.memory)
             .field("metrics", &self.metrics)
-            .field("io_engine_builder", &self.io_engine_config)
             .field("engine_builder", &self.engine_config)
             .field("spawner", &self.spawner)
             .field("compression", &self.compression)
@@ -365,7 +368,6 @@ where
             memory,
             metrics,
 
-            io_engine_config: None,
             engine_config: None,
 
             spawner: None,
@@ -375,14 +377,6 @@ where
             #[cfg(any(test, feature = "test_utils"))]
             load_throttle_switch: LoadThrottleSwitch::default(),
         }
-    }
-
-    /// Set io engine config for the disk cache store.
-    ///
-    /// Default: [`crate::io::engine::psync::PsyncIoEngineConfig`].
-    pub fn with_io_engine_config(mut self, io_engine_builder: impl Into<Box<dyn IoEngineConfig>>) -> Self {
-        self.io_engine_config = Some(io_engine_builder.into());
-        self
     }
 
     /// Set engine config for the disk cache store.
@@ -442,20 +436,6 @@ where
 
         let spawner = self.spawner.unwrap_or_else(Spawner::current);
 
-        let io_engine_builder = match self.io_engine_config {
-            Some(builder) => builder,
-            None => {
-                tracing::info!("[store builder]: No I/O engine builder is provided, use `PsyncIoEngineConfig` with default parameters as default.");
-                PsyncIoEngineConfig::new().boxed()
-            }
-        };
-        let io_engine = io_engine_builder
-            .build(IoEngineBuildContext {
-                spawner: spawner.clone(),
-            })
-            .await?;
-        let io_engine = MonitoredIoEngine::new(io_engine, metrics.clone());
-
         let engine_builder = match self.engine_config {
             Some(eb) => eb,
             None => {
@@ -469,7 +449,6 @@ where
 
         let engine = engine_builder
             .build(EngineBuildContext {
-                io_engine,
                 metrics: metrics.clone(),
                 spawner: spawner.clone(),
                 recover_mode: self.recover_mode,
@@ -503,11 +482,7 @@ mod tests {
     use foyer_memory::CacheBuilder;
 
     use super::*;
-    use crate::{
-        engine::block::engine::BlockEngineConfig,
-        io::{device::fs::FsDeviceBuilder, engine::psync::PsyncIoEngineConfig},
-        DeviceBuilder,
-    };
+    use crate::{engine::block::engine::BlockEngineConfig, io::device::fs::FsDeviceBuilder, DeviceBuilder};
 
     #[tokio::test]
     async fn test_build_with_unaligned_buffer_pool_size() {
@@ -515,7 +490,6 @@ mod tests {
         let metrics = Arc::new(Metrics::noop());
         let memory: Cache<u64, u64> = CacheBuilder::new(10).build();
         let _ = StoreBuilder::new("test", memory, metrics)
-            .with_io_engine_config(PsyncIoEngineConfig::new())
             .with_engine_config(
                 BlockEngineConfig::new(
                     FsDeviceBuilder::new(dir.path())
@@ -545,7 +519,6 @@ mod tests {
         assert_eq!(memory.hash(e1.key()), memory.hash(e2.key()));
 
         let store = StoreBuilder::new("test", memory, metrics)
-            .with_io_engine_config(PsyncIoEngineConfig::new())
             .with_engine_config(
                 BlockEngineConfig::new(
                     FsDeviceBuilder::new(dir.path())

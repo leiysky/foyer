@@ -24,7 +24,7 @@ use foyer_common::{
 use foyer_memory::Piece;
 use futures_core::future::BoxFuture;
 
-use crate::{filter::StorageFilterResult, io::engine::IoEngine, keeper::PieceRef, Device};
+use crate::{filter::StorageFilterResult, io::control::IoControl, keeper::PieceRef};
 
 /// Source context for populated entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,14 +122,38 @@ pub enum RecoverMode {
 
 /// Context for building the disk cache engine.
 pub struct EngineBuildContext {
-    /// IO engine for the disk cache engine.
-    pub io_engine: Arc<dyn IoEngine>,
     /// Shared metrics for all components.
     pub metrics: Arc<Metrics>,
     /// The runtime for the disk cache engine.
     pub spawner: Spawner,
     /// The recover mode of the disk cache engine.
     pub recover_mode: RecoverMode,
+}
+
+/// Storage capacity and allocation reported by a disk cache engine.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StorageUsage {
+    capacity: usize,
+    allocated: usize,
+}
+
+impl StorageUsage {
+    /// Create a storage usage snapshot.
+    pub const fn new(capacity: usize, allocated: usize) -> Self {
+        Self { capacity, allocated }
+    }
+
+    /// Get the maximum storage bytes governed by the engine.
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Get the bytes currently allocated by the engine.
+    ///
+    /// This may include unused space reserved by a preallocated file or raw device partition.
+    pub const fn allocated(&self) -> usize {
+        self.allocated
+    }
 }
 
 /// Disk cache engine config trait.
@@ -159,8 +183,11 @@ where
     V: StorageValue,
     P: Properties,
 {
-    /// Get the device used by this disk cache engine.
-    fn device(&self) -> &Arc<dyn Device>;
+    /// Get the storage usage reported by this disk cache engine.
+    fn storage_usage(&self) -> StorageUsage;
+
+    /// Get the engine-level I/O statistics and throttling state.
+    fn io_control(&self) -> &IoControl;
 
     /// Return if the given key can be picked by the disk cache engine.
     fn filter(&self, hash: u64, estimated_size: usize) -> StorageFilterResult;
@@ -170,12 +197,15 @@ where
 
     /// Load a cache entry from the disk cache.
     ///
+    /// `key` is the complete lookup key and `hash` is Foyer's routing hash. Hash-indexed engines
+    /// may ignore `key`; engines with their own exact index may ignore `hash`.
+    ///
     /// `load` may return a false-positive result on entry key hash collision. It's the caller's responsibility to
     /// check if the returned key matches the given key.
-    fn load(&self, hash: u64) -> BoxFuture<'static, Result<Load<K, V, P>>>;
+    fn load(&self, key: K, hash: u64) -> BoxFuture<'static, Result<Load<K, V, P>>>;
 
-    /// Delete the cache entry with the given key from the disk cache.
-    fn delete(&self, hash: u64);
+    /// Delete the cache entry with the given complete key and routing hash from the disk cache.
+    fn delete(&self, key: K, hash: u64);
 
     /// Check if the disk cache contains a cached entry with the given key.
     ///

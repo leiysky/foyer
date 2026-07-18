@@ -22,6 +22,7 @@ pub use crate::{
         code::{Code, DefaultHasher, Key, StorageKey, StorageValue, Value},
         error::{Error, ErrorKind, Result},
         event::{Event, EventListener},
+        metrics::Metrics,
         properties::{Age, Hint, Location, Source},
         spawn::Spawner,
         utils::{option::OptionExt, range::RangeBoundsExt, scope::Scope},
@@ -38,9 +39,9 @@ pub use crate::{
     storage::{
         AdmitAll, Block, BlockEngineConfig, BlockStatistics, CombinedDeviceBuilder, Compression, Device, DeviceBuilder,
         Engine, EngineBuildContext, EngineConfig, EstimatedSize, EvictionInfo, EvictionPicker, FifoPicker,
-        FileDeviceBuilder, FsDeviceBuilder, InvalidRatioPicker, IoEngine, IoEngineConfig, IoHandle, IopsCounter, Load,
-        NoopDeviceBuilder, NoopIoEngine, NoopIoEngineConfig, PartialDeviceBuilder, PsyncIoEngine, PsyncIoEngineConfig,
-        RawFile, RecoverMode, RejectAll, Statistics, StorageFilter, StorageFilterCondition, StorageFilterResult, Store,
-        StoreBuilder, Throttle,
+        FileDeviceBuilder, FsDeviceBuilder, InvalidRatioPicker, IoControl, IoEngine, IoEngineConfig, IoHandle,
+        IopsCounter, Load, NoopDeviceBuilder, NoopIoEngine, NoopIoEngineConfig, PartialDeviceBuilder, PieceRef,
+        Populated, PsyncIoEngine, PsyncIoEngineConfig, RawFile, RecoverMode, RejectAll, Statistics, StorageFilter,
+        StorageFilterCondition, StorageFilterResult, StorageUsage, Store, StoreBuilder, Throttle,
     },
 };

@@ -23,9 +23,10 @@ use futures_core::future::BoxFuture;
 use futures_util::FutureExt;
 
 use crate::{
-    engine::{Engine, EngineBuildContext, EngineConfig},
+    engine::{Engine, EngineBuildContext, EngineConfig, StorageUsage},
+    io::control::IoControl,
     keeper::PieceRef,
-    Device, DeviceBuilder, Load, NoopDeviceBuilder, StorageFilterResult,
+    Load, StorageFilterResult,
 };
 
 pub struct NoopEngineConfig<K, V, P>(PhantomData<(K, V, P)>)
@@ -63,10 +64,8 @@ where
     P: Properties,
 {
     pub fn build(self) -> Arc<NoopEngine<K, V, P>> {
-        let device = NoopDeviceBuilder::default().build().unwrap();
-        let device: Arc<dyn Device> = device;
         Arc::new(NoopEngine {
-            device,
+            io_control: IoControl::default(),
             marker: PhantomData,
         })
     }
@@ -100,7 +99,7 @@ where
     V: StorageValue,
     P: Properties,
 {
-    device: Arc<dyn Device>,
+    io_control: IoControl,
     marker: PhantomData<(K, V, P)>,
 }
 
@@ -121,8 +120,12 @@ where
     V: StorageValue,
     P: Properties,
 {
-    fn device(&self) -> &Arc<dyn Device> {
-        &self.device
+    fn storage_usage(&self) -> StorageUsage {
+        StorageUsage::default()
+    }
+
+    fn io_control(&self) -> &IoControl {
+        &self.io_control
     }
 
     fn filter(&self, _: u64, _: usize) -> StorageFilterResult {
@@ -131,11 +134,11 @@ where
 
     fn enqueue(&self, _: PieceRef<K, V, P>, _: usize) {}
 
-    fn load(&self, _: u64) -> BoxFuture<'static, Result<Load<K, V, P>>> {
+    fn load(&self, _: K, _: u64) -> BoxFuture<'static, Result<Load<K, V, P>>> {
         async move { Ok(Load::Miss) }.boxed()
     }
 
-    fn delete(&self, _: u64) {}
+    fn delete(&self, _: K, _: u64) {}
 
     fn may_contains(&self, _: u64) -> bool {
         false
