@@ -52,6 +52,25 @@ pub struct Metrics {
     pub storage_queue_buffer_overflow: BoxedCounter,
     pub storage_queue_channel_overflow: BoxedCounter,
 
+    pub storage_engine_command_accepted: BoxedCounter,
+    pub storage_engine_command_dropped: BoxedCounter,
+    pub storage_engine_command_completed: BoxedCounter,
+    pub storage_engine_command_rejected: BoxedCounter,
+    pub storage_engine_batch_completed: BoxedCounter,
+    pub storage_engine_batch_failed: BoxedCounter,
+
+    pub storage_engine_queue_pending_entries: BoxedGauge,
+    pub storage_engine_queue_pending_bytes: BoxedGauge,
+    pub storage_engine_queue_capacity_entries: BoxedGauge,
+    pub storage_engine_queue_capacity_bytes: BoxedGauge,
+
+    pub storage_engine_checkpoint_published: BoxedGauge,
+    pub storage_engine_checkpoint_requested: BoxedGauge,
+    pub storage_engine_checkpoint_durable: BoxedGauge,
+    pub storage_engine_checkpoint_in_flight: BoxedGauge,
+    pub storage_engine_checkpoint_dirty: BoxedGauge,
+    pub storage_engine_healthy: BoxedGauge,
+
     pub storage_disk_write: BoxedCounter,
     pub storage_disk_read: BoxedCounter,
     pub storage_disk_flush: BoxedCounter,
@@ -165,6 +184,37 @@ impl Metrics {
             Buckets::exponential(0.000_001, 2.0, 25),
         );
 
+        let foyer_storage_engine_command_total = registry.register_counter_vec(
+            "foyer_storage_engine_command_total".into(),
+            "foyer disk engine asynchronous command state transitions".into(),
+            &["name", "state"],
+        );
+        let foyer_storage_engine_batch_total = registry.register_counter_vec(
+            "foyer_storage_engine_batch_total".into(),
+            "foyer disk engine asynchronous batch outcomes".into(),
+            &["name", "outcome"],
+        );
+        let foyer_storage_engine_queue_entries = registry.register_gauge_vec(
+            "foyer_storage_engine_queue_entries".into(),
+            "foyer disk engine queue entries".into(),
+            &["name", "state"],
+        );
+        let foyer_storage_engine_queue_bytes = registry.register_gauge_vec(
+            "foyer_storage_engine_queue_bytes".into(),
+            "foyer disk engine queue bytes".into(),
+            &["name", "state"],
+        );
+        let foyer_storage_engine_checkpoint = registry.register_gauge_vec(
+            "foyer_storage_engine_checkpoint".into(),
+            "foyer disk engine checkpoint frontiers and dirty work".into(),
+            &["name", "measure"],
+        );
+        let foyer_storage_engine_healthy = registry.register_gauge_vec(
+            "foyer_storage_engine_healthy".into(),
+            "whether the foyer disk engine background pipeline is healthy".into(),
+            &["name"],
+        );
+
         let foyer_storage_disk_io_total = registry.register_counter_vec(
             "foyer_storage_disk_io_total".into(),
             "foyer disk cache disk operations".into(),
@@ -245,6 +295,40 @@ impl Metrics {
 
         let storage_queue_rotate_duration =
             foyer_storage_inner_op_duration.histogram(&[name.clone(), "queue_rotate".into()]);
+
+        let storage_engine_command_accepted =
+            foyer_storage_engine_command_total.counter(&[name.clone(), "accepted".into()]);
+        let storage_engine_command_dropped =
+            foyer_storage_engine_command_total.counter(&[name.clone(), "dropped".into()]);
+        let storage_engine_command_completed =
+            foyer_storage_engine_command_total.counter(&[name.clone(), "completed".into()]);
+        let storage_engine_command_rejected =
+            foyer_storage_engine_command_total.counter(&[name.clone(), "storage_rejected".into()]);
+        let storage_engine_batch_completed =
+            foyer_storage_engine_batch_total.counter(&[name.clone(), "completed".into()]);
+        let storage_engine_batch_failed = foyer_storage_engine_batch_total.counter(&[name.clone(), "failed".into()]);
+
+        let storage_engine_queue_pending_entries =
+            foyer_storage_engine_queue_entries.gauge(&[name.clone(), "pending".into()]);
+        let storage_engine_queue_pending_bytes =
+            foyer_storage_engine_queue_bytes.gauge(&[name.clone(), "pending".into()]);
+        let storage_engine_queue_capacity_entries =
+            foyer_storage_engine_queue_entries.gauge(&[name.clone(), "capacity".into()]);
+        let storage_engine_queue_capacity_bytes =
+            foyer_storage_engine_queue_bytes.gauge(&[name.clone(), "capacity".into()]);
+
+        let storage_engine_checkpoint_published =
+            foyer_storage_engine_checkpoint.gauge(&[name.clone(), "published_epoch".into()]);
+        let storage_engine_checkpoint_requested =
+            foyer_storage_engine_checkpoint.gauge(&[name.clone(), "requested_epoch".into()]);
+        let storage_engine_checkpoint_durable =
+            foyer_storage_engine_checkpoint.gauge(&[name.clone(), "durable_epoch".into()]);
+        let storage_engine_checkpoint_in_flight =
+            foyer_storage_engine_checkpoint.gauge(&[name.clone(), "in_flight_epoch".into()]);
+        let storage_engine_checkpoint_dirty =
+            foyer_storage_engine_checkpoint.gauge(&[name.clone(), "dirty_changes".into()]);
+        let storage_engine_healthy = foyer_storage_engine_healthy.gauge(std::slice::from_ref(&name));
+        storage_engine_healthy.absolute(1);
 
         let storage_disk_write = foyer_storage_disk_io_total.counter(&[name.clone(), "write".into()]);
         let storage_disk_read = foyer_storage_disk_io_total.counter(&[name.clone(), "read".into()]);
@@ -338,6 +422,22 @@ impl Metrics {
             storage_queue_rotate_duration,
             storage_queue_buffer_overflow,
             storage_queue_channel_overflow,
+            storage_engine_command_accepted,
+            storage_engine_command_dropped,
+            storage_engine_command_completed,
+            storage_engine_command_rejected,
+            storage_engine_batch_completed,
+            storage_engine_batch_failed,
+            storage_engine_queue_pending_entries,
+            storage_engine_queue_pending_bytes,
+            storage_engine_queue_capacity_entries,
+            storage_engine_queue_capacity_bytes,
+            storage_engine_checkpoint_published,
+            storage_engine_checkpoint_requested,
+            storage_engine_checkpoint_durable,
+            storage_engine_checkpoint_in_flight,
+            storage_engine_checkpoint_dirty,
+            storage_engine_healthy,
             storage_disk_write,
             storage_disk_read,
             storage_disk_flush,

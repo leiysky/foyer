@@ -131,6 +131,30 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+### Extent SSD Engine (leiysky fork)
+
+This fork vendors Extent as a separate workspace extension. `foyer-storage` retains the generic
+disk-engine contract; `foyer-extent` provides a segment-based, priority-aware SSD engine and its
+specialized, path-private `foyer-fixed-lsm` index. Downstream users must resolve `foyer` and
+`foyer-extent` from the same fork revision. The extension also checks
+`foyer::DISK_ENGINE_API_VERSION` at compile time, so mixing it with crates.io Foyer or an
+incompatible fork revision fails during the build instead of surfacing as a runtime mismatch.
+
+```toml
+[dependencies]
+foyer = { path = "../foyer/foyer" }
+foyer-extent = { path = "../foyer/foyer-extent" }
+```
+
+`foyer_extent::Cache` is the complete best-effort blob-cache facade. Callers that already construct
+their own `HybridCache<Bytes, EngineValue>` can install
+`foyer_extent::ExtentEngineConfig` directly through `with_engine_config`.
+
+The vendored implementation retains its ScopeDB license. Its architecture, failure model, and
+matched BlockEngine benchmark are documented under [`foyer-extent/docs`](foyer-extent/docs).
+This fork's minimum supported Rust version is 1.91.
+Extent production support is Linux-only, and online `HybridCache::clear()` is not yet supported.
+
 ### Fully Configured Hybrid Cache
 
 Here is an example of a hybrid cache setup with almost all configurations to show the possibilities of tuning.
@@ -172,9 +196,9 @@ async fn main() -> anyhow::Result<()> {
         .with_weighter(|_key, value: &String| value.len())
         .with_filter(|_, _| true)
         .storage()
-        .with_io_engine_config(PsyncIoEngineConfig::new())
         .with_engine_config(
             BlockEngineConfig::new(device)
+                .with_io_engine_config(PsyncIoEngineConfig::new())
                 .with_block_size(16 * 1024 * 1024)
                 .with_indexer_shards(64)
                 .with_recover_concurrency(8)
@@ -260,7 +284,7 @@ The architecture of ***foyer*** is still not mature and is undergoing rapid iter
 
 ## Supported Rust Versions
 
-*foyer* is built against the recent stable release. The minimum supported version is 1.85.0. The current *foyer* version is not guaranteed to build on Rust versions earlier than the minimum supported version.
+*foyer* is built against the recent stable release. The minimum supported version in this fork is 1.91.0. The current *foyer* version is not guaranteed to build on Rust versions earlier than the minimum supported version.
 
 ## Supported Platforms
 

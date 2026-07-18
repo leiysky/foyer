@@ -1,0 +1,55 @@
+# foyer-extent
+
+The `foyer-extent` package provides `ExtentEngine`, a Foyer disk engine backed by `SegmentEngine` and
+FixedRecordLSM. The project name is not a storage concept.
+
+The public cache object is `Entry`: a complete variable-length opaque key of at most 1 KiB, a
+non-empty variable-length value, and a priority. Both key and value use `Bytes`, so cloning a hit is
+cheap. Foyer owns the memory tier and hybrid coordination. `ExtentEngine` owns the non-blocking
+engine submission boundary and one byte-bounded disk queue. `SegmentEngine` owns lookup,
+publication, and checkpoint coordination; its concrete `Reclaimer` owns allocation pressure,
+generation-reuse fencing, and priority-aware reclaim.
+
+The balanced engine defaults use a 256 MiB submission budget, 128 MiB write batches, and a
+one-second periodic checkpoint request in addition to the mutation-count trigger. An
+`ExtentEngineHandle` exposes queue depth, publication/durability frontiers, asynchronous write
+outcomes, physical I/O, reclaim work, and the first sticky background failure. These observations
+do not turn fire-and-forget puts into acknowledged writes.
+
+The same state is exported through Foyer's metrics registry as
+`foyer_storage_engine_command_total`, `foyer_storage_engine_batch_total`,
+`foyer_storage_engine_queue_entries`, `foyer_storage_engine_queue_bytes`,
+`foyer_storage_engine_checkpoint`, and `foyer_storage_engine_healthy`. Queue gauges are updated at
+reservation ownership changes; the worker refreshes checkpoint frontiers on every batch and
+periodic checkpoint tick. `storage_usage()` is an O(1) snapshot: preallocated segment-file usage is
+fixed by the discovered layout, while FixedRecordLSM reports its atomic disk-budget counter.
+
+The physical hierarchy is allocation slots grouped into cache segments. A blob occupies contiguous
+slots within exactly one segment, and a segment is reused as one generation. Object ranges,
+application-specific key encoding, and remote-storage behavior belong outside the project.
+
+The durable exact index is the workspace-private `foyer-fixed-lsm` crate. RocksDB support is gated
+behind the `rocksdb-benchmark` feature and exists only as an industrial comparison point.
+
+`foyer-extent` must be resolved with `foyer` from the same fork revision. A compile-time
+`DISK_ENGINE_API_VERSION` assertion rejects an incompatible Foyer engine boundary. Both extension
+crates are `publish = false`; the fork workspace, rather than crates.io version coincidence, is the
+distribution unit.
+
+The production target is Linux SSD. Buffered I/O also supports macOS and Windows development
+builds; direct I/O is Linux-only. The Foyer boundary supports entry insertion, lookup, deletion,
+waiting, close, and recovery. Online `HybridCache::clear()` currently returns an error: a correct
+implementation requires an atomic segment-generation replacement and must not be emulated with an
+O(live entries) tombstone pass. Close and reopen with `RecoverMode::None` to reset the cache.
+Reset removes only Extent-owned files below the configured directory; it does not recursively
+delete that directory or unrelated caller files.
+
+Compatibility CI reconstructs a frozen complete V3 engine image—including payload, owners,
+allocator pages, FixedRecordLSM manifest, and WAL—then opens it, reads it, advances it with the
+current writer, and reopens it. This prevents simultaneous encoder/decoder changes from hiding an
+on-disk incompatibility. Process-crash tests separately cover checkpoint and reclaim publication.
+
+See [`docs/architecture.md`](docs/architecture.md) for module boundaries,
+[`docs/segment-engine.md`](docs/segment-engine.md) for the on-disk and crash-safety design, and
+[`docs/foyer-engine-benchmark.md`](docs/foyer-engine-benchmark.md) for the
+BlockEngine comparison.

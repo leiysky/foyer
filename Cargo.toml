@@ -5,6 +5,7 @@ members = [
   "foyer",
   "foyer-bench",
   "foyer-common",
+  "foyer-extent",
   "foyer-fixed-lsm",
   "foyer-memory",
   "foyer-storage",
@@ -29,6 +30,7 @@ allocator-api2 = "0.2"
 anyhow = "1"
 bincode = "1"
 bitflags = "2"
+blake3 = "1"
 bytes = "1"
 bytesize = { package = "foyer-bytesize", version = "2" }
 cfg-if = "1"
@@ -45,6 +47,7 @@ fastant = "0.1.11"
 fastrace = "0.7"
 fastrace-jaeger = "0.7"
 fastrace-opentelemetry = "0.15"
+fixed-lsm = { package = "foyer-fixed-lsm", path = "foyer-fixed-lsm" }
 foyer = { version = "0.22.3", path = "foyer", default-features = false }
 foyer-common = { version = "0.22.3", path = "foyer-common", default-features = false }
 foyer-memory = { version = "0.22.3", path = "foyer-memory", default-features = false }
@@ -76,6 +79,9 @@ pin-project = "1"
 prometheus = "0.14"
 rand = { version = "0.9" }
 rand_distr = { version = "0.5" }
+rocksdb = { version = "0.24.0", default-features = false, features = [
+  "bindgen-runtime",
+] }
 # Enable all features by default to make it possible to opt-out madsim dependency. 
 # FYI: https://github.com/rust-lang/cargo/issues/10801
 runtime-madsim-tokio = { package = "madsim-tokio", version = "0.2", features = [

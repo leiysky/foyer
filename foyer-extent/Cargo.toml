@@ -1,0 +1,51 @@
+[package]
+name = "foyer-extent"
+description = "Extent segment-based SSD cache engine for foyer"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+repository = "https://github.com/leiysky/foyer"
+homepage.workspace = true
+authors.workspace = true
+license-file = "LICENSE"
+readme = "README.md"
+publish = false
+
+[features]
+default = ["runtime-tokio"]
+runtime-tokio = ["foyer/runtime-tokio", "tokio/runtime-tokio"]
+runtime-madsim-tokio = [
+  "foyer/runtime-madsim-tokio",
+  "tokio/runtime-madsim-tokio",
+]
+rocksdb-benchmark = ["dep:rocksdb"]
+
+[dependencies]
+blake3 = { workspace = true }
+bytes = { workspace = true }
+crc-fast = { workspace = true }
+fixed-lsm = { workspace = true }
+foyer = { workspace = true }
+futures-core = { workspace = true }
+rocksdb = { workspace = true, optional = true }
+rustix = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+twox-hash = { workspace = true, features = ["xxhash3_64"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+len_without_is_empty = "allow"
+single_range_in_vec_init = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+
+[[bench]]
+name = "foyer_engine_compare"
+harness = false
