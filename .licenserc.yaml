@@ -6,4 +6,8 @@ header:
   paths:
     - "**/*.rs"
 
+  # ScopeDB-owned sources vendored by the leiysky fork retain their original license.
+  paths-ignore:
+    - "foyer-fixed-lsm/**"
+
   comment: on-failure
