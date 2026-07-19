@@ -20,8 +20,8 @@ use futures_core::future::BoxFuture;
 use tokio::sync::Notify;
 
 use crate::{
-    CheckpointStats, EngineValue, Error, IndexReadStats, IndexStats, MAX_BLOB_KEY_SIZE, PhysicalWriteStats,
-    ReclaimStats,
+    CheckpointStats, EngineValue, Error, IndexReadStats, IndexStats, IoSchedulerStats, MAX_BLOB_KEY_SIZE,
+    PhysicalWriteStats, ReclaimStats,
     format::BLOB_HEADER_SIZE,
     model::BlobKey,
     segment::{SegmentEngine, SegmentEngineConfig},
@@ -107,6 +107,12 @@ impl ExtentEngineConfig {
     /// Set the number of concurrent data-file write runs.
     pub fn with_write_concurrency(mut self, concurrency: usize) -> Self {
         self.segment.options.write_concurrency = concurrency;
+        self
+    }
+
+    /// Set how long physical writes yield to continuously active payload reads.
+    pub fn with_io_read_priority_duration(mut self, duration: Duration) -> Self {
+        self.segment.options.io_read_priority_duration = duration;
         self
     }
 
@@ -278,6 +284,10 @@ impl ExtentEngineHandle {
 
     pub fn physical_write_stats(&self) -> Option<PhysicalWriteStats> {
         self.upgrade().map(|inner| inner.segment.physical_write_stats())
+    }
+
+    pub fn io_scheduler_stats(&self) -> Option<IoSchedulerStats> {
+        self.upgrade().map(|inner| inner.segment.io_scheduler_stats())
     }
 
     pub fn index_stats(&self) -> Option<IndexStats> {

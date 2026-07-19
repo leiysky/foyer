@@ -21,6 +21,7 @@ use crate::{
         config::{SegmentEngineConfig, SegmentEngineOptions},
         format::{SegmentLayout, SegmentLocation},
         index::{INDEX_DIRECTORY, IndexReadStats, IndexStats, SegmentIndex},
+        io::IoSchedulerStats,
         operation::{BatchInsertResult, BlobInsert, GetResult, InsertOutcome},
         reclaim::{AllocationDecision, ReclaimResult, Reclaimer},
         stats::PhysicalWriteStats,
@@ -67,6 +68,7 @@ impl SegmentEngine {
             layout,
             config.options.direct_io,
             config.options.write_concurrency,
+            config.options.io_read_priority_duration,
             config.options.read_run_size,
             config.options.write_run_size,
         )?;
@@ -90,6 +92,7 @@ impl SegmentEngine {
             root,
             options.direct_io,
             options.write_concurrency,
+            options.io_read_priority_duration,
             options.read_run_size,
             options.write_run_size,
         )?;
@@ -149,6 +152,10 @@ impl SegmentEngine {
         let mut stats = self.store.physical_write_stats();
         stats.merge(self.index.physical_write_stats());
         stats
+    }
+
+    pub fn io_scheduler_stats(&self) -> IoSchedulerStats {
+        self.store.io_scheduler_stats()
     }
 
     pub fn index_stats(&self) -> IndexStats {

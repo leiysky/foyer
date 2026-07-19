@@ -6,6 +6,7 @@ use std::{
         Mutex, MutexGuard,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use crate::{
@@ -17,6 +18,7 @@ use crate::{
     model::{BlobKey, CachePriority, KeyDigest},
     segment::{
         format::{AllocatorState, OWNER_RECORD_SIZE, OwnerRecord, SegmentLayout, SegmentLocation, SegmentRole},
+        io::{IoSchedulerStats, SegmentIoScheduler},
         stats::PhysicalWriteStats,
     },
 };
@@ -110,6 +112,7 @@ pub struct SegmentStore {
     data: File,
     owners: File,
     state_file: File,
+    io: SegmentIoScheduler,
     layout: SegmentLayout,
     direct_io: bool,
     write_concurrency: usize,
@@ -150,6 +153,7 @@ impl SegmentStore {
         layout: SegmentLayout,
         direct_io: bool,
         write_concurrency: usize,
+        io_read_priority_duration: Duration,
         read_run_size: usize,
         write_run_size: usize,
     ) -> Result<Self> {
@@ -175,10 +179,13 @@ impl SegmentStore {
             .sync_data()
             .map_err(|error| Error::io("sync initial segment state", error))?;
         let allocated_size = layout_allocated_size(layout)?;
+        let io = SegmentIoScheduler::new(write_concurrency, io_read_priority_duration)
+            .map_err(|error| Error::io("configure segment I/O scheduler", error))?;
         Ok(Self {
             data,
             owners,
             state_file,
+            io,
             layout,
             direct_io,
             write_concurrency,
@@ -194,6 +201,7 @@ impl SegmentStore {
         root: &Path,
         direct_io: bool,
         write_concurrency: usize,
+        io_read_priority_duration: Duration,
         read_run_size: usize,
         write_run_size: usize,
     ) -> Result<Self> {
@@ -255,11 +263,14 @@ impl SegmentStore {
         ensure_cache_file_reserved(&state_file, state_file_size(layout)?)
             .map_err(|error| Error::io("verify segment state reservation", error))?;
         let allocated_size = layout_allocated_size(layout)?;
+        let io = SegmentIoScheduler::new(write_concurrency, io_read_priority_duration)
+            .map_err(|error| Error::io("configure segment I/O scheduler", error))?;
 
         let store = Self {
             data,
             owners,
             state_file,
+            io,
             layout,
             direct_io,
             write_concurrency,
@@ -283,6 +294,10 @@ impl SegmentStore {
 
     pub fn physical_write_stats(&self) -> PhysicalWriteStats {
         self.writes.snapshot()
+    }
+
+    pub fn io_scheduler_stats(&self) -> IoSchedulerStats {
+        self.io.stats()
     }
 
     pub fn allocate(&self, priority: CachePriority, slots: u32) -> Result<SegmentAllocationResult> {
@@ -459,36 +474,39 @@ impl SegmentStore {
         after_validation()?;
 
         let mut value = Vec::with_capacity(location.stored_len as usize);
-        let mut slot_offset = 0usize;
-        while slot_offset < slots as usize {
-            let run_slots = (slots as usize - slot_offset).min(self.read_run_slots);
-            let remaining = location.stored_len as usize - value.len();
-            let logical_len = remaining.min(run_slots * self.layout.slot_size);
-            let physical_slot = location
-                .physical_slot
-                .checked_add(slot_offset as u64)
-                .ok_or_else(|| invalid_state("segment blob slot overflows u64"))?;
-            let file_offset = physical_slot
-                .checked_mul(self.layout.slot_size as u64)
-                .ok_or_else(|| invalid_state("segment blob offset overflows u64"))?;
-            if self.direct_io {
-                let physical_len = run_slots * self.layout.slot_size;
-                let mut input = AlignedBuffer::new(physical_len);
-                read_exact_at(&self.data, input.as_mut_slice(), file_offset)
-                    .map_err(|error| Error::io("read segment blob", error))?;
-                value.extend_from_slice(&input.as_slice()[..logical_len]);
-                result.data_bytes = result.data_bytes.saturating_add(physical_len);
-            } else {
-                let start = value.len();
-                value.resize(start + logical_len, 0);
-                read_exact_at(&self.data, &mut value[start..], file_offset)
-                    .map_err(|error| Error::io("read segment blob", error))?;
-                result.data_bytes = result.data_bytes.saturating_add(logical_len);
+        self.io.read(|| -> Result<()> {
+            let mut slot_offset = 0usize;
+            while slot_offset < slots as usize {
+                let run_slots = (slots as usize - slot_offset).min(self.read_run_slots);
+                let remaining = location.stored_len as usize - value.len();
+                let logical_len = remaining.min(run_slots * self.layout.slot_size);
+                let physical_slot = location
+                    .physical_slot
+                    .checked_add(slot_offset as u64)
+                    .ok_or_else(|| invalid_state("segment blob slot overflows u64"))?;
+                let file_offset = physical_slot
+                    .checked_mul(self.layout.slot_size as u64)
+                    .ok_or_else(|| invalid_state("segment blob offset overflows u64"))?;
+                if self.direct_io {
+                    let physical_len = run_slots * self.layout.slot_size;
+                    let mut input = AlignedBuffer::new(physical_len);
+                    read_exact_at(&self.data, input.as_mut_slice(), file_offset)
+                        .map_err(|error| Error::io("read segment blob", error))?;
+                    value.extend_from_slice(&input.as_slice()[..logical_len]);
+                    result.data_bytes = result.data_bytes.saturating_add(physical_len);
+                } else {
+                    let start = value.len();
+                    value.resize(start + logical_len, 0);
+                    read_exact_at(&self.data, &mut value[start..], file_offset)
+                        .map_err(|error| Error::io("read segment blob", error))?;
+                    result.data_bytes = result.data_bytes.saturating_add(logical_len);
+                }
+                result.data_runs = result.data_runs.saturating_add(1);
+                result.data_slots = result.data_slots.saturating_add(run_slots);
+                slot_offset += run_slots;
             }
-            result.data_runs = result.data_runs.saturating_add(1);
-            result.data_slots = result.data_slots.saturating_add(run_slots);
-            slot_offset += run_slots;
-        }
+            Ok(())
+        })?;
         let generation_matches = {
             let state = mutex_lock(&self.state);
             state.segments[segment as usize].generation == location.segment_generation
@@ -732,11 +750,11 @@ impl SegmentStore {
     }
 
     pub fn sync_payload(&self) -> Result<()> {
-        self.data
-            .sync_data()
+        self.io
+            .write(|| self.data.sync_data())
             .map_err(|error| Error::io("sync segment data", error))?;
-        self.owners
-            .sync_data()
+        self.io
+            .write(|| self.owners.sync_data())
             .map_err(|error| Error::io("sync segment owners", error))
     }
 
@@ -908,7 +926,8 @@ impl SegmentStore {
                             .first_slot
                             .checked_mul(self.layout.slot_size as u64)
                             .ok_or_else(|| invalid_state("segment data offset overflows u64"))?;
-                        write_all_at(&self.data, output.as_slice(), offset)
+                        self.io
+                            .write(|| write_all_at(&self.data, output.as_slice(), offset))
                             .map_err(|error| Error::io("write segment data batch", error))?;
                         self.writes.data_runs.fetch_add(1, Ordering::Relaxed);
                         self.writes.data_bytes.fetch_add(len as u64, Ordering::Relaxed);
@@ -946,7 +965,8 @@ impl SegmentStore {
                 .first_slot
                 .checked_mul(OWNER_RECORD_SIZE as u64)
                 .ok_or_else(|| invalid_state("segment owner offset overflows u64"))?;
-            write_all_at(&self.owners, &output, offset)
+            self.io
+                .write(|| write_all_at(&self.owners, &output, offset))
                 .map_err(|error| Error::io("write segment owner batch", error))?;
             self.writes.owner_runs.fetch_add(1, Ordering::Relaxed);
             self.writes
@@ -1076,7 +1096,7 @@ mod tests {
                 .with_options(options),
         )
         .unwrap();
-        SegmentStore::create(root, layout, false, 2, PAGE_SIZE * 4, PAGE_SIZE * 4).unwrap()
+        SegmentStore::create(root, layout, false, 2, Duration::ZERO, PAGE_SIZE * 4, PAGE_SIZE * 4).unwrap()
     }
 
     fn key(index: u64) -> BlobKey {
@@ -1131,7 +1151,7 @@ mod tests {
         let layout = store.layout();
         drop(store);
 
-        let reopened = SegmentStore::open(dir.path(), false, 2, PAGE_SIZE * 4, PAGE_SIZE * 4).unwrap();
+        let reopened = SegmentStore::open(dir.path(), false, 2, Duration::ZERO, PAGE_SIZE * 4, PAGE_SIZE * 4).unwrap();
         assert_eq!(reopened.layout(), layout);
         for (index, location) in result.locations.iter().enumerate() {
             assert_eq!(
@@ -1212,7 +1232,7 @@ mod tests {
         store.sync_payload().unwrap();
         drop(store);
 
-        let reopened = SegmentStore::open(dir.path(), false, 1, PAGE_SIZE * 4, PAGE_SIZE * 4).unwrap();
+        let reopened = SegmentStore::open(dir.path(), false, 1, Duration::ZERO, PAGE_SIZE * 4, PAGE_SIZE * 4).unwrap();
         let next = allocated(reopened.allocate(CachePriority::High, 1).unwrap());
         assert_eq!(next.segment, allocation.segment);
         assert_eq!(next.slot, allocation.slot + 1);
@@ -1232,7 +1252,7 @@ mod tests {
         write_all_at(&state_file, &[0xff], offset).unwrap();
         state_file.sync_data().unwrap();
 
-        let reopened = SegmentStore::open(dir.path(), false, 1, PAGE_SIZE * 4, PAGE_SIZE * 4).unwrap();
+        let reopened = SegmentStore::open(dir.path(), false, 1, Duration::ZERO, PAGE_SIZE * 4, PAGE_SIZE * 4).unwrap();
         assert!(reopened.state_snapshot().generation < state.generation);
     }
 }

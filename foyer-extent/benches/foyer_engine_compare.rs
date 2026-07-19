@@ -52,6 +52,7 @@ struct Config {
     extent_segment_size: usize,
     extent_index_cache_bytes: usize,
     extent_index_write_buffer_bytes: usize,
+    extent_io_read_priority: Duration,
     concurrency: usize,
     shards: usize,
     write_concurrency: usize,
@@ -111,6 +112,9 @@ impl Config {
             extent_segment_size: env_mib("EXTENT_BENCH_SEGMENT_MIB", 64)?,
             extent_index_cache_bytes: env_mib("EXTENT_BENCH_INDEX_CACHE_MIB", 256)?,
             extent_index_write_buffer_bytes: env_mib("EXTENT_BENCH_INDEX_WRITE_BUFFER_MIB", 64)?,
+            extent_io_read_priority: Duration::from_micros(
+                env_optional_u64("EXTENT_BENCH_IO_READ_PRIORITY_US")?.unwrap_or(2_000),
+            ),
             concurrency,
             shards: env_usize("EXTENT_BENCH_SHARDS", cores.next_power_of_two())?,
             write_concurrency: env_usize("EXTENT_BENCH_EXTENT_WRITE_CONCURRENCY", (cores / 2).clamp(1, 8))?,
@@ -255,7 +259,7 @@ async fn main() -> AnyResult<()> {
     fs::create_dir_all(&config.root)?;
 
     println!(
-        "foyer-engine benchmark: path={}, engines={}, entries={}, payload_mib={:.1}, capacity_mib={}, memory_mib={}, entry_kib={}, key_bytes={}, concurrency={} (>=2x cores), io={}, recover_only={}",
+        "foyer-engine benchmark: path={}, engines={}, entries={}, payload_mib={:.1}, capacity_mib={}, memory_mib={}, entry_kib={}, key_bytes={}, concurrency={} (>=2x cores), io={}, extent_read_priority_us={}, recover_only={}",
         config.root.display(),
         config
             .engines
@@ -271,6 +275,7 @@ async fn main() -> AnyResult<()> {
         join_sizes(&workload.key_sizes, 1),
         config.concurrency,
         if config.direct_io { "direct" } else { "buffered" },
+        config.extent_io_read_priority.as_micros(),
         config.recover_only,
     );
 
@@ -480,6 +485,7 @@ async fn build_cache(
                 .with_slot_size(config.extent_slot_size)
                 .with_segment_size(config.extent_segment_size)
                 .with_write_concurrency(config.write_concurrency)
+                .with_io_read_priority_duration(config.extent_io_read_priority)
                 .with_index_cache_size(config.extent_index_cache_bytes)
                 .with_index_write_buffer_size(config.extent_index_write_buffer_bytes)
                 .with_direct_io(config.direct_io)
@@ -796,6 +802,22 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
             as_mib(stats.owner_bytes),
             as_mib(stats.index_bytes),
             as_mib(stats.allocator_bytes),
+        );
+    }
+    if let Some(stats) = handle.io_scheduler_stats() {
+        println!(
+            "engine={} phase=extent_io_scheduler enabled={} read_priority_us={} write_operations={} read_priority_waits={} write_limit_waits={} total_write_wait_ms={:.3} maximum_write_wait_us={} active_reads={} active_writes={} waiting_writes={}",
+            engine.label(),
+            stats.enabled(),
+            stats.read_priority_duration.as_micros(),
+            stats.write_operations,
+            stats.read_priority_waits,
+            stats.write_limit_waits,
+            stats.total_write_wait.as_secs_f64() * 1_000.0,
+            stats.maximum_write_wait.as_micros(),
+            stats.active_reads,
+            stats.active_writes,
+            stats.waiting_writes,
         );
     }
     if let Some(index) = handle.index_stats() {

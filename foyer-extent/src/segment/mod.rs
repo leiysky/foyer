@@ -5,6 +5,7 @@ mod config;
 mod engine;
 mod format;
 mod index;
+mod io;
 mod operation;
 mod reclaim;
 mod stats;
@@ -16,6 +17,7 @@ pub use self::{
     engine::SegmentEngine,
     format::EXTENT_FORMAT_VERSION,
     index::{IndexReadStats, IndexStats},
+    io::IoSchedulerStats,
     stats::{PhysicalWriteStats, ReclaimStats},
 };
 pub(crate) use self::{

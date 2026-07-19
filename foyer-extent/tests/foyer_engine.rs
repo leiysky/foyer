@@ -198,6 +198,12 @@ async fn extent_reports_complete_physical_write_statistics_to_foyer() {
     let physical = handle.physical_write_stats().unwrap();
     assert_eq!(cache.statistics().disk_write_bytes(), physical.total_bytes() as usize);
     assert_eq!(cache.statistics().disk_write_ios(), physical.total_runs() as usize);
+    let scheduler = handle.io_scheduler_stats().unwrap();
+    assert!(scheduler.enabled());
+    assert!(scheduler.write_operations > 0);
+    assert_eq!(scheduler.active_reads, 0);
+    assert_eq!(scheduler.active_writes, 0);
+    assert_eq!(scheduler.waiting_writes, 0);
     cache.close().await.unwrap();
 }
 

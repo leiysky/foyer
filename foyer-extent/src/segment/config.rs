@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::format::DEFAULT_SLOT_SIZE;
 
 pub const DEFAULT_SEGMENT_SIZE: usize = 64 * 1024 * 1024;
@@ -5,11 +7,13 @@ const DEFAULT_READ_RUN_SIZE: usize = DEFAULT_SLOT_SIZE;
 const DEFAULT_WRITE_RUN_SIZE: usize = 1024 * 1024;
 const DEFAULT_INDEX_WRITE_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 const DEFAULT_INDEX_CACHE_SIZE: usize = 512 * 1024 * 1024;
+const DEFAULT_IO_READ_PRIORITY_DURATION: Duration = Duration::from_millis(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentEngineOptions {
     pub segment_size: usize,
     pub write_concurrency: usize,
+    pub io_read_priority_duration: Duration,
     pub read_run_size: usize,
     pub write_run_size: usize,
     pub index_write_buffer_size: usize,
@@ -25,6 +29,7 @@ impl Default for SegmentEngineOptions {
         Self {
             segment_size: DEFAULT_SEGMENT_SIZE,
             write_concurrency: 1,
+            io_read_priority_duration: DEFAULT_IO_READ_PRIORITY_DURATION,
             read_run_size: DEFAULT_READ_RUN_SIZE,
             write_run_size: DEFAULT_WRITE_RUN_SIZE,
             index_write_buffer_size: DEFAULT_INDEX_WRITE_BUFFER_SIZE,

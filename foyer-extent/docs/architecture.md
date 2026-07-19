@@ -12,9 +12,11 @@ Foyer or the public cache facade.
 3. **Segment engine** — `SegmentEngine` owns ordered entry publication and coordinates the
    checkpoint frontier. Its concrete `Reclaimer` owns allocation pressure, priority-aware victim
    selection, generation-reuse fencing, and bounded hot-entry promotion.
-4. **Persistence** — `SegmentStore` owns physical payload, owner, and allocator files;
-   `SegmentIndex` owns digest-to-location lookup through FixedRecordLSM. FixedRecordLSM remains a
-   separate fixed-record storage crate and has no cache or segment knowledge.
+4. **Persistence** — `SegmentStore` owns physical payload, owner, and allocator files. Its
+   cooperative I/O scheduler admits payload reads, publication writes, and payload syncs without
+   owning buffers or executing work on another thread. `SegmentIndex` owns digest-to-location
+   lookup through FixedRecordLSM. FixedRecordLSM remains a separate fixed-record storage crate and
+   has no cache or segment knowledge.
 
 The boundaries are concrete module boundaries rather than interchangeable backend traits. There
 is one accepted segment index and one physical layout. A new abstraction is justified only when it
@@ -24,6 +26,13 @@ details upward.
 Within the Foyer layer, a command retains its queue reservation for its entire queued/in-flight
 lifetime. Within the segment layer, reclaim is invoked only while the engine mutation lock is held.
 Those ownership rules are module invariants, not conventions repeated at call sites.
+
+I/O admission is intentionally below Foyer and above positional file calls. A logical blob read
+holds one lock-free read permit across all of its bounded physical runs. A write run waits for a
+read-quiescent point for at most the configured read-priority duration, then proceeds; reads never
+queue behind an admitted write. The default synchronous implementation keeps syscall execution and
+buffer ownership on the caller. It is not an emulated submission/completion queue and does not
+pre-commit Extent to io_uring.
 
 The pending-write keeper assigns a generation to every submission. Completion of an older
 same-key write removes only its own generation and cannot erase a newer pending value. The first

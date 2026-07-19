@@ -51,6 +51,26 @@ records exist for reclaim and recovery accounting, not foreground lookup. Any st
 mismatched location is a miss/error boundary, never an unverified hit. There is deliberately no
 second batch-read implementation beside Foyer's point-load interface.
 
+## I/O admission
+
+`SegmentStore` owns a cooperative synchronous I/O scheduler for the payload data plane. One read
+permit spans all physical runs of a blob; acquisition is an atomic lock-free fast path and never
+waits for a write. Data and owner write runs plus their publication syncs use write permits. A write
+first looks for a read-quiescent point, but the read-priority interval is bounded (2 ms by default),
+so continuously arriving reads cannot starve cache publication or reclaim. Existing write
+concurrency remains the hard cap. A zero interval bypasses admission and accounting entirely.
+
+The scheduler does not own buffers, spawn I/O workers, reorder durability steps, or alter the disk
+format. The admitted caller executes the positional syscall directly. Allocator-state persistence
+and FixedRecordLSM remain outside this policy: allocator writes are serialized recovery-critical
+transitions, while an index lookup may be satisfied by its memory overlay or block cache without a
+physical I/O. Extending admission into FixedRecordLSM requires evidence of metadata-I/O contention,
+not a scheduler call around a high-level lookup.
+
+`IoSchedulerStats` reports enabled policy, current readers/writers, scheduled write operations,
+read-priority waits, write-limit waits, and cumulative/maximum write admission delay. These are
+runtime tuning signals rather than acknowledged-write semantics.
+
 ## Insert and checkpoint
 
 An insert validates the blob, allocates contiguous slots, writes payload and owners, installs the

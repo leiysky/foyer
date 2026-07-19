@@ -13,13 +13,20 @@ generation-reuse fencing, and priority-aware reclaim.
 The balanced engine defaults use a 256 MiB submission budget, 128 MiB idle write batches, an 8 MiB
 write batch while reads are active, and a one-second periodic checkpoint request in addition to
 the mutation-count trigger. Physical reads have a hard, non-waiting `2 * available_parallelism`
-admission limit. Low- and normal-priority writes are progressively shed before the queue is full,
-with earlier shedding while reads are active; high-priority writes retain the hard queue budget. An
-`ExtentEngineHandle` exposes queue depth, publication/durability frontiers, asynchronous write
-outcomes, active read admission, physical I/O, reclaim work, and the first sticky background
-failure. These observations do not turn fire-and-forget puts into acknowledged writes.
+admission limit. The synchronous payload I/O scheduler gives an active blob read a bounded 2 ms
+head start over newly admitted writes; reads never wait behind writes, and writes proceed after the
+bound so sustained reads cannot starve publication. This is a cooperative admission layer: the
+calling thread retains the buffer and executes `pread`, `pwrite`, or `fdatasync`; no extra executor
+or io_uring dependency is involved. Set the read-priority duration to zero for a full runtime
+bypass.
 
-The same state is exported through Foyer's metrics registry as
+Low- and normal-priority writes are progressively shed before the queue is full, with earlier
+shedding while reads are active; high-priority writes retain the hard queue budget. An
+`ExtentEngineHandle` exposes queue depth, publication/durability frontiers, asynchronous write
+outcomes, active read admission, scheduler waits, physical I/O, reclaim work, and the first sticky
+background failure. These observations do not turn fire-and-forget puts into acknowledged writes.
+
+The Foyer-facing queue, pipeline, and recovery state is also exported through its metrics registry as
 `foyer_storage_engine_command_total`, `foyer_storage_engine_batch_total`,
 `foyer_storage_engine_queue_entries`, `foyer_storage_engine_queue_bytes`,
 `foyer_storage_engine_checkpoint`, `foyer_storage_engine_read_total`,
