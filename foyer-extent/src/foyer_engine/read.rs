@@ -45,7 +45,7 @@ impl ReadLimiter {
             self.metrics.storage_engine_read_rejected.increase(1);
             return None;
         }
-        self.metrics.storage_engine_read_active.absolute(self.active() as u64);
+        self.metrics.storage_engine_read_active.increase(1);
         Some(ReadPermit { limiter: self.clone() })
     }
 }
@@ -58,10 +58,7 @@ impl Drop for ReadPermit {
     fn drop(&mut self) {
         let previous = self.limiter.active.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "Extent active reader count underflow");
-        self.limiter
-            .metrics
-            .storage_engine_read_active
-            .absolute(previous.saturating_sub(1) as u64);
+        self.limiter.metrics.storage_engine_read_active.decrease(1);
     }
 }
 

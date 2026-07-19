@@ -74,11 +74,11 @@ impl SubmissionQueue {
         let mut current = self.pending_bytes.load(Ordering::Relaxed);
         loop {
             let Some(next) = current.checked_add(bytes) else {
-                self.release(0);
+                self.rollback_entry();
                 return None;
             };
             if next > self.capacity_bytes {
-                self.release(0);
+                self.rollback_entry();
                 return None;
             }
             match self
@@ -90,7 +90,8 @@ impl SubmissionQueue {
             }
         }
 
-        self.refresh_metrics();
+        self.metrics.storage_engine_queue_pending_entries.increase(1);
+        self.metrics.storage_engine_queue_pending_bytes.increase(bytes as u64);
         Some(QueueReservation {
             queue: self.clone(),
             bytes,
@@ -102,17 +103,15 @@ impl SubmissionQueue {
         assert!(previous_bytes >= bytes, "Extent pending queue byte count underflow");
         let previous_entries = self.pending_entries.fetch_sub(1, Ordering::AcqRel);
         assert!(previous_entries > 0, "Extent pending queue entry count underflow");
-        self.refresh_metrics();
+        self.metrics.storage_engine_queue_pending_entries.decrease(1);
+        self.metrics.storage_engine_queue_pending_bytes.decrease(bytes as u64);
         self.notify.notify_waiters();
     }
 
-    fn refresh_metrics(&self) {
-        self.metrics
-            .storage_engine_queue_pending_entries
-            .absolute(self.pending_entries() as u64);
-        self.metrics
-            .storage_engine_queue_pending_bytes
-            .absolute(self.pending_bytes() as u64);
+    fn rollback_entry(&self) {
+        let previous_entries = self.pending_entries.fetch_sub(1, Ordering::AcqRel);
+        assert!(previous_entries > 0, "Extent pending queue entry count underflow");
+        self.notify.notify_waiters();
     }
 
     pub async fn wait(&self) {
