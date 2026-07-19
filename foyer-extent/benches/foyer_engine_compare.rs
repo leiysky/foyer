@@ -213,6 +213,8 @@ struct ReadMeasurements {
     hits_by_priority: [u64; 3],
     requests_by_priority: [u64; 3],
     latencies: Vec<Duration>,
+    hit_latencies: Vec<Duration>,
+    miss_latencies: Vec<Duration>,
     duration: Duration,
 }
 
@@ -229,6 +231,8 @@ impl ReadMeasurements {
             self.requests_by_priority[priority] += other.requests_by_priority[priority];
         }
         self.latencies.extend(other.latencies);
+        self.hit_latencies.extend(other.hit_latencies);
+        self.miss_latencies.extend(other.miss_latencies);
     }
 }
 
@@ -348,7 +352,7 @@ async fn recover_and_read(engine: DiskEngine, config: &Config, workload: Arc<Wor
             .unwrap_or_else(|| "n/a".to_string()),
     );
 
-    let reads = run_reads(&recovered.cache, workload, config.reads, config.concurrency).await?;
+    let reads = run_reads(&recovered.cache, workload.clone(), config.reads, config.concurrency).await?;
     let io = io_measurements(&recovered.cache, &recovered.extent);
     println!(
         "engine={} phase=read operations={} hits={} misses={} errors={} invalid={} hit_ratio={:.3} seconds={:.3} ops_s={:.0} hit_mib_s={:.1} disk_read_mib={:.1} disk_read_ios={}",
@@ -377,9 +381,58 @@ async fn recover_and_read(engine: DiskEngine, config: &Config, workload: Arc<Wor
         );
     }
     print_latencies(engine, "get", &reads.latencies);
+    print_latencies(engine, "get_hit", &reads.hit_latencies);
+    print_latencies(engine, "get_miss", &reads.miss_latencies);
     print_extent_read_stats(engine, &recovered.extent);
+
+    if !config.recover_only {
+        let before_burst = run_reads(&recovered.cache, workload.clone(), config.reads, config.concurrency).await?;
+        println!(
+            "engine={} phase=read_before_write_burst operations={} hits={} misses={} errors={} invalid={} seconds={:.3} ops_s={:.0}",
+            engine.label(),
+            before_burst.operations,
+            before_burst.hits,
+            before_burst.misses,
+            before_burst.errors,
+            before_burst.invalid,
+            before_burst.duration.as_secs_f64(),
+            before_burst.operations as f64 / before_burst.duration.as_secs_f64().max(f64::EPSILON),
+        );
+        print_latencies(engine, "get_before_write_burst", &before_burst.latencies);
+        print_latencies(engine, "get_hit_before_write_burst", &before_burst.hit_latencies);
+        print_latencies(engine, "get_miss_before_write_burst", &before_burst.miss_latencies);
+
+        let io_before = io_measurements(&recovered.cache, &recovered.extent);
+        let (burst, under_burst) = run_read_under_write_burst(&recovered.cache, config, workload).await?;
+        let io = io_delta(io_measurements(&recovered.cache, &recovered.extent), io_before);
+        println!(
+            "engine={} phase=read_under_write_burst read_operations={} hits={} misses={} errors={} invalid={} read_seconds={:.3} read_ops_s={:.0} burst_operations={} burst_mib={:.1} burst_foreground_seconds={:.3} burst_drain_seconds={:.3} disk_read_mib={:.1} disk_write_mib={:.1} hit_p99_inflation={:.3}",
+            engine.label(),
+            under_burst.operations,
+            under_burst.hits,
+            under_burst.misses,
+            under_burst.errors,
+            under_burst.invalid,
+            under_burst.duration.as_secs_f64(),
+            under_burst.operations as f64 / under_burst.duration.as_secs_f64().max(f64::EPSILON),
+            burst.operations,
+            as_mib(burst.bytes),
+            burst.foreground.as_secs_f64(),
+            burst.drain.as_secs_f64(),
+            as_mib(io.read_bytes as u64),
+            as_mib(io.write_bytes as u64),
+            duration_ratio(
+                quantile(&under_burst.hit_latencies, 990, 1_000),
+                quantile(&before_burst.hit_latencies, 990, 1_000),
+            ),
+        );
+        print_latencies(engine, "get_under_write_burst", &under_burst.latencies);
+        print_latencies(engine, "get_hit_under_write_burst", &under_burst.hit_latencies);
+        print_latencies(engine, "get_miss_under_write_burst", &under_burst.miss_latencies);
+        print_latencies(engine, "put_burst_foreground", &burst.latencies);
+        print_extent_write_stats(engine, &recovered.extent)?;
+    }
     recovered.cache.close().await?;
-    drop(recovered);
     Ok(())
 }
 
@@ -543,7 +596,7 @@ async fn run_reads(
                 result.requests_by_priority[priority.to_byte() as usize] += 1;
                 let key = make_key(index, workload.key_size(index));
                 let requested = Instant::now();
-                match cache.get(&key).await {
+                let outcome = match cache.get(&key).await {
                     Ok(Some(entry)) => {
                         result.hits += 1;
                         result.hits_by_priority[priority.to_byte() as usize] += 1;
@@ -554,12 +607,25 @@ async fn run_reads(
                         {
                             result.invalid += 1;
                         }
+                        ReadOutcome::Hit
                     }
-                    Ok(None) => result.misses += 1,
-                    Err(_) => result.errors += 1,
-                }
+                    Ok(None) => {
+                        result.misses += 1;
+                        ReadOutcome::Miss
+                    }
+                    Err(_) => {
+                        result.errors += 1;
+                        ReadOutcome::Error
+                    }
+                };
                 if operation.is_multiple_of(sample_stride) {
-                    result.latencies.push(requested.elapsed());
+                    let latency = requested.elapsed();
+                    result.latencies.push(latency);
+                    match outcome {
+                        ReadOutcome::Hit => result.hit_latencies.push(latency),
+                        ReadOutcome::Miss => result.miss_latencies.push(latency),
+                        ReadOutcome::Error => {}
+                    }
                 }
                 result.operations += 1;
                 operation += worker_count as u64;
@@ -574,6 +640,60 @@ async fn run_reads(
     }
     measurements.duration = started.elapsed();
     Ok(measurements)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReadOutcome {
+    Hit,
+    Miss,
+    Error,
+}
+
+async fn run_read_under_write_burst(
+    cache: &BenchCache,
+    config: &Config,
+    workload: Arc<Workload>,
+) -> AnyResult<(WriteMeasurements, ReadMeasurements)> {
+    let burst_entries = workload.wave_entries(config.wave_bytes);
+    let sample_stride = (burst_entries / LATENCY_SAMPLE_TARGET).max(1);
+    let writer_cache = cache.clone();
+    let writer_workload = workload.clone();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let writer_started = started.clone();
+    let writer = tokio::task::spawn_blocking(move || {
+        let foreground = Instant::now();
+        let mut measurements = WriteMeasurements::default();
+        for offset in 0..burst_entries {
+            let index = writer_workload.entries.saturating_add(offset);
+            let key = make_key(index, writer_workload.key_size(index));
+            let value = make_value(index, writer_workload.entry_size(index));
+            let priority = priority(index);
+            let submitted = Instant::now();
+            writer_cache.insert_with_properties(
+                key,
+                EngineValue::new(value, priority).expect("benchmark values must be non-empty"),
+                properties(priority),
+            );
+            if offset.is_multiple_of(sample_stride) {
+                measurements.latencies.push(submitted.elapsed());
+            }
+            measurements.operations += 1;
+            measurements.bytes += writer_workload.entry_size(index) as u64;
+            if offset == 0 {
+                writer_started.notify_one();
+            }
+        }
+        measurements.foreground = foreground.elapsed();
+        measurements
+    });
+
+    started.notified().await;
+    let reads = run_reads(cache, workload, config.reads, config.concurrency).await?;
+    let mut writes = writer.await?;
+    let drain = Instant::now();
+    cache.storage().wait().await;
+    writes.drain = drain.elapsed();
+    Ok((writes, reads))
 }
 
 fn make_key(index: u64, len: usize) -> Bytes {
@@ -649,6 +769,19 @@ fn quantile(values: &[Duration], numerator: usize, denominator: usize) -> Durati
     values[index]
 }
 
+fn duration_ratio(value: Duration, baseline: Duration) -> f64 {
+    value.as_secs_f64() / baseline.as_secs_f64().max(f64::EPSILON)
+}
+
+fn io_delta(after: IoMeasurements, before: IoMeasurements) -> IoMeasurements {
+    IoMeasurements {
+        write_bytes: after.write_bytes.saturating_sub(before.write_bytes),
+        write_ios: after.write_ios.saturating_sub(before.write_ios),
+        read_bytes: after.read_bytes.saturating_sub(before.read_bytes),
+        read_ios: after.read_ios.saturating_sub(before.read_ios),
+    }
+}
+
 fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHandle>) -> AnyResult<()> {
     let Some(handle) = handle else {
         return Ok(());
@@ -678,17 +811,20 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
     }
     if let Some(writes) = handle.write_stats() {
         println!(
-            "engine={} phase=extent_pipeline accepted={} dropped={} completed={} storage_rejected={} completed_batches={} failed_batches={}",
+            "engine={} phase=extent_pipeline accepted={} dropped={} shutdown_dropped={} shed_low={} shed_normal={} shed_high={} completed={} storage_rejected={} completed_batches={} failed_batches={}",
             engine.label(),
             writes.accepted_commands,
             writes.dropped_commands,
+            writes.shutdown_dropped_commands,
+            writes.shed_low_commands,
+            writes.shed_normal_commands,
+            writes.shed_high_commands,
             writes.completed_commands,
             writes.storage_rejected_puts,
             writes.completed_batches,
             writes.failed_batches,
         );
-        if writes.dropped_commands > 0
-            || writes.storage_rejected_puts > 0
+        if writes.storage_rejected_puts > 0
             || writes.failed_batches > 0
             || writes.completed_commands != writes.accepted_commands
         {

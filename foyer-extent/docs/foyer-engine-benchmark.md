@@ -20,6 +20,20 @@ The default entry sizes are 4, 16, 64, 256, and 1024 KiB. Default key sizes are 
 1024 bytes. Access concurrency defaults to twice the detected CPU core count and values below that
 are rejected.
 
+After the cold-memory read phase, the benchmark repeats the read workload on the same cache to
+establish a warm steady-state control, then runs it again while a new-key write wave is being
+submitted. It reports
+separate hit and miss latency distributions and `hit_p99_inflation` relative to the no-writer phase,
+plus foreground and drain time for the burst. Keeping hits separate prevents intentionally fast
+misses after eviction from hiding storage-read contention. The read side alone uses the configured
+concurrency and therefore retains the benchmark's `2 * cores` minimum while the writer submits the
+competing wave.
+Recover-only runs do not mutate the cache and therefore skip this phase.
+
+Best-effort priority shedding is reported as an observed pipeline outcome, not treated as
+corruption. The run still fails if any accepted command is unfinished, a storage write or batch
+fails, or the durable checkpoint trails the published recovery frontier.
+
 Reported Extent read bytes and I/O operations include both payload reads recorded through Foyer's
 device statistics and FixedRecordLSM reads. The separate `extent_read` and `extent_index_read`
 records provide that total's decomposition. Extent write statistics include the final metadata
