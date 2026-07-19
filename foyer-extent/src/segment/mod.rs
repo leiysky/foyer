@@ -12,8 +12,9 @@ mod store;
 
 pub use self::{
     checkpoint::CheckpointStats,
-    config::SegmentEngineConfig,
+    config::{DEFAULT_SEGMENT_SIZE, SegmentEngineConfig},
     engine::SegmentEngine,
+    format::EXTENT_FORMAT_VERSION,
     index::{IndexReadStats, IndexStats},
     stats::{PhysicalWriteStats, ReclaimStats},
 };

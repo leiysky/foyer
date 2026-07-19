@@ -220,7 +220,8 @@ where
 
     /// Close the disk cache gracefully.
     ///
-    /// `close` will wait for all ongoing flush and reclaim tasks to finish.
+    /// `close` waits for already-started atomic work to finish. Best-effort engines may discard
+    /// accepted commands that have not started, provided published entries remain recoverable.
     fn close(&self) -> BoxFuture<'static, Result<()>>;
 }
 

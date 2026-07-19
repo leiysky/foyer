@@ -14,7 +14,7 @@ use foyer::{Metrics, Statistics};
 
 use crate::{
     ReclaimStats,
-    foyer_engine::{ExtentPiece, mutex_lock, queue::QueueReservation, stats::EngineStats},
+    foyer_engine::{ExtentPiece, mutex_lock, queue::QueueReservation, read::ReadLimiter, stats::EngineStats},
     model::BlobKey,
     segment::{BatchInsertResult, BlobInsert, InsertOutcome, SegmentEngine},
 };
@@ -104,9 +104,12 @@ pub struct WriteWorker {
     statistics: Arc<Statistics>,
     batch_entries: usize,
     batch_bytes: usize,
+    read_busy_batch_bytes: usize,
     checkpoint_interval: Duration,
     background_error: Arc<BackgroundError>,
     stats: Arc<EngineStats>,
+    read_limiter: Arc<ReadLimiter>,
+    shutdown: Arc<AtomicBool>,
     #[cfg(test)]
     panic_next: Arc<AtomicBool>,
 }
@@ -117,9 +120,12 @@ impl WriteWorker {
         statistics: Arc<Statistics>,
         batch_entries: usize,
         batch_bytes: usize,
+        read_busy_batch_bytes: usize,
         checkpoint_interval: Duration,
         background_error: Arc<BackgroundError>,
         stats: Arc<EngineStats>,
+        read_limiter: Arc<ReadLimiter>,
+        shutdown: Arc<AtomicBool>,
         #[cfg(test)] panic_next: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -127,9 +133,12 @@ impl WriteWorker {
             statistics,
             batch_entries,
             batch_bytes,
+            read_busy_batch_bytes,
             checkpoint_interval,
             background_error,
             stats,
+            read_limiter,
+            shutdown,
             #[cfg(test)]
             panic_next,
         }
@@ -147,7 +156,7 @@ impl WriteWorker {
         }));
         if outcome.is_err() {
             self.background_error.record("Extent flush worker panicked".to_string());
-            drain_abandoned(receiver);
+            self.stats.record_abandoned(drain_abandoned(receiver));
         }
         if let Err(error) = sync_segment(&self.segment, self.statistics.as_ref(), &self.stats) {
             self.background_error.record(format!("sync Extent engine: {error}"));
@@ -175,6 +184,11 @@ impl WriteWorker {
                 }
                 Err(RecvTimeoutError::Disconnected) => return,
             };
+            if self.shutdown.load(Ordering::Acquire) {
+                let abandoned = 1usize.saturating_add(drain_abandoned(receiver));
+                self.stats.record_shutdown_dropped(abandoned);
+                return;
+            }
             #[cfg(test)]
             if self.panic_next.swap(false, Ordering::AcqRel) {
                 panic!("injected Extent flush worker panic");
@@ -182,7 +196,12 @@ impl WriteWorker {
             let mut bytes = first.charge();
             let mut commands = Vec::with_capacity(self.batch_entries.min(1_024));
             commands.push(first);
-            while commands.len() < self.batch_entries && bytes < self.batch_bytes {
+            let batch_bytes = if self.read_limiter.active() == 0 {
+                self.batch_bytes
+            } else {
+                self.read_busy_batch_bytes.min(self.batch_bytes)
+            };
+            while commands.len() < self.batch_entries && bytes < batch_bytes {
                 match receiver.try_recv() {
                     Ok(command) => {
                         bytes = bytes.saturating_add(command.charge());
@@ -190,6 +209,12 @@ impl WriteWorker {
                     }
                     Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
                 }
+            }
+
+            if !self.wait_for_write_budget() {
+                let abandoned = commands.len().saturating_add(drain_abandoned(receiver));
+                self.stats.record_shutdown_dropped(abandoned);
+                return;
             }
 
             let started = Instant::now();
@@ -233,6 +258,20 @@ impl WriteWorker {
                 self.stats.record_checkpoint(self.segment.checkpoint_stats());
                 checkpoint_requested_at = Instant::now();
             }
+        }
+    }
+
+    fn wait_for_write_budget(&self) -> bool {
+        loop {
+            if self.shutdown.load(Ordering::Acquire) {
+                return false;
+            }
+            let delay = self.statistics.write_throttle();
+            if delay.is_zero() {
+                return true;
+            }
+            // Keep shutdown responsive even when the configured token-bucket debt is large.
+            std::thread::sleep(delay.min(Duration::from_millis(10)));
         }
     }
 }
@@ -308,8 +347,12 @@ impl ProcessResult {
     }
 }
 
-fn drain_abandoned(receiver: &Receiver<Command>) {
-    while receiver.try_recv().is_ok() {}
+fn drain_abandoned(receiver: &Receiver<Command>) -> usize {
+    let mut commands = 0usize;
+    while receiver.try_recv().is_ok() {
+        commands = commands.saturating_add(1);
+    }
+    commands
 }
 
 #[cfg(test)]

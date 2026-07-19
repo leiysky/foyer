@@ -15,7 +15,7 @@ const STATE_CHECKSUM_SIZE: usize = size_of::<u32>();
 const STATE_MAGIC: [u8; 8] = *b"SCSEGST1";
 const OWNER_MAGIC: [u8; 4] = *b"SCOW";
 const LOCATION_MAGIC: [u8; 4] = *b"SCLO";
-const FORMAT_VERSION: u32 = 3;
+pub const EXTENT_FORMAT_VERSION: u32 = 3;
 const NO_SEGMENT: u32 = u32::MAX;
 const FIXED_LSM_INDEX_BYTES_PER_ENTRY: u64 = 76;
 // One steady-state copy, one atomic compaction output, and one bounded WAL/L0 write tail.
@@ -116,7 +116,7 @@ impl SegmentLayout {
     ) -> Option<Self> {
         if state_copy.len() < STATE_HEADER_SIZE
             || state_copy[..8] != STATE_MAGIC
-            || get_u32(state_copy, 8) != FORMAT_VERSION
+            || get_u32(state_copy, 8) != EXTENT_FORMAT_VERSION
         {
             return None;
         }
@@ -266,7 +266,7 @@ impl AllocatorState {
         self.validate(layout)?;
         let mut output = vec![0; layout.state_copy_size];
         output[..8].copy_from_slice(&STATE_MAGIC);
-        put_u32(&mut output, 8, FORMAT_VERSION);
+        put_u32(&mut output, 8, EXTENT_FORMAT_VERSION);
         put_u32(&mut output, 12, layout.segment_count);
         put_u32(&mut output, 16, layout.slots_per_segment);
         put_u32(
@@ -307,7 +307,7 @@ impl AllocatorState {
         if input.len() != layout.state_copy_size || input[..8] != STATE_MAGIC {
             return None;
         }
-        if get_u32(input, 8) != FORMAT_VERSION
+        if get_u32(input, 8) != EXTENT_FORMAT_VERSION
             || get_u32(input, 12) != layout.segment_count
             || get_u32(input, 16) != layout.slots_per_segment
             || get_u32(input, 20) as usize != layout.slot_size
@@ -407,7 +407,7 @@ impl SegmentLocation {
     pub fn encode(self) -> [u8; LOCATION_RECORD_SIZE] {
         let mut output = [0; LOCATION_RECORD_SIZE];
         output[..4].copy_from_slice(&LOCATION_MAGIC);
-        output[4] = FORMAT_VERSION as u8;
+        output[4] = EXTENT_FORMAT_VERSION as u8;
         output[5] = self.priority.to_byte();
         put_u64(&mut output, 8, self.physical_slot);
         put_u32(&mut output, 16, self.segment_generation);
@@ -421,7 +421,7 @@ impl SegmentLocation {
     pub fn decode(input: &[u8]) -> Option<Self> {
         if input.len() != LOCATION_RECORD_SIZE
             || input[..4] != LOCATION_MAGIC
-            || input[4] != FORMAT_VERSION as u8
+            || input[4] != EXTENT_FORMAT_VERSION as u8
             || checksum(&input[..28]) != get_u32(input, 28)
         {
             return None;
@@ -451,7 +451,7 @@ impl OwnerRecord {
     pub fn encode(self) -> [u8; OWNER_RECORD_SIZE] {
         let mut output = [0; OWNER_RECORD_SIZE];
         output[..4].copy_from_slice(&OWNER_MAGIC);
-        output[4] = FORMAT_VERSION as u8;
+        output[4] = EXTENT_FORMAT_VERSION as u8;
         output[5] = self.priority.to_byte();
         output[8..32].copy_from_slice(self.key_digest.as_bytes());
         put_u32(&mut output, 32, self.segment_generation);
@@ -467,7 +467,7 @@ impl OwnerRecord {
     pub fn decode(input: &[u8]) -> Option<Self> {
         if input.len() != OWNER_RECORD_SIZE
             || input[..4] != OWNER_MAGIC
-            || input[4] != FORMAT_VERSION as u8
+            || input[4] != EXTENT_FORMAT_VERSION as u8
             || checksum(&input[..56]) != get_u32(input, 56)
         {
             return None;

@@ -10,17 +10,22 @@ engine submission boundary and one byte-bounded disk queue. `SegmentEngine` owns
 publication, and checkpoint coordination; its concrete `Reclaimer` owns allocation pressure,
 generation-reuse fencing, and priority-aware reclaim.
 
-The balanced engine defaults use a 256 MiB submission budget, 128 MiB write batches, and a
-one-second periodic checkpoint request in addition to the mutation-count trigger. An
+The balanced engine defaults use a 256 MiB submission budget, 128 MiB idle write batches, an 8 MiB
+write batch while reads are active, and a one-second periodic checkpoint request in addition to
+the mutation-count trigger. Physical reads have a hard, non-waiting `2 * available_parallelism`
+admission limit. Low- and normal-priority writes are progressively shed before the queue is full,
+with earlier shedding while reads are active; high-priority writes retain the hard queue budget. An
 `ExtentEngineHandle` exposes queue depth, publication/durability frontiers, asynchronous write
-outcomes, physical I/O, reclaim work, and the first sticky background failure. These observations
-do not turn fire-and-forget puts into acknowledged writes.
+outcomes, active read admission, physical I/O, reclaim work, and the first sticky background
+failure. These observations do not turn fire-and-forget puts into acknowledged writes.
 
 The same state is exported through Foyer's metrics registry as
 `foyer_storage_engine_command_total`, `foyer_storage_engine_batch_total`,
 `foyer_storage_engine_queue_entries`, `foyer_storage_engine_queue_bytes`,
-`foyer_storage_engine_checkpoint`, and `foyer_storage_engine_healthy`. Queue gauges are updated at
-reservation ownership changes; the worker refreshes checkpoint frontiers on every batch and
+`foyer_storage_engine_checkpoint`, `foyer_storage_engine_read_total`,
+`foyer_storage_engine_readers`, `foyer_storage_engine_duration`,
+`foyer_storage_engine_recovery_total`, and `foyer_storage_engine_healthy`. Queue gauges are updated
+at reservation ownership changes; the worker refreshes checkpoint frontiers on every batch and
 periodic checkpoint tick. `storage_usage()` is an O(1) snapshot: preallocated segment-file usage is
 fixed by the discovered layout, while FixedRecordLSM reports its atomic disk-budget counter.
 
@@ -43,6 +48,11 @@ implementation requires an atomic segment-generation replacement and must not be
 O(live entries) tombstone pass. Close and reopen with `RecoverMode::None` to reset the cache.
 Reset removes only Extent-owned files below the configured directory; it does not recursively
 delete that directory or unrelated caller files.
+
+Graceful close rejects new submissions, completes at most the atomic batch already executing,
+discards the unstarted queue tail, and publishes one final durable checkpoint. The discarded tail
+is explicitly counted. This bounds shutdown by one batch plus checkpoint work without exposing a
+partially published entry; cache writes remain best effort and the source remains authoritative.
 
 Compatibility CI reconstructs a frozen complete V3 engine image—including payload, owners,
 allocator pages, FixedRecordLSM manifest, and WAL—then opens it, reads it, advances it with the

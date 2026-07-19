@@ -17,5 +17,8 @@ pub use self::{
     format::DEFAULT_SLOT_SIZE,
     foyer_engine::{EngineReadStats, EngineWriteStats, ExtentEngineConfig, ExtentEngineHandle},
     model::{CachePriority, MAX_BLOB_KEY_SIZE},
-    segment::{CheckpointStats, IndexReadStats, IndexStats, PhysicalWriteStats, ReclaimStats},
+    segment::{
+        CheckpointStats, DEFAULT_SEGMENT_SIZE, EXTENT_FORMAT_VERSION, IndexReadStats, IndexStats, PhysicalWriteStats,
+        ReclaimStats,
+    },
 };

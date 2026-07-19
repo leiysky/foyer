@@ -1,6 +1,6 @@
 use crate::format::DEFAULT_SLOT_SIZE;
 
-const DEFAULT_SEGMENT_SIZE: usize = 64 * 1024 * 1024;
+pub const DEFAULT_SEGMENT_SIZE: usize = 64 * 1024 * 1024;
 const DEFAULT_READ_RUN_SIZE: usize = DEFAULT_SLOT_SIZE;
 const DEFAULT_WRITE_RUN_SIZE: usize = 1024 * 1024;
 const DEFAULT_INDEX_WRITE_BUFFER_SIZE: usize = 64 * 1024 * 1024;

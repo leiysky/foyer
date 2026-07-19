@@ -8,7 +8,7 @@ use std::{
 
 use foyer::{Metrics, Statistics};
 
-use crate::{CheckpointStats, ReclaimStats, foyer_engine::mutex_lock};
+use crate::{CachePriority, CheckpointStats, ReclaimStats, foyer_engine::mutex_lock};
 
 const LATENCY_SAMPLE_CAPACITY: usize = 16_384;
 
@@ -28,6 +28,14 @@ pub struct EngineWriteStats {
     pub accepted_commands: u64,
     /// Commands shed by admission, validation, close, or an enqueue race.
     pub dropped_commands: u64,
+    /// Accepted commands discarded during a bounded graceful shutdown.
+    pub shutdown_dropped_commands: u64,
+    /// Low-priority commands shed before reaching the hard queue bound.
+    pub shed_low_commands: u64,
+    /// Normal-priority commands shed before reaching the hard queue bound.
+    pub shed_normal_commands: u64,
+    /// High-priority commands shed at the hard queue bound.
+    pub shed_high_commands: u64,
     /// Accepted commands fully processed by SegmentEngine.
     pub completed_commands: u64,
     /// Put commands processed but rejected by SegmentEngine under allocation pressure.
@@ -92,6 +100,44 @@ impl EngineStats {
         self.metrics.storage_engine_command_dropped.increase(1);
     }
 
+    pub fn record_shed_command(&self, priority: CachePriority) {
+        self.record_dropped_command();
+        match priority {
+            CachePriority::Low => {
+                self.writes.shed_low_commands.fetch_add(1, Ordering::Relaxed);
+                self.metrics.storage_engine_command_shed_low.increase(1);
+            }
+            CachePriority::Normal => {
+                self.writes.shed_normal_commands.fetch_add(1, Ordering::Relaxed);
+                self.metrics.storage_engine_command_shed_normal.increase(1);
+            }
+            CachePriority::High => {
+                self.writes.shed_high_commands.fetch_add(1, Ordering::Relaxed);
+                self.metrics.storage_engine_command_shed_high.increase(1);
+            }
+        }
+    }
+
+    pub fn record_shutdown_dropped(&self, commands: usize) {
+        self.writes
+            .dropped_commands
+            .fetch_add(commands as u64, Ordering::Relaxed);
+        self.writes
+            .shutdown_dropped_commands
+            .fetch_add(commands as u64, Ordering::Relaxed);
+        self.metrics.storage_engine_command_dropped.increase(commands as u64);
+        self.metrics
+            .storage_engine_command_shutdown_dropped
+            .increase(commands as u64);
+    }
+
+    pub fn record_abandoned(&self, commands: usize) {
+        self.writes
+            .dropped_commands
+            .fetch_add(commands as u64, Ordering::Relaxed);
+        self.metrics.storage_engine_command_dropped.increase(commands as u64);
+    }
+
     pub fn record_completed_batch(&self, commands: usize, storage_rejected_puts: usize) {
         self.writes
             .completed_commands
@@ -132,12 +178,16 @@ impl EngineStats {
 
     pub fn record_write_batch(&self, latency: Duration) {
         mutex_lock(&self.write_batches).record(latency);
+        self.metrics.storage_engine_batch_duration.record(latency.as_secs_f64());
     }
 
     pub fn record_write_publications(&self, latencies: impl IntoIterator<Item = Duration>) {
         let mut samples = mutex_lock(&self.write_publications);
         for latency in latencies {
             samples.record(latency);
+            self.metrics
+                .storage_engine_publication_duration
+                .record(latency.as_secs_f64());
         }
     }
 
@@ -195,6 +245,10 @@ struct EngineReadCounters {
 struct EngineWriteCounters {
     accepted_commands: AtomicU64,
     dropped_commands: AtomicU64,
+    shutdown_dropped_commands: AtomicU64,
+    shed_low_commands: AtomicU64,
+    shed_normal_commands: AtomicU64,
+    shed_high_commands: AtomicU64,
     completed_commands: AtomicU64,
     storage_rejected_puts: AtomicU64,
     completed_batches: AtomicU64,
@@ -206,6 +260,10 @@ impl EngineWriteCounters {
         EngineWriteStats {
             accepted_commands: self.accepted_commands.load(Ordering::Relaxed),
             dropped_commands: self.dropped_commands.load(Ordering::Relaxed),
+            shutdown_dropped_commands: self.shutdown_dropped_commands.load(Ordering::Relaxed),
+            shed_low_commands: self.shed_low_commands.load(Ordering::Relaxed),
+            shed_normal_commands: self.shed_normal_commands.load(Ordering::Relaxed),
+            shed_high_commands: self.shed_high_commands.load(Ordering::Relaxed),
             completed_commands: self.completed_commands.load(Ordering::Relaxed),
             storage_rejected_puts: self.storage_rejected_puts.load(Ordering::Relaxed),
             completed_batches: self.completed_batches.load(Ordering::Relaxed),
