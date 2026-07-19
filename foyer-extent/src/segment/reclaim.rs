@@ -10,7 +10,8 @@ use crate::{
         operation::InsertOutcome,
         stats::ReclaimStats,
         store::{
-            ReclaimTransaction, SegmentAllocation, SegmentAllocationResult, SegmentStore, SegmentVictim, SegmentWrite,
+            ReclaimCandidates, ReclaimTransaction, SegmentAllocation, SegmentAllocationResult, SegmentStore,
+            SegmentVictim, SegmentWrite,
         },
     },
 };
@@ -26,6 +27,7 @@ pub struct Reclaimer<'a> {
     store: &'a SegmentStore,
     checkpoints: &'a CheckpointCoordinator,
     slot_size: usize,
+    priority_capacity_floors: [u32; 3],
     hot_frequency: u8,
     low_hot_frequency: u8,
 }
@@ -36,6 +38,7 @@ impl<'a> Reclaimer<'a> {
         store: &'a SegmentStore,
         checkpoints: &'a CheckpointCoordinator,
         slot_size: usize,
+        priority_capacity_floors: [u32; 3],
         hot_frequency: u8,
         low_hot_frequency: u8,
     ) -> Self {
@@ -44,6 +47,7 @@ impl<'a> Reclaimer<'a> {
             store,
             checkpoints,
             slot_size,
+            priority_capacity_floors,
             hot_frequency,
             low_hot_frequency,
         }
@@ -64,14 +68,7 @@ impl<'a> Reclaimer<'a> {
                 }
                 SegmentAllocationResult::ReclaimRequired => {}
             }
-            let sealed = self.store.victim(priority);
-            let current = self.store.current_victim(priority);
-            let candidate = match (sealed, current) {
-                (Some(sealed), Some(current)) if victim_order(current) < victim_order(sealed) => Some((current, true)),
-                (Some(sealed), _) => Some((sealed, false)),
-                (None, Some(current)) => Some((current, true)),
-                (None, None) => None,
-            };
+            let candidate = select_victim(self.store.reclaim_candidates(), priority, self.priority_capacity_floors);
             let Some((victim, is_current)) = candidate else {
                 return Ok(AllocationDecision::Rejected(reclaimed));
             };
@@ -306,8 +303,29 @@ struct Promotion {
     checksum: u32,
 }
 
-const fn victim_order(victim: SegmentVictim) -> (CachePriority, u64, u32) {
-    (victim.priority, victim.sequence, victim.segment)
+fn select_victim(
+    candidates: ReclaimCandidates,
+    incoming: CachePriority,
+    capacity_floors: [u32; 3],
+) -> Option<(SegmentVictim, bool)> {
+    let borrowed = |priority| {
+        if candidates.occupied_segments(priority) > capacity_floors[priority as usize] {
+            candidates.oldest(priority)
+        } else {
+            None
+        }
+    };
+    match incoming {
+        CachePriority::Low => candidates.oldest(CachePriority::Low),
+        CachePriority::Normal => candidates
+            .oldest(CachePriority::Low)
+            .or_else(|| borrowed(CachePriority::High))
+            .or_else(|| candidates.oldest(CachePriority::Normal)),
+        CachePriority::High => candidates
+            .oldest(CachePriority::Low)
+            .or_else(|| borrowed(CachePriority::Normal))
+            .or_else(|| candidates.oldest(CachePriority::High)),
+    }
 }
 
 pub fn promotion_limit(slots_per_segment: u32) -> usize {

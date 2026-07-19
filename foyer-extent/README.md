@@ -12,13 +12,14 @@ generation-reuse fencing, and priority-aware reclaim.
 
 The balanced engine defaults use a 256 MiB submission budget, 128 MiB idle write batches, an 8 MiB
 write batch while reads are active, and a one-second periodic checkpoint request in addition to
-the mutation-count trigger. Physical reads have a hard, non-waiting `2 * available_parallelism`
-admission limit. The synchronous payload I/O scheduler gives an active blob read a bounded 2 ms
-head start over newly admitted writes; reads never wait behind writes, and writes proceed after the
-bound so sustained reads cannot starve publication. This is a cooperative admission layer: the
-calling thread retains the buffer and executes `pread`, `pwrite`, or `fdatasync`; no extra executor
-or io_uring dependency is involved. Set the read-priority duration to zero for a full runtime
-bypass.
+the mutation-count trigger. High and normal priorities have borrowable 10% and 70% logical segment
+capacity floors; low priority uses unprotected capacity. Physical reads have a hard, non-waiting
+`2 * available_parallelism` admission limit. The synchronous payload I/O scheduler gives an active
+blob read a bounded 2 ms head start over newly admitted writes; reads never wait behind writes, and
+writes proceed after the bound so sustained reads cannot starve publication. This is a cooperative
+admission layer: the calling thread retains the buffer and executes `pread`, `pwrite`, or
+`fdatasync`; no extra executor or io_uring dependency is involved. Set the read-priority duration
+to zero for a full runtime bypass.
 
 Low- and normal-priority writes are progressively shed before the queue is full, with earlier
 shedding while reads are active; high-priority writes retain the hard queue budget. An
@@ -30,6 +31,7 @@ The Foyer-facing queue, pipeline, and recovery state is also exported through it
 `foyer_storage_engine_command_total`, `foyer_storage_engine_batch_total`,
 `foyer_storage_engine_queue_entries`, `foyer_storage_engine_queue_bytes`,
 `foyer_storage_engine_checkpoint`, `foyer_storage_engine_read_total`,
+`foyer_storage_engine_priority_segments`, `foyer_storage_engine_priority_allocated_bytes`,
 `foyer_storage_engine_readers`, `foyer_storage_engine_duration`,
 `foyer_storage_engine_recovery_total`, and `foyer_storage_engine_healthy`. Queue gauges are updated
 at reservation ownership changes; the worker refreshes checkpoint frontiers on every batch and

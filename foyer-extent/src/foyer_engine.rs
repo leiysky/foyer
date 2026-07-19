@@ -21,7 +21,7 @@ use tokio::sync::Notify;
 
 use crate::{
     CheckpointStats, EngineValue, Error, IndexReadStats, IndexStats, IoSchedulerStats, MAX_BLOB_KEY_SIZE,
-    PhysicalWriteStats, ReclaimStats,
+    PhysicalWriteStats, PriorityOccupancy, ReclaimStats,
     format::BLOB_HEADER_SIZE,
     model::BlobKey,
     segment::{SegmentEngine, SegmentEngineConfig},
@@ -164,6 +164,16 @@ impl ExtentEngineConfig {
         self
     }
 
+    /// Set the minimum usable-segment percentages protected for high and normal priority data.
+    ///
+    /// The percentages may sum to at most 100 and are rounded up to whole segments. Unoccupied
+    /// protection remains shared capacity; low-priority data has no protected floor.
+    pub fn with_priority_capacity_floors(mut self, high_percent: u8, normal_percent: u8) -> Self {
+        self.segment.options.priority_capacity_floors =
+            crate::segment::PriorityCapacityFloors::new(high_percent, normal_percent);
+        self
+    }
+
     /// Select direct data-file I/O on supported Linux filesystems.
     pub fn with_direct_io(mut self, direct_io: bool) -> Self {
         self.segment.options.direct_io = direct_io;
@@ -300,6 +310,10 @@ impl ExtentEngineHandle {
 
     pub fn reclaim_stats(&self) -> Option<ReclaimStats> {
         self.upgrade().map(|inner| inner.stats.reclaim())
+    }
+
+    pub fn priority_occupancy(&self) -> Option<PriorityOccupancy> {
+        self.upgrade().map(|inner| inner.segment.priority_occupancy())
     }
 
     pub fn read_stats(&self) -> Option<EngineReadStats> {
@@ -458,6 +472,7 @@ impl ExtentEngine {
         let background_error = Arc::new(BackgroundError::new(metrics.clone()));
         metrics.storage_engine_healthy.absolute(1);
         let stats = Arc::new(EngineStats::new(metrics.clone()));
+        stats.record_priority_occupancy(segment.priority_occupancy());
         let read_limiter = ReadLimiter::new(config.read_concurrency, metrics.clone());
         let shutdown = Arc::new(AtomicBool::new(false));
         stats.record_checkpoint(segment.checkpoint_stats());
@@ -927,7 +942,7 @@ mod tests {
         let reopened = open_segment(directory.path(), segment_config, RecoverMode::Strict).unwrap();
         let mut hits = 0;
         for suffix in 0..128u8 {
-            let key = BlobKey::new(&[b'k', suffix]).unwrap();
+            let key = BlobKey::new([b'k', suffix]).unwrap();
             if let Some(value) = reopened.engine.get(&key).unwrap() {
                 assert_eq!(value, vec![suffix; 4096]);
                 hits += 1;

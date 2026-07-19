@@ -228,6 +228,7 @@ impl WriteWorker {
                         result.write_runs,
                         result.written_bytes,
                     );
+                    self.stats.record_priority_occupancy(self.segment.priority_occupancy());
                 }
                 Err(error) => {
                     self.stats.record_failed_batch();

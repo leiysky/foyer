@@ -97,10 +97,23 @@ acknowledgement.
 
 ## Reclaim
 
-Allocation is append-oriented within the current segment. Under pressure, a victim segment is
-selected using caller priority, frequency estimate, and age. Valuable entries may be promoted into
-the reclaim target; others are removed from the index. Segment generation changes fence all stale
-locations.
+Allocation is append-oriented within the current segment. Under pressure, priority capacity floors
+first select a reclaimable class, then age selects a victim segment. The default protects 10% of
+usable segments for high-priority data and 70% for normal-priority data; these are logical lower
+bounds, rounded up to reclaim-unit granularity, rather than preallocated partitions. Empty
+protection and all unreserved capacity remain borrowable. Low priority has no floor and can recycle
+only low-priority segments.
+
+Normal pressure reclaims low data first, then high occupancy above the high floor, then normal
+data. High pressure reclaims low data first, then normal occupancy above the normal floor, then
+high data. Thus stale historical high-priority data cannot starve normal demand, and high writes
+cannot consume normal's protected working set. Floor percentages are runtime policy and may change
+across reopen; segment ownership remains part of the durable allocator state.
+
+Within the selected class, valuable entries may be promoted into the reclaim target; others are
+removed from the index. Promotion is considered only for same-priority reclaim and is capped at the
+hottest one eighth of the source segment, bounding promotion-only write amplification at one
+seventh. Segment generation changes fence all stale locations.
 
 The concrete `Reclaimer` owns that complete transition. `SegmentEngine` invokes it only from the
 ordered publication path while holding the mutation lock; it is deliberately not an independent
@@ -115,6 +128,7 @@ Priority and temperature remain distinct:
 
 - priority is supplied by the caller (`high`, `normal`, `low`);
 - temperature is the volatile TinyLFU-style reuse estimate;
+- capacity floors protect minimum physical residency without persisting temperature;
 - promotion requires the configured threshold for the entry's priority.
 
 ## FixedRecordLSM boundary

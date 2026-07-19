@@ -19,7 +19,7 @@ use crate::{
     segment::{
         format::{AllocatorState, OWNER_RECORD_SIZE, OwnerRecord, SegmentLayout, SegmentLocation, SegmentRole},
         io::{IoSchedulerStats, SegmentIoScheduler},
-        stats::PhysicalWriteStats,
+        stats::{PhysicalWriteStats, PriorityOccupancy},
     },
 };
 
@@ -83,6 +83,33 @@ pub struct SegmentVictim {
     pub used: u32,
     pub priority: CachePriority,
     pub sequence: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReclaimCandidates {
+    occupied_segments: [u32; 3],
+    sealed: [Option<SegmentVictim>; 3],
+    current: [Option<SegmentVictim>; 3],
+}
+
+impl ReclaimCandidates {
+    pub const fn occupied_segments(self, priority: CachePriority) -> u32 {
+        self.occupied_segments[priority as usize]
+    }
+
+    pub fn oldest(self, priority: CachePriority) -> Option<(SegmentVictim, bool)> {
+        let priority = priority as usize;
+        match (self.sealed[priority], self.current[priority]) {
+            (Some(sealed), Some(current))
+                if (current.sequence, current.segment) < (sealed.sequence, sealed.segment) =>
+            {
+                Some((current, true))
+            }
+            (Some(sealed), _) => Some((sealed, false)),
+            (None, Some(current)) => Some((current, true)),
+            (None, None) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -518,38 +545,59 @@ impl SegmentStore {
         Ok(result)
     }
 
-    pub fn victim(&self, incoming: CachePriority) -> Option<SegmentVictim> {
+    pub fn reclaim_candidates(&self) -> ReclaimCandidates {
         let state = mutex_lock(&self.state);
-        state
-            .segments
-            .iter()
-            .enumerate()
-            .filter(|(_, segment)| segment.role == SegmentRole::Sealed && segment.priority <= incoming)
-            .min_by_key(|(_, segment)| (segment.priority, segment.sequence))
-            .map(|(index, segment)| SegmentVictim {
+        let mut candidates = ReclaimCandidates::default();
+        for (index, segment) in state.segments.iter().enumerate() {
+            let priority = segment.priority as usize;
+            if matches!(
+                segment.role,
+                SegmentRole::Current | SegmentRole::Sealed | SegmentRole::ReclaimSource
+            ) {
+                candidates.occupied_segments[priority] = candidates.occupied_segments[priority].saturating_add(1);
+            }
+            let target = match segment.role {
+                SegmentRole::Current => &mut candidates.current[priority],
+                SegmentRole::Sealed => &mut candidates.sealed[priority],
+                _ => continue,
+            };
+            let victim = SegmentVictim {
                 segment: u32::try_from(index).expect("segment index must fit u32"),
                 generation: segment.generation,
                 used: segment.used,
                 priority: segment.priority,
                 sequence: segment.sequence,
-            })
+            };
+            if target.is_none_or(|current| (victim.sequence, victim.segment) < (current.sequence, current.segment)) {
+                *target = Some(victim);
+            }
+        }
+        candidates
     }
 
-    pub fn current_victim(&self, incoming: CachePriority) -> Option<SegmentVictim> {
+    pub fn priority_occupancy(&self, capacity_floor_segments: [u32; 3]) -> PriorityOccupancy {
         let state = mutex_lock(&self.state);
-        state
-            .segments
-            .iter()
-            .enumerate()
-            .filter(|(_, segment)| segment.role == SegmentRole::Current && segment.priority <= incoming)
-            .min_by_key(|(_, segment)| (segment.priority, segment.sequence))
-            .map(|(index, segment)| SegmentVictim {
-                segment: u32::try_from(index).expect("segment index must fit u32"),
-                generation: segment.generation,
-                used: segment.used,
-                priority: segment.priority,
-                sequence: segment.sequence,
-            })
+        let mut occupied_segments = [0u32; 3];
+        let mut used_slots = [0u64; 3];
+        for segment in &state.segments {
+            if !matches!(
+                segment.role,
+                SegmentRole::Current | SegmentRole::Sealed | SegmentRole::ReclaimSource
+            ) {
+                continue;
+            }
+            let priority = segment.priority as usize;
+            occupied_segments[priority] = occupied_segments[priority].saturating_add(1);
+            used_slots[priority] = used_slots[priority].saturating_add(u64::from(segment.used));
+        }
+        PriorityOccupancy::new(
+            self.layout.segment_count.saturating_sub(1),
+            self.layout.slots_per_segment,
+            self.layout.slot_size,
+            occupied_segments,
+            used_slots,
+            capacity_floor_segments,
+        )
     }
 
     pub fn seal_current(&self, victim: SegmentVictim) -> Result<SegmentVictim> {
@@ -1190,7 +1238,8 @@ mod tests {
             }])
             .unwrap()
             .locations[0];
-        let victim = store.current_victim(CachePriority::Normal).unwrap();
+        let (victim, is_current) = store.reclaim_candidates().oldest(CachePriority::Normal).unwrap();
+        assert!(is_current);
         let victim = store.seal_current(victim).unwrap();
 
         let value = store

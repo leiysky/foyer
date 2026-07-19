@@ -18,7 +18,8 @@ pub use self::{
     foyer_engine::{EngineReadStats, EngineWriteStats, ExtentEngineConfig, ExtentEngineHandle},
     model::{CachePriority, MAX_BLOB_KEY_SIZE},
     segment::{
-        CheckpointStats, DEFAULT_SEGMENT_SIZE, EXTENT_FORMAT_VERSION, IndexReadStats, IndexStats, IoSchedulerStats,
-        PhysicalWriteStats, ReclaimStats,
+        CheckpointStats, DEFAULT_HIGH_PRIORITY_CAPACITY_PERCENT, DEFAULT_NORMAL_PRIORITY_CAPACITY_PERCENT,
+        DEFAULT_SEGMENT_SIZE, EXTENT_FORMAT_VERSION, IndexReadStats, IndexStats, IoSchedulerStats, PhysicalWriteStats,
+        PriorityOccupancy, ReclaimStats,
     },
 };

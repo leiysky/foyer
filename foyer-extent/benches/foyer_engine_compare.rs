@@ -13,7 +13,10 @@ use foyer::{
     BlockEngineConfig, Compression, DeviceBuilder, EngineConfig, FsDeviceBuilder, Hint, HybridCache, HybridCachePolicy,
     HybridCacheProperties, PsyncIoEngineConfig, RecoverMode, S3FifoConfig,
 };
-use foyer_extent::{CachePriority, EngineValue, ExtentEngineConfig, ExtentEngineHandle, MAX_BLOB_KEY_SIZE};
+use foyer_extent::{
+    CachePriority, DEFAULT_HIGH_PRIORITY_CAPACITY_PERCENT, DEFAULT_NORMAL_PRIORITY_CAPACITY_PERCENT, EngineValue,
+    ExtentEngineConfig, ExtentEngineHandle, MAX_BLOB_KEY_SIZE,
+};
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
@@ -27,6 +30,21 @@ type BenchCache = HybridCache<Bytes, EngineValue>;
 enum DiskEngine {
     Block,
     Extent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PriorityWorkload {
+    ScopeDb,
+    HistoricalHigh,
+}
+
+impl PriorityWorkload {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::ScopeDb => "scopedb",
+            Self::HistoricalHigh => "historical-high",
+        }
+    }
 }
 
 impl DiskEngine {
@@ -53,6 +71,8 @@ struct Config {
     extent_index_cache_bytes: usize,
     extent_index_write_buffer_bytes: usize,
     extent_io_read_priority: Duration,
+    extent_high_capacity_percent: u8,
+    extent_normal_capacity_percent: u8,
     concurrency: usize,
     shards: usize,
     write_concurrency: usize,
@@ -98,6 +118,20 @@ impl Config {
             return Err(invalid("direct I/O benchmark mode is only supported on Linux").into());
         }
         let recover_only = env_bool("EXTENT_BENCH_RECOVER_ONLY", false)?;
+        let extent_high_capacity_percent = env_percent(
+            "EXTENT_BENCH_HIGH_CAPACITY_PERCENT",
+            DEFAULT_HIGH_PRIORITY_CAPACITY_PERCENT,
+        )?;
+        let extent_normal_capacity_percent = env_percent(
+            "EXTENT_BENCH_NORMAL_CAPACITY_PERCENT",
+            DEFAULT_NORMAL_PRIORITY_CAPACITY_PERCENT,
+        )?;
+        if u16::from(extent_high_capacity_percent) + u16::from(extent_normal_capacity_percent) > 100 {
+            return Err(invalid(
+                "EXTENT_BENCH_HIGH_CAPACITY_PERCENT and EXTENT_BENCH_NORMAL_CAPACITY_PERCENT must sum to at most 100",
+            )
+            .into());
+        }
 
         Ok(Self {
             root,
@@ -115,6 +149,8 @@ impl Config {
             extent_io_read_priority: Duration::from_micros(
                 env_optional_u64("EXTENT_BENCH_IO_READ_PRIORITY_US")?.unwrap_or(2_000),
             ),
+            extent_high_capacity_percent,
+            extent_normal_capacity_percent,
             concurrency,
             shards: env_usize("EXTENT_BENCH_SHARDS", cores.next_power_of_two())?,
             write_concurrency: env_usize("EXTENT_BENCH_EXTENT_WRITE_CONCURRENCY", (cores / 2).clamp(1, 8))?,
@@ -133,6 +169,7 @@ struct Workload {
     entry_sizes: Vec<usize>,
     key_sizes: Vec<usize>,
     cycle_bytes: u64,
+    priority: PriorityWorkload,
 }
 
 impl Workload {
@@ -165,12 +202,14 @@ impl Workload {
             None => entries_for_payload(target_payload, &entry_sizes, cycle_bytes),
         };
         let payload_bytes = patterned_bytes(entries, &entry_sizes, cycle_bytes);
+        let priority = parse_priority_workload()?;
         Ok(Self {
             entries,
             payload_bytes,
             entry_sizes,
             key_sizes,
             cycle_bytes,
+            priority,
         })
     }
 
@@ -188,6 +227,18 @@ impl Workload {
 
     fn wave_entries(&self, wave_bytes: usize) -> u64 {
         ((wave_bytes as u64).saturating_mul(self.entry_sizes.len() as u64) / self.cycle_bytes).max(1)
+    }
+
+    fn priority(&self, index: u64) -> CachePriority {
+        match self.priority {
+            PriorityWorkload::ScopeDb => match index % 10 {
+                0 => CachePriority::High,
+                1..=3 => CachePriority::Normal,
+                _ => CachePriority::Low,
+            },
+            PriorityWorkload::HistoricalHigh if index < self.entries / 2 => CachePriority::High,
+            PriorityWorkload::HistoricalHigh => CachePriority::Normal,
+        }
     }
 }
 
@@ -259,7 +310,7 @@ async fn main() -> AnyResult<()> {
     fs::create_dir_all(&config.root)?;
 
     println!(
-        "foyer-engine benchmark: path={}, engines={}, entries={}, payload_mib={:.1}, capacity_mib={}, memory_mib={}, entry_kib={}, key_bytes={}, concurrency={} (>=2x cores), io={}, extent_read_priority_us={}, recover_only={}",
+        "foyer-engine benchmark: path={}, engines={}, entries={}, payload_mib={:.1}, capacity_mib={}, memory_mib={}, entry_kib={}, key_bytes={}, priority_workload={}, concurrency={} (>=2x cores), io={}, extent_read_priority_us={}, extent_priority_floors={}/{}, recover_only={}",
         config.root.display(),
         config
             .engines
@@ -273,9 +324,12 @@ async fn main() -> AnyResult<()> {
         config.memory_bytes / MIB,
         join_sizes(&workload.entry_sizes, KIB),
         join_sizes(&workload.key_sizes, 1),
+        workload.priority.label(),
         config.concurrency,
         if config.direct_io { "direct" } else { "buffered" },
         config.extent_io_read_priority.as_micros(),
+        config.extent_high_capacity_percent,
+        config.extent_normal_capacity_percent,
         config.recover_only,
     );
 
@@ -488,6 +542,10 @@ async fn build_cache(
                 .with_io_read_priority_duration(config.extent_io_read_priority)
                 .with_index_cache_size(config.extent_index_cache_bytes)
                 .with_index_write_buffer_size(config.extent_index_write_buffer_bytes)
+                .with_priority_capacity_floors(
+                    config.extent_high_capacity_percent,
+                    config.extent_normal_capacity_percent,
+                )
                 .with_direct_io(config.direct_io)
                 .with_queue_capacity_bytes(config.queue_bytes)
                 .with_queue_capacity_entries(queue_entries)
@@ -537,7 +595,7 @@ async fn run_writes(cache: &BenchCache, config: &Config, workload: Arc<Workload>
                 while index < end {
                     let key = make_key(index, workload.key_size(index));
                     let value = make_value(index, workload.entry_size(index));
-                    let priority = priority(index);
+                    let priority = workload.priority(index);
                     let submitted = Instant::now();
                     cache.insert_with_properties(
                         key,
@@ -598,7 +656,7 @@ async fn run_reads(
             let mut operation = worker as u64;
             while operation < reads {
                 let index = mix64(operation ^ 0x9e37_79b9_7f4a_7c15) % workload.entries;
-                let priority = priority(index);
+                let priority = workload.priority(index);
                 result.requests_by_priority[priority.to_byte() as usize] += 1;
                 let key = make_key(index, workload.key_size(index));
                 let requested = Instant::now();
@@ -673,7 +731,7 @@ async fn run_read_under_write_burst(
             let index = writer_workload.entries.saturating_add(offset);
             let key = make_key(index, writer_workload.key_size(index));
             let value = make_value(index, writer_workload.entry_size(index));
-            let priority = priority(index);
+            let priority = writer_workload.priority(index);
             let submitted = Instant::now();
             writer_cache.insert_with_properties(
                 key,
@@ -725,14 +783,6 @@ fn validate_value(index: u64, len: usize, value: &Bytes) -> bool {
         && value.get(..8) == Some(index.to_le_bytes().as_slice())
         && value.get(8..16) == Some((len as u64).to_le_bytes().as_slice())
         && value.get(16).copied() == Some(index as u8)
-}
-
-const fn priority(index: u64) -> CachePriority {
-    match index % 10 {
-        0 => CachePriority::High,
-        1..=3 => CachePriority::Normal,
-        _ => CachePriority::Low,
-    }
 }
 
 fn properties(priority: CachePriority) -> HybridCacheProperties {
@@ -829,6 +879,23 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
             index.sst_files,
             as_mib(index.sst_bytes),
             as_mib(index.cache_resident_bytes),
+        );
+    }
+    if let Some(occupancy) = handle.priority_occupancy() {
+        println!(
+            "engine={} phase=extent_priority usable_segments={} high_segments={} high_floor={} high_borrowed={} high_mib={:.1} normal_segments={} normal_floor={} normal_borrowed={} normal_mib={:.1} low_segments={} low_mib={:.1}",
+            engine.label(),
+            occupancy.usable_segments(),
+            occupancy.occupied_segments(CachePriority::High),
+            occupancy.capacity_floor_segments(CachePriority::High),
+            occupancy.borrowed_segments(CachePriority::High),
+            as_mib(occupancy.used_bytes(CachePriority::High)),
+            occupancy.occupied_segments(CachePriority::Normal),
+            occupancy.capacity_floor_segments(CachePriority::Normal),
+            occupancy.borrowed_segments(CachePriority::Normal),
+            as_mib(occupancy.used_bytes(CachePriority::Normal)),
+            occupancy.occupied_segments(CachePriority::Low),
+            as_mib(occupancy.used_bytes(CachePriority::Low)),
         );
     }
     if let Some(writes) = handle.write_stats() {
@@ -1011,6 +1078,16 @@ fn parse_engines() -> AnyResult<Vec<DiskEngine>> {
     Ok(engines)
 }
 
+fn parse_priority_workload() -> AnyResult<PriorityWorkload> {
+    match env::var("EXTENT_BENCH_PRIORITY_WORKLOAD") {
+        Ok(value) if value == "scopedb" => Ok(PriorityWorkload::ScopeDb),
+        Ok(value) if value == "historical-high" => Ok(PriorityWorkload::HistoricalHigh),
+        Ok(_) => Err(invalid("EXTENT_BENCH_PRIORITY_WORKLOAD accepts scopedb and historical-high").into()),
+        Err(env::VarError::NotPresent) => Ok(PriorityWorkload::ScopeDb),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn env_list_kib(name: &str, default: &[usize]) -> AnyResult<Vec<usize>> {
     env_list_usize(name, default)?
         .into_iter()
@@ -1059,6 +1136,24 @@ fn env_usize(name: &str, default: usize) -> AnyResult<usize> {
                     Err(invalid(format!("{name} must be positive")))
                 } else {
                     Ok(value)
+                }
+            })
+            .map_err(Into::into),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn env_percent(name: &str, default: u8) -> AnyResult<u8> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<u8>()
+            .map_err(|_| invalid(format!("{name} must be an integer between 0 and 100")))
+            .and_then(|value| {
+                if value <= 100 {
+                    Ok(value)
+                } else {
+                    Err(invalid(format!("{name} must be at most 100")))
                 }
             })
             .map_err(Into::into),

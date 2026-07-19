@@ -1,5 +1,65 @@
 use crate::model::CachePriority;
 
+/// A point-in-time view of physical segment ownership by cache priority.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PriorityOccupancy {
+    usable_segments: u32,
+    slots_per_segment: u32,
+    slot_size: usize,
+    occupied_segments: [u32; 3],
+    used_slots: [u64; 3],
+    capacity_floor_segments: [u32; 3],
+}
+
+impl PriorityOccupancy {
+    pub(crate) const fn new(
+        usable_segments: u32,
+        slots_per_segment: u32,
+        slot_size: usize,
+        occupied_segments: [u32; 3],
+        used_slots: [u64; 3],
+        capacity_floor_segments: [u32; 3],
+    ) -> Self {
+        Self {
+            usable_segments,
+            slots_per_segment,
+            slot_size,
+            occupied_segments,
+            used_slots,
+            capacity_floor_segments,
+        }
+    }
+
+    pub const fn usable_segments(self) -> u32 {
+        self.usable_segments
+    }
+
+    pub const fn slots_per_segment(self) -> u32 {
+        self.slots_per_segment
+    }
+
+    pub const fn occupied_segments(self, priority: CachePriority) -> u32 {
+        self.occupied_segments[priority as usize]
+    }
+
+    pub const fn used_slots(self, priority: CachePriority) -> u64 {
+        self.used_slots[priority as usize]
+    }
+
+    pub const fn used_bytes(self, priority: CachePriority) -> u64 {
+        self.used_slots(priority).saturating_mul(self.slot_size as u64)
+    }
+
+    pub const fn capacity_floor_segments(self, priority: CachePriority) -> u32 {
+        self.capacity_floor_segments[priority as usize]
+    }
+
+    pub const fn borrowed_segments(self, priority: CachePriority) -> u32 {
+        self.occupied_segments(priority)
+            .saturating_sub(self.capacity_floor_segments(priority))
+    }
+}
+
 /// Cumulative physical writes issued by the engine after creation or reopen.
 ///
 /// The counters describe userspace write calls and bytes, not filesystem writeback accounting.

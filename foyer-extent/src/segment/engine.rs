@@ -24,7 +24,7 @@ use crate::{
         io::IoSchedulerStats,
         operation::{BatchInsertResult, BlobInsert, GetResult, InsertOutcome},
         reclaim::{AllocationDecision, ReclaimResult, Reclaimer},
-        stats::PhysicalWriteStats,
+        stats::{PhysicalWriteStats, PriorityOccupancy},
         store::{DATA_FILE, OWNER_FILE, STATE_FILE, SegmentAllocation, SegmentStore, SegmentWrite},
     },
 };
@@ -168,6 +168,10 @@ impl SegmentEngine {
 
     pub fn checkpoint_stats(&self) -> CheckpointStats {
         self.checkpoints.stats()
+    }
+
+    pub fn priority_occupancy(&self) -> PriorityOccupancy {
+        self.store.priority_occupancy(self.priority_capacity_floors())
     }
 
     #[cfg(all(test, target_os = "linux"))]
@@ -459,9 +463,16 @@ impl SegmentEngine {
             &self.store,
             &self.checkpoints,
             self.slot_size(),
+            self.priority_capacity_floors(),
             self.options.hot_frequency,
             self.options.low_hot_frequency,
         )
+    }
+
+    fn priority_capacity_floors(&self) -> [u32; 3] {
+        self.options
+            .priority_capacity_floors
+            .segment_floors(self.layout.segment_count.saturating_sub(1))
     }
 }
 
@@ -538,6 +549,17 @@ fn validate_options(options: SegmentEngineOptions) -> Result<()> {
             "segment low_hot_frequency must be between 1 and 15".to_string(),
         ));
     }
+    let priority_capacity_floors = options.priority_capacity_floors;
+    if priority_capacity_floors.high_percent() > 100
+        || priority_capacity_floors.normal_percent() > 100
+        || u16::from(priority_capacity_floors.high_percent()) + u16::from(priority_capacity_floors.normal_percent())
+            > 100
+    {
+        return Err(Error::InvalidConfig(
+            "segment high and normal priority capacity floors must each be at most 100 percent and sum to at most 100"
+                .to_string(),
+        ));
+    }
     #[cfg(not(target_os = "linux"))]
     if options.direct_io {
         return Err(Error::InvalidConfig(
@@ -565,6 +587,13 @@ fn validate_layout_options(layout: SegmentLayout, options: SegmentEngineOptions)
             "segment write_run_size must be a multiple of slot_size ({})",
             layout.slot_size
         )));
+    }
+    let usable_segments = layout.segment_count.saturating_sub(1);
+    let capacity_floors = options.priority_capacity_floors.segment_floors(usable_segments);
+    if capacity_floors.into_iter().sum::<u32>() > usable_segments {
+        return Err(Error::InvalidConfig(
+            "segment priority capacity floors exceed usable segment capacity".to_string(),
+        ));
     }
     Ok(())
 }
@@ -1051,7 +1080,7 @@ mod tests {
     }
 
     #[test]
-    fn pressure_reclaims_only_at_or_below_incoming_priority() {
+    fn low_priority_cannot_reclaim_protected_data() {
         let dir = tempdir().unwrap();
         let engine = engine(dir.path(), 2 * 1024 * 1024);
         let entries = engine.store.layout().usable_entries as usize;
@@ -1069,6 +1098,81 @@ mod tests {
             engine.insert(&key(10_001), &[3; 16], CachePriority::High).unwrap(),
             InsertOutcome::Rejected
         );
+    }
+
+    #[test]
+    fn priority_capacity_is_borrowed_and_repaid_without_starvation() {
+        let dir = tempdir().unwrap();
+        let engine = SegmentEngine::create(
+            dir.path(),
+            SegmentEngineConfig::new(2 * 1024 * 1024)
+                .with_slot_size(PAGE_SIZE)
+                .with_options(options().with_priority_capacity_floors(25, 50)),
+        )
+        .unwrap();
+        let layout = engine.store.layout();
+        let usable_segments = layout.segment_count - 1;
+        let value = vec![1; layout.segment_size - stored_blob_len(&key(0), &[]).unwrap()];
+        let high_floor = engine.priority_occupancy().capacity_floor_segments(CachePriority::High);
+        let normal_floor = engine
+            .priority_occupancy()
+            .capacity_floor_segments(CachePriority::Normal);
+
+        for index in 0..usable_segments as usize {
+            assert_ne!(
+                engine.insert(&key(index as u64), &value, CachePriority::High).unwrap(),
+                InsertOutcome::Rejected
+            );
+        }
+        assert_eq!(
+            engine.priority_occupancy().occupied_segments(CachePriority::High),
+            usable_segments
+        );
+
+        let normal_segments = usable_segments - high_floor;
+        for index in 0..normal_segments as usize {
+            assert_ne!(
+                engine
+                    .insert(&key(100_000 + index as u64), &value, CachePriority::Normal)
+                    .unwrap(),
+                InsertOutcome::Rejected
+            );
+        }
+        let occupancy = engine.priority_occupancy();
+        assert_eq!(occupancy.occupied_segments(CachePriority::High), high_floor);
+        assert_eq!(
+            occupancy.occupied_segments(CachePriority::Normal),
+            usable_segments - high_floor
+        );
+
+        let high_segments = usable_segments - normal_floor - high_floor;
+        for index in 0..high_segments as usize {
+            assert_ne!(
+                engine
+                    .insert(&key(200_000 + index as u64), &value, CachePriority::High)
+                    .unwrap(),
+                InsertOutcome::Rejected
+            );
+        }
+        let occupancy = engine.priority_occupancy();
+        assert_eq!(occupancy.occupied_segments(CachePriority::Normal), normal_floor);
+        assert_eq!(
+            occupancy.occupied_segments(CachePriority::High),
+            usable_segments - normal_floor
+        );
+    }
+
+    #[test]
+    fn invalid_priority_capacity_is_rejected() {
+        let dir = tempdir().unwrap();
+        let error = SegmentEngine::create(
+            dir.path(),
+            SegmentEngineConfig::new(2 * 1024 * 1024)
+                .with_slot_size(PAGE_SIZE)
+                .with_options(options().with_priority_capacity_floors(40, 61)),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidConfig(_)));
     }
 
     #[test]
@@ -1262,7 +1366,8 @@ mod tests {
             engine.store.allocate(CachePriority::Normal, 1).unwrap(),
             SegmentAllocationResult::ReclaimRequired
         );
-        let victim = engine.store.victim(CachePriority::Normal).unwrap();
+        let (victim, is_current) = engine.store.reclaim_candidates().oldest(CachePriority::Normal).unwrap();
+        assert!(!is_current);
         engine.store.begin_reclaim(victim).unwrap();
         assert!(engine.store.pending_reclaim().is_some());
         drop(engine);

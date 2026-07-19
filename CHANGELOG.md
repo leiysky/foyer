@@ -24,6 +24,8 @@ date: 2023-05-12T11:02:09+08:00
   remove only Extent-owned paths.
 - Align Extent's default queue and batch sizes with the validated 256 MiB / 128 MiB configuration
   and expose asynchronous write and checkpoint-frontier snapshots through `ExtentEngineHandle`.
+- Give Extent high and normal data borrowable priority-capacity floors, prevent either class from
+  starving the other's protected working set, and expose per-priority segment occupancy.
 - Add formal async-write, queue, checkpoint, and health metrics; contain injected no-space,
   short-write, sync, and worker-panic failures behind a sticky circuit breaker.
 - Freeze and reopen a complete V3 SegmentEngine image in CI, add a compile-time fork engine-API

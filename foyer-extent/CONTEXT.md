@@ -81,6 +81,11 @@ _Avoid_: Temperature, hotness
 A runtime estimate of a cache blob's observed reuse, independent of its cache priority.
 _Avoid_: Priority
 
+**Priority capacity floor**:
+The minimum cache-segment capacity protected for one cache priority while unused capacity remains
+borrowable by more active priorities. It is a lower bound, not a physical partition or upper quota.
+_Avoid_: Priority partition, pinned capacity, priority limit
+
 **Admission**:
 The internal classification of how Extent handled an offered cache entry. Queue pressure and
 engine work may be observed in aggregate, but admission is never returned as a per-put result.

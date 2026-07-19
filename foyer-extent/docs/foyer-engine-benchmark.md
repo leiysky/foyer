@@ -34,6 +34,11 @@ Best-effort priority shedding is reported as an observed pipeline outcome, not t
 corruption. The run still fails if any accepted command is unfinished, a storage write or batch
 fails, or the durable checkpoint trails the published recovery frontier.
 
+`EXTENT_BENCH_PRIORITY_WORKLOAD=scopedb` is the default mixed workload. The
+`historical-high` validation mode writes high-priority entries in the first half and normal entries
+in the second half. It directly checks that historical high occupancy above its floor is returned
+to normal demand instead of permanently starving it.
+
 Reported Extent read bytes and I/O operations include both payload reads recorded through Foyer's
 device statistics and FixedRecordLSM reads. The separate `extent_read` and `extent_index_read`
 records provide that total's decomposition. Extent write statistics include the final metadata
@@ -93,4 +98,6 @@ Important tuning variables remain explicit: `EXTENT_BENCH_ENGINES`, `EXTENT_BENC
 `EXTENT_BENCH_SHARDS`, `EXTENT_BENCH_BLOCK_MIB`, `EXTENT_BENCH_BLOCK_BUFFER_MIB`,
 `EXTENT_BENCH_SEGMENT_MIB`, `EXTENT_BENCH_SLOT_KIB`, `EXTENT_BENCH_INDEX_CACHE_MIB`,
 `EXTENT_BENCH_INDEX_WRITE_BUFFER_MIB`, `EXTENT_BENCH_EXTENT_WRITE_CONCURRENCY`, and
-`EXTENT_BENCH_IO_READ_PRIORITY_US`.
+`EXTENT_BENCH_IO_READ_PRIORITY_US`. Priority-isolation experiments may also override
+`EXTENT_BENCH_HIGH_CAPACITY_PERCENT` and `EXTENT_BENCH_NORMAL_CAPACITY_PERCENT`; their sum must not
+exceed 100.

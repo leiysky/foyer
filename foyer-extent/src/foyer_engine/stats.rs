@@ -8,7 +8,7 @@ use std::{
 
 use foyer::{Metrics, Statistics};
 
-use crate::{CachePriority, CheckpointStats, ReclaimStats, foyer_engine::mutex_lock};
+use crate::{CachePriority, CheckpointStats, PriorityOccupancy, ReclaimStats, foyer_engine::mutex_lock};
 
 const LATENCY_SAMPLE_CAPACITY: usize = 16_384;
 
@@ -174,6 +174,17 @@ impl EngineStats {
         self.metrics
             .storage_engine_checkpoint_dirty
             .absolute(checkpoint.dirty_changes as u64);
+    }
+
+    pub fn record_priority_occupancy(&self, occupancy: PriorityOccupancy) {
+        for priority in [CachePriority::Low, CachePriority::Normal, CachePriority::High] {
+            let index = priority as usize;
+            self.metrics.storage_engine_priority_segments[index]
+                .absolute(u64::from(occupancy.occupied_segments(priority)));
+            self.metrics.storage_engine_priority_floor_segments[index]
+                .absolute(u64::from(occupancy.capacity_floor_segments(priority)));
+            self.metrics.storage_engine_priority_allocated_bytes[index].absolute(occupancy.used_bytes(priority));
+        }
     }
 
     pub fn record_write_batch(&self, latency: Duration) {

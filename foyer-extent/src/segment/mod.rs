@@ -13,14 +13,18 @@ mod store;
 
 pub use self::{
     checkpoint::CheckpointStats,
-    config::{DEFAULT_SEGMENT_SIZE, SegmentEngineConfig},
+    config::{
+        DEFAULT_HIGH_PRIORITY_CAPACITY_PERCENT, DEFAULT_NORMAL_PRIORITY_CAPACITY_PERCENT, DEFAULT_SEGMENT_SIZE,
+        SegmentEngineConfig,
+    },
     engine::SegmentEngine,
     format::EXTENT_FORMAT_VERSION,
     index::{IndexReadStats, IndexStats},
     io::IoSchedulerStats,
-    stats::{PhysicalWriteStats, ReclaimStats},
+    stats::{PhysicalWriteStats, PriorityOccupancy, ReclaimStats},
 };
 pub(crate) use self::{
+    config::PriorityCapacityFloors,
     format::SegmentLayout,
     operation::{BatchInsertResult, BlobInsert, InsertOutcome},
 };
