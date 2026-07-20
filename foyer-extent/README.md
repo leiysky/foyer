@@ -28,7 +28,9 @@ outcomes, active read admission, scheduler waits, physical I/O, reclaim work, an
 background failure. These observations do not turn fire-and-forget puts into acknowledged writes.
 The public `Cache` facade exposes this handle directly through `engine_handle()`, together with
 `storage_usage()` and the shared Foyer `statistics()`, so a production canary does not need to retain
-an internal builder config solely for observability.
+an internal builder config solely for observability. `estimated_entry_count()` returns the larger
+of the memory-resident count and the disk index's live count. It avoids systematic overlap
+double-counting and is intended only as a low-cost telemetry estimate.
 
 The Foyer-facing queue, pipeline, and recovery state is also exported through its metrics registry as
 `foyer_storage_engine_command_total`, `foyer_storage_engine_batch_total`,

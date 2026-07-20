@@ -79,6 +79,17 @@ impl Cache {
     pub fn statistics(&self) -> &Arc<Statistics> {
         self.inner.statistics()
     }
+
+    /// Estimate the number of distinct entries visible from the hybrid cache.
+    ///
+    /// Memory entries normally overlap disk entries, so the larger tier count is a more stable
+    /// telemetry estimate than their sum. The estimate can undercount disjoint memory-only and
+    /// disk-only entries during write bursts and must not be used for correctness decisions.
+    pub fn estimated_entry_count(&self) -> u64 {
+        let memory_entries = u64::try_from(self.inner.memory().entries()).unwrap_or(u64::MAX);
+        let disk_entries = self.engine_handle.index_stats().map_or(0, |stats| stats.live_entries);
+        memory_entries.max(disk_entries)
+    }
 }
 
 /// Builder for the public hybrid Extent cache.

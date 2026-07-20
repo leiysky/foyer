@@ -141,7 +141,9 @@ async fn public_cache_recovers_complete_entries() {
     assert_eq!(cache.storage_usage().capacity(), DISK_CAPACITY);
     assert!(cache.engine_handle().write_stats().is_some());
     assert_eq!(cache.statistics().disk_read_ios(), 0);
+    assert_eq!(cache.estimated_entry_count(), 0);
     cache.put(Entry::new(key.clone(), value.clone(), CachePriority::High).unwrap());
+    assert_eq!(cache.estimated_entry_count(), 1);
     assert_eq!(cache.get(&key).await.unwrap().value(), &value);
     cache.close().await.unwrap();
     drop(cache);
@@ -151,6 +153,7 @@ async fn public_cache_recovers_complete_entries() {
         .build()
         .await
         .unwrap();
+    assert_eq!(recovered.estimated_entry_count(), 1);
     let handle = recovered.engine_handle();
     let disk_reads_before = (
         recovered.statistics().disk_read_ios() as u64,
@@ -162,6 +165,7 @@ async fn public_cache_recovers_complete_entries() {
     assert_eq!(entry.key(), &key);
     assert_eq!(entry.value(), &value);
     assert_eq!(entry.priority(), CachePriority::High);
+    assert_eq!(recovered.estimated_entry_count(), 1);
     let index_reads_after = handle.index_read_stats().unwrap();
     let payload_reads_after = handle.read_stats().unwrap();
     assert_eq!(
