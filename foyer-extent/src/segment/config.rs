@@ -8,7 +8,7 @@ pub const DEFAULT_NORMAL_PRIORITY_CAPACITY_PERCENT: u8 = 70;
 const DEFAULT_READ_RUN_SIZE: usize = DEFAULT_SLOT_SIZE;
 const DEFAULT_WRITE_RUN_SIZE: usize = 1024 * 1024;
 const DEFAULT_INDEX_WRITE_BUFFER_SIZE: usize = 64 * 1024 * 1024;
-const DEFAULT_INDEX_CACHE_SIZE: usize = 512 * 1024 * 1024;
+const DEFAULT_INDEX_CACHE_SIZE: usize = 1024 * 1024 * 1024;
 const DEFAULT_IO_READ_PRIORITY_DURATION: Duration = Duration::from_millis(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

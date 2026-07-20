@@ -14,7 +14,7 @@ use crc_fast::{CrcAlgorithm, Digest};
 use crate::{
     bloom,
     bloom::FILTER_BYTES,
-    cache::{BlockCache, CacheKey, CacheKind},
+    cache::{BlockCache, CacheKey, CacheKind, PinnedMetadata},
     error::{Error, Result},
     format::{
         DATA_BLOCK_HEADER_SIZE, DATA_BLOCK_SIZE, KEY_SIZE, Key, MAX_SEQUENCE, RECORD_SIZE, RECORDS_PER_BLOCK, Record,
@@ -45,9 +45,6 @@ pub struct TableIoStats {
     pub read_bytes: u64,
     pub write_operations: u64,
     pub write_bytes: u64,
-    pub point_filter_checks: u64,
-    pub point_filter_positives: u64,
-    pub point_data_cache_hits: u64,
     pub point_data_reads: u64,
     pub point_false_positives: u64,
 }
@@ -58,9 +55,6 @@ pub struct TableIoCounters {
     read_bytes: AtomicU64,
     write_operations: AtomicU64,
     write_bytes: AtomicU64,
-    point_filter_checks: AtomicU64,
-    point_filter_positives: AtomicU64,
-    point_data_cache_hits: AtomicU64,
     point_data_reads: AtomicU64,
     point_false_positives: AtomicU64,
 }
@@ -72,9 +66,6 @@ impl TableIoCounters {
             read_bytes: self.read_bytes.load(Ordering::Relaxed),
             write_operations: self.write_operations.load(Ordering::Relaxed),
             write_bytes: self.write_bytes.load(Ordering::Relaxed),
-            point_filter_checks: self.point_filter_checks.load(Ordering::Relaxed),
-            point_filter_positives: self.point_filter_positives.load(Ordering::Relaxed),
-            point_data_cache_hits: self.point_data_cache_hits.load(Ordering::Relaxed),
             point_data_reads: self.point_data_reads.load(Ordering::Relaxed),
             point_false_positives: self.point_false_positives.load(Ordering::Relaxed),
         }
@@ -112,6 +103,7 @@ pub struct Table {
     meta: TableMeta,
     top_fences: Arc<[Key]>,
     fence_pages: Arc<[OnceLock<Box<[Key]>>]>,
+    filter_pages: Arc<[OnceLock<PinnedMetadata>]>,
     fences_offset: u64,
     filters_offset: u64,
     cache: Arc<BlockCache>,
@@ -143,12 +135,14 @@ impl Table {
         io.record_write(written.meta.file_size);
         let file = File::open(&final_path).map_err(|error| Error::io("open new SST file", error))?;
         let fence_pages = fence_page_slots(written.top_fences.len());
+        let filter_pages = filter_page_slots(written.meta.block_count);
         Ok(Arc::new(Self {
             path: final_path,
             file: Arc::new(file),
             meta: written.meta,
             top_fences: written.top_fences.into(),
             fence_pages,
+            filter_pages,
             fences_offset: written.fences_offset,
             filters_offset: written.filters_offset,
             cache,
@@ -187,12 +181,14 @@ impl Table {
         }
         let top_fences = decode_top_fences(&path, &top_fence_bytes, decoded.meta)?;
         let fence_pages = fence_page_slots(top_fences.len());
+        let filter_pages = filter_page_slots(decoded.meta.block_count);
         Ok(Arc::new(Self {
             path,
             file: Arc::new(file),
             meta: decoded.meta,
             top_fences: top_fences.into(),
             fence_pages,
+            filter_pages,
             fences_offset: decoded.fences_offset,
             filters_offset: decoded.filters_offset,
             cache,
@@ -213,6 +209,7 @@ impl Table {
             meta,
             top_fences: self.top_fences.clone(),
             fence_pages: self.fence_pages.clone(),
+            filter_pages: self.filter_pages.clone(),
             fences_offset: self.fences_offset,
             filters_offset: self.filters_offset,
             cache: self.cache.clone(),
@@ -234,24 +231,25 @@ impl Table {
             block,
             kind: CacheKind::Data,
         };
-        let mut read_data = false;
-        let data = if let Some(data) = self.cache.get(data_key) {
-            self.io.point_data_cache_hits.fetch_add(1, Ordering::Relaxed);
-            data
-        } else {
-            let may_contain = self.filter_may_contain(block, key)?;
-            self.io.point_filter_checks.fetch_add(1, Ordering::Relaxed);
-            if !may_contain {
-                return Ok(None);
+        let filter_first = self.meta.level == 0;
+        if filter_first && !self.filter_may_contain(block, key)? {
+            return Ok(None);
+        }
+        if let Some(record) = self.cache.get_with(data_key, |data| find_record(&self.path, data, key)) {
+            let record = record?;
+            if filter_first && record.is_none() {
+                self.io.point_false_positives.fetch_add(1, Ordering::Relaxed);
             }
-            self.io.point_filter_positives.fetch_add(1, Ordering::Relaxed);
-            let data = self.read_data_block(block, Some(fence))?;
-            self.io.point_data_reads.fetch_add(1, Ordering::Relaxed);
-            read_data = true;
-            self.cache.insert(data_key, data)
-        };
+            return Ok(record);
+        }
+        if !filter_first && !self.filter_may_contain(block, key)? {
+            return Ok(None);
+        }
+        let data = self.read_data_block(block, Some(fence))?;
+        self.io.point_data_reads.fetch_add(1, Ordering::Relaxed);
+        let data = self.cache.insert(data_key, data);
         let record = find_record(&self.path, &data, key)?;
-        if read_data && record.is_none() {
+        if record.is_none() {
             self.io.point_false_positives.fetch_add(1, Ordering::Relaxed);
         }
         Ok(record)
@@ -306,19 +304,41 @@ impl Table {
             block: page,
             kind: CacheKind::Filter,
         };
-        let filter_page = if let Some(filter_page) = self.cache.get(cache_key) {
-            filter_page
-        } else {
-            let mut filter_page = vec![0; FILTER_PAGE_SIZE];
-            let offset = self.filters_offset + u64::from(page) * FILTER_PAGE_SIZE as u64;
-            read_exact_at(&self.file, &mut filter_page, offset)
-                .map_err(|error| Error::io("read SST Bloom page", error))?;
-            self.io.record_read(filter_page.len());
-            validate_filter_page(&self.path, &filter_page, self.meta, page)?;
-            self.cache.insert(cache_key, filter_page.into())
+        let page_slot = &self.filter_pages[page as usize];
+        if let Some(filter_page) = page_slot.get() {
+            let offset = FILTER_PAGE_HEADER_SIZE + slot * FILTER_BYTES;
+            let may_contain = bloom::may_contain(&filter_page.data()[offset..offset + FILTER_BYTES], key);
+            self.cache.record_pinned_filter(cache_key, may_contain);
+            return Ok(may_contain);
+        }
+        if let Some(may_contain) = self.cache.get_filter_with(cache_key, |filter_page| {
+            let offset = FILTER_PAGE_HEADER_SIZE + slot * FILTER_BYTES;
+            bloom::may_contain(&filter_page[offset..offset + FILTER_BYTES], key)
+        }) {
+            return Ok(may_contain);
+        }
+        let mut filter_page = vec![0; FILTER_PAGE_SIZE];
+        let offset = self.filters_offset + u64::from(page) * FILTER_PAGE_SIZE as u64;
+        read_exact_at(&self.file, &mut filter_page, offset).map_err(|error| Error::io("read SST Bloom page", error))?;
+        self.io.record_read(filter_page.len());
+        validate_filter_page(&self.path, &filter_page, self.meta, page)?;
+        let filter_page = match self.cache.pin_metadata(filter_page.into_boxed_slice()) {
+            Ok(filter_page) => {
+                if let Err(filter_page) = page_slot.set(filter_page) {
+                    drop(filter_page);
+                }
+                let filter_page = page_slot.get().unwrap();
+                let offset = FILTER_PAGE_HEADER_SIZE + slot * FILTER_BYTES;
+                let may_contain = bloom::may_contain(&filter_page.data()[offset..offset + FILTER_BYTES], key);
+                self.cache.record_pinned_filter(cache_key, may_contain);
+                return Ok(may_contain);
+            }
+            Err(filter_page) => self.cache.insert(cache_key, filter_page.into()),
         };
         let offset = FILTER_PAGE_HEADER_SIZE + slot * FILTER_BYTES;
-        Ok(bloom::may_contain(&filter_page[offset..offset + FILTER_BYTES], key))
+        let may_contain = bloom::may_contain(&filter_page[offset..offset + FILTER_BYTES], key);
+        self.cache.record_filter_result(cache_key, may_contain);
+        Ok(may_contain)
     }
 
     fn read_data_block(&self, block: u32, fence: Option<Key>) -> Result<Arc<[u8]>> {
@@ -898,6 +918,13 @@ fn checked_align_up(value: u64, alignment: u64) -> Option<u64> {
 
 fn fence_page_slots(page_count: usize) -> Arc<[OnceLock<Box<[Key]>>]> {
     (0..page_count).map(|_| OnceLock::new()).collect::<Vec<_>>().into()
+}
+
+fn filter_page_slots(block_count: u32) -> Arc<[OnceLock<PinnedMetadata>]> {
+    (0..(block_count as usize).div_ceil(FILTERS_PER_PAGE))
+        .map(|_| OnceLock::new())
+        .collect::<Vec<_>>()
+        .into()
 }
 
 pub fn table_path(directory: &Path, file_id: u64) -> PathBuf {

@@ -28,7 +28,7 @@ const LEVEL_COUNT: usize = 7;
 const L0_COMPACTION_TRIGGER: usize = 4;
 const LEVEL_SIZE_MULTIPLIER: u64 = 10;
 const DEFAULT_WRITE_BUFFER_CAPACITY: usize = 64 * 1024 * 1024;
-const DEFAULT_CACHE_CAPACITY: usize = 512 * 1024 * 1024;
+const DEFAULT_CACHE_CAPACITY: usize = 1024 * 1024 * 1024;
 const MAX_PENDING_FLUSHES: usize = 2;
 const MINIMUM_OUTPUT_FILL_DIVISOR: usize = 4;
 const MEMTABLE_TOMBSTONE_BIT: u64 = 1_u64 << 63;
@@ -771,9 +771,9 @@ impl FixedLsm {
             table_read_bytes: io.read_bytes,
             table_write_operations: io.write_operations,
             table_write_bytes: io.write_bytes,
-            point_filter_checks: io.point_filter_checks,
-            point_filter_positives: io.point_filter_positives,
-            point_data_cache_hits: io.point_data_cache_hits,
+            point_filter_checks: cache.filter_accesses,
+            point_filter_positives: cache.filter_positives,
+            point_data_cache_hits: cache.data_hits,
             point_data_reads: io.point_data_reads,
             point_false_positives: io.point_false_positives,
             flush_operations: self

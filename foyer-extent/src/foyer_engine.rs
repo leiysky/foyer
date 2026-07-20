@@ -134,7 +134,7 @@ impl ExtentEngineConfig {
         self
     }
 
-    /// Set the FixedRecordLSM metadata page-cache budget.
+    /// Set the FixedRecordLSM index page-cache budget.
     pub fn with_index_cache_size(mut self, bytes: usize) -> Self {
         self.segment.options.index_cache_size = bytes;
         self

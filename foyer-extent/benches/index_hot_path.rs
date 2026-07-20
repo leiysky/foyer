@@ -84,7 +84,7 @@ impl Config {
             path,
             entries,
             hotset,
-            cache_capacity: env_usize("INDEX_BENCH_CACHE_MIB", 256)?.saturating_mul(MIB),
+            cache_capacity: env_usize("INDEX_BENCH_CACHE_MIB", 1024)?.saturating_mul(MIB),
             concurrency,
             warmup: Duration::from_secs(env_u64("INDEX_BENCH_WARMUP_SECONDS", 3)?),
             duration: Duration::from_secs(env_u64("INDEX_BENCH_SECONDS", 10)?),

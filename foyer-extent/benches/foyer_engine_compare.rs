@@ -183,7 +183,7 @@ impl Config {
             block_buffer_pool_bytes: env_mib("EXTENT_BENCH_BLOCK_BUFFER_MIB", 256)?,
             extent_slot_size: env_kib("EXTENT_BENCH_SLOT_KIB", foyer_extent::DEFAULT_SLOT_SIZE / KIB)?,
             extent_segment_size: env_mib("EXTENT_BENCH_SEGMENT_MIB", 64)?,
-            extent_index_cache_bytes: env_mib("EXTENT_BENCH_INDEX_CACHE_MIB", 256)?,
+            extent_index_cache_bytes: env_mib("EXTENT_BENCH_INDEX_CACHE_MIB", 1024)?,
             extent_index_write_buffer_bytes: env_mib("EXTENT_BENCH_INDEX_WRITE_BUFFER_MIB", 64)?,
             extent_io_read_priority: Duration::from_micros(
                 env_optional_u64("EXTENT_BENCH_IO_READ_PRIORITY_US")?.unwrap_or(2_000),
