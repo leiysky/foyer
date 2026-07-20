@@ -11,7 +11,7 @@ use std::{
 use bytes::Bytes;
 use foyer::{
     BlockEngineConfig, Compression, DeviceBuilder, EngineConfig, FsDeviceBuilder, Hint, HybridCache, HybridCachePolicy,
-    HybridCacheProperties, PsyncIoEngineConfig, RecoverMode, S3FifoConfig,
+    HybridCacheProperties, Load, PsyncIoEngineConfig, RecoverMode, S3FifoConfig,
 };
 use foyer_extent::{
     CachePriority, DEFAULT_HIGH_PRIORITY_CAPACITY_PERCENT, DEFAULT_NORMAL_PRIORITY_CAPACITY_PERCENT, EngineValue,
@@ -93,7 +93,10 @@ struct Config {
     shards: usize,
     write_concurrency: usize,
     reads: u64,
+    read_warmup: u64,
+    read_hotset: u64,
     read_pattern: ReadPattern,
+    storage_reads: bool,
     direct_io: bool,
     recover_only: bool,
     recover_write_wave: bool,
@@ -163,6 +166,12 @@ impl Config {
             return Err(invalid("EXTENT_BENCH_PUT_CONCURRENCY must be positive").into());
         }
 
+        let reads = env_u64("EXTENT_BENCH_READS", workload.entries.saturating_mul(2))?;
+        let read_hotset = env_u64("EXTENT_BENCH_READ_HOTSET", workload.entries)?;
+        if read_hotset == 0 || read_hotset > workload.entries {
+            return Err(invalid("EXTENT_BENCH_READ_HOTSET must be in 1..=EXTENT_BENCH_ENTRIES").into());
+        }
+
         Ok(Self {
             root,
             engines: parse_engines()?,
@@ -185,8 +194,11 @@ impl Config {
             put_concurrency,
             shards: env_usize("EXTENT_BENCH_SHARDS", cores.next_power_of_two())?,
             write_concurrency: env_usize("EXTENT_BENCH_EXTENT_WRITE_CONCURRENCY", (cores / 2).clamp(1, 8))?,
-            reads: env_u64("EXTENT_BENCH_READS", workload.entries.saturating_mul(2))?,
+            reads,
+            read_warmup: env_u64("EXTENT_BENCH_READ_WARMUP", 0)?,
+            read_hotset,
             read_pattern: parse_read_pattern()?,
+            storage_reads: env_bool("EXTENT_BENCH_STORAGE_READS", false)?,
             direct_io,
             recover_only,
             recover_write_wave: env_bool("EXTENT_BENCH_RECOVER_WRITE_WAVE", false)?,
@@ -344,7 +356,7 @@ async fn main() -> AnyResult<()> {
     fs::create_dir_all(&config.root)?;
 
     println!(
-        "foyer-engine benchmark: path={}, engines={}, entries={}, payload_mib={:.1}, capacity_mib={}, memory_mib={}, entry_kib={}, key_bytes={}, priority_workload={}, read_pattern={}, concurrency={} (>=2x cores), put_concurrency={}, io={}, extent_read_priority_us={}, extent_priority_floors={}/{}, recover_only={}, recover_write_wave={}, populate_only={}",
+        "foyer-engine benchmark: path={}, engines={}, entries={}, payload_mib={:.1}, capacity_mib={}, memory_mib={}, entry_kib={}, key_bytes={}, priority_workload={}, read_pattern={}, read_hotset={}, read_warmup={}, read_source={}, concurrency={} (>=2x cores), put_concurrency={}, io={}, extent_read_priority_us={}, extent_priority_floors={}/{}, recover_only={}, recover_write_wave={}, populate_only={}",
         config.root.display(),
         config
             .engines
@@ -360,6 +372,9 @@ async fn main() -> AnyResult<()> {
         join_sizes(&workload.key_sizes, 1),
         workload.priority.label(),
         config.read_pattern.label(),
+        config.read_hotset,
+        config.read_warmup,
+        if config.storage_reads { "storage" } else { "hybrid" },
         config.concurrency,
         config.put_concurrency,
         if config.direct_io { "direct" } else { "buffered" },
@@ -453,12 +468,38 @@ async fn recover_and_read(engine: DiskEngine, config: &Config, workload: Arc<Wor
             .unwrap_or_else(|| "n/a".to_string()),
     );
 
+    if config.read_warmup > 0 {
+        let warmup = run_reads(
+            &recovered.cache,
+            workload.clone(),
+            config.read_warmup,
+            config.concurrency,
+            config.read_pattern,
+            config.read_hotset,
+            config.storage_reads,
+        )
+        .await?;
+        println!(
+            "engine={} phase=read_warmup operations={} hits={} misses={} errors={} invalid={} seconds={:.3} ops_s={:.0}",
+            engine.label(),
+            warmup.operations,
+            warmup.hits,
+            warmup.misses,
+            warmup.errors,
+            warmup.invalid,
+            warmup.duration.as_secs_f64(),
+            warmup.operations as f64 / warmup.duration.as_secs_f64().max(f64::EPSILON),
+        );
+    }
+
     let reads = run_reads(
         &recovered.cache,
         workload.clone(),
         config.reads,
         config.concurrency,
         config.read_pattern,
+        config.read_hotset,
+        config.storage_reads,
     )
     .await?;
     let io = io_measurements(&recovered.cache, &recovered.extent);
@@ -500,6 +541,8 @@ async fn recover_and_read(engine: DiskEngine, config: &Config, workload: Arc<Wor
             config.reads,
             config.concurrency,
             config.read_pattern,
+            config.read_hotset,
+            config.storage_reads,
         )
         .await?;
         println!(
@@ -700,6 +743,8 @@ async fn run_reads(
     reads: u64,
     concurrency: usize,
     pattern: ReadPattern,
+    hotset: u64,
+    storage_reads: bool,
 ) -> AnyResult<ReadMeasurements> {
     let sample_stride = (reads / LATENCY_SAMPLE_TARGET).max(1);
     let started = Instant::now();
@@ -713,33 +758,72 @@ async fn run_reads(
             let mut operation = worker as u64;
             while operation < reads {
                 let index = match pattern {
-                    ReadPattern::Random => mix64(operation ^ 0x9e37_79b9_7f4a_7c15) % workload.entries,
-                    ReadPattern::Sequential => operation,
+                    ReadPattern::Random => mix64(operation ^ 0x9e37_79b9_7f4a_7c15) % hotset,
+                    ReadPattern::Sequential => operation % hotset,
                 };
                 let priority = workload.priority(index);
                 result.requests_by_priority[priority.to_byte() as usize] += 1;
                 let key = make_key(index, workload.key_size(index));
                 let requested = Instant::now();
-                let outcome = match cache.get(&key).await {
-                    Ok(Some(entry)) => {
-                        result.hits += 1;
-                        result.hits_by_priority[priority.to_byte() as usize] += 1;
-                        result.hit_bytes += entry.value().value().len() as u64;
-                        if entry.key() != &key
-                            || entry.value().priority() != priority
-                            || !validate_value(index, workload.entry_size(index), entry.value().value())
-                        {
-                            result.invalid += 1;
+                let outcome = if storage_reads {
+                    match cache.storage().load(&key).await {
+                        Ok(Load::Entry {
+                            key: loaded_key, value, ..
+                        }) => {
+                            result.hits += 1;
+                            result.hits_by_priority[priority.to_byte() as usize] += 1;
+                            result.hit_bytes += value.value().len() as u64;
+                            if loaded_key != key
+                                || value.priority() != priority
+                                || !validate_value(index, workload.entry_size(index), value.value())
+                            {
+                                result.invalid += 1;
+                            }
+                            ReadOutcome::Hit
                         }
-                        ReadOutcome::Hit
+                        Ok(Load::Piece { piece, .. }) => {
+                            result.hits += 1;
+                            result.hits_by_priority[priority.to_byte() as usize] += 1;
+                            result.hit_bytes += piece.value().value().len() as u64;
+                            if piece.key() != &key
+                                || piece.value().priority() != priority
+                                || !validate_value(index, workload.entry_size(index), piece.value().value())
+                            {
+                                result.invalid += 1;
+                            }
+                            ReadOutcome::Hit
+                        }
+                        Ok(Load::Miss) => {
+                            result.misses += 1;
+                            ReadOutcome::Miss
+                        }
+                        Ok(Load::Throttled) | Err(_) => {
+                            result.errors += 1;
+                            ReadOutcome::Error
+                        }
                     }
-                    Ok(None) => {
-                        result.misses += 1;
-                        ReadOutcome::Miss
-                    }
-                    Err(_) => {
-                        result.errors += 1;
-                        ReadOutcome::Error
+                } else {
+                    match cache.get(&key).await {
+                        Ok(Some(entry)) => {
+                            result.hits += 1;
+                            result.hits_by_priority[priority.to_byte() as usize] += 1;
+                            result.hit_bytes += entry.value().value().len() as u64;
+                            if entry.key() != &key
+                                || entry.value().priority() != priority
+                                || !validate_value(index, workload.entry_size(index), entry.value().value())
+                            {
+                                result.invalid += 1;
+                            }
+                            ReadOutcome::Hit
+                        }
+                        Ok(None) => {
+                            result.misses += 1;
+                            ReadOutcome::Miss
+                        }
+                        Err(_) => {
+                            result.errors += 1;
+                            ReadOutcome::Error
+                        }
                     }
                 };
                 if operation.is_multiple_of(sample_stride) {
@@ -812,7 +896,16 @@ async fn run_read_under_write_burst(
     });
 
     started.notified().await;
-    let reads = run_reads(cache, workload, config.reads, config.concurrency, config.read_pattern).await?;
+    let reads = run_reads(
+        cache,
+        workload,
+        config.reads,
+        config.concurrency,
+        config.read_pattern,
+        config.read_hotset,
+        config.storage_reads,
+    )
+    .await?;
     let mut writes = writer.await?;
     let drain = Instant::now();
     cache.storage().wait().await;

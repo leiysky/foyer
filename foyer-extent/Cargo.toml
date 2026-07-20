@@ -34,6 +34,7 @@ tracing = { workspace = true }
 twox-hash = { workspace = true, features = ["xxhash3_64"] }
 
 [dev-dependencies]
+foyer-storage = { workspace = true, features = ["test_utils"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
@@ -49,4 +50,8 @@ type_complexity = "allow"
 
 [[bench]]
 name = "foyer_engine_compare"
+harness = false
+
+[[bench]]
+name = "index_hot_path"
 harness = false

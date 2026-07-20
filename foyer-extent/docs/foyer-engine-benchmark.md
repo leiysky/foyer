@@ -39,6 +39,11 @@ Crash-recovery validation can set `EXTENT_BENCH_READ_PATTERN=sequential` and
 `EXTENT_BENCH_READS` equal to the offered entry count to visit every candidate key exactly once.
 Larger sequential read counts continue into the deterministic new-key range, which can validate a
 write wave appended after recovery.
+`EXTENT_BENCH_STORAGE_READS=1` bypasses HybridCache memory lookup and exercises the storage engine
+directly. `EXTENT_BENCH_READ_HOTSET` bounds the repeated key range, while
+`EXTENT_BENCH_READ_WARMUP` performs a separate warmup before the measured read phase. Together
+these switches isolate a page-cache and engine-index hot path without allowing the memory cache to
+hide it.
 Set `EXTENT_BENCH_RECOVER_WRITE_WAVE=1` on a recover-only run to append and drain one write wave
 after strict recovery, concurrently validate reads, and close with a new durable checkpoint. Both
 switches are disabled by default and do not affect normal comparison runs.
@@ -115,3 +120,31 @@ Important tuning variables remain explicit: `EXTENT_BENCH_ENGINES`, `EXTENT_BENC
 `EXTENT_BENCH_IO_READ_PRIORITY_US`. Priority-isolation experiments may also override
 `EXTENT_BENCH_HIGH_CAPACITY_PERCENT` and `EXTENT_BENCH_NORMAL_CAPACITY_PERCENT`; their sum must not
 exceed 100.
+
+## Index-only hot path
+
+`index_hot_path` compares the FixedLSM point-lookup path with the block engine's real sharded
+in-memory index. Copy a populated FixedLSM directory before opening it because every database open
+creates a fresh WAL generation:
+
+```shell
+cp -a --reflink=auto /path/to/extent-engine/index-lsm /path/to/index-profile
+
+INDEX_BENCH_ENGINE=fixed \
+INDEX_BENCH_PATH=/path/to/index-profile \
+INDEX_BENCH_ENTRIES=10000000 \
+INDEX_BENCH_HOTSET=10000 \
+INDEX_BENCH_CACHE_MIB=256 \
+cargo bench -p foyer-extent --bench index_hot_path
+
+INDEX_BENCH_ENGINE=memory \
+INDEX_BENCH_ENTRIES=10000000 \
+INDEX_BENCH_HOTSET=10000 \
+cargo bench -p foyer-extent --bench index_hot_path
+```
+
+Both modes prepare their index before warmup and use the same deterministic lookup stream.
+`INDEX_BENCH_CONCURRENCY` defaults to twice the detected core count. Set
+`INDEX_BENCH_CACHE_MIB=0` to isolate a page-cache-only FixedLSM path. For an external profiler,
+`INDEX_BENCH_PROFILE_DELAY_SECONDS` inserts a delay after warmup and immediately before the measured
+phase; preparation and recovery therefore remain outside the captured lookup window.
