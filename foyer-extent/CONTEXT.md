@@ -97,8 +97,8 @@ independently reclaimed.
 _Avoid_: Extent allocation, block chain, reclaim unit
 
 **Entry location** (`EntryLocation`):
-The physical reference to one Stored Entry: byte offset, encoded length, checksum, priority, and
-extent generation.
+The physical reference to one Stored Entry: byte offset, encoded length, value-content digest,
+priority, and extent generation. Its compact record is independently checksummed.
 _Avoid_: Extent location, blob address, index entry
 
 **Entry directory**:

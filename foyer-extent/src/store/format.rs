@@ -2,7 +2,7 @@ use crc_fast::{CrcAlgorithm, Digest};
 
 use crate::{
     error::{Error, Result},
-    format::PAGE_SIZE,
+    format::{CONTENT_DIGEST_SIZE, ContentDigest, PAGE_SIZE},
     model::{CachePriority, KeyDigest},
     store::config::ExtentStoreConfig,
 };
@@ -13,13 +13,11 @@ const STATE_ENTRY_SIZE: usize = 24;
 const STATE_HEADER_SIZE: usize = 64;
 const STATE_CHECKSUM_SIZE: usize = size_of::<u32>();
 const STATE_MAGIC: [u8; 8] = *b"SCSEGST1";
-const ENTRY_OWNER_MAGIC: [u8; 4] = *b"SCEO";
-const LOCATION_MAGIC: [u8; 4] = *b"SCLO";
 /// Compatibility identity for every persisted Extent layout and encoding choice.
 ///
 /// Bump this when changing the balanced entry charge or extent size, layout derivation, record encoding,
 /// or an incompatible format in the embedded fixed-record index.
-pub const EXTENT_FORMAT_VERSION: u32 = 4;
+pub const EXTENT_FORMAT_VERSION: u32 = 5;
 const NO_EXTENT: u32 = u32::MAX;
 const FIXED_LSM_INDEX_BYTES_PER_ENTRY: u64 = 76;
 // One steady-state copy, one atomic compaction output, and one bounded WAL/L0 write tail.
@@ -419,39 +417,35 @@ pub struct EntryLocation {
     pub data_offset: u64,
     pub extent_generation: u32,
     pub stored_len: u32,
-    pub checksum: u32,
+    pub content_digest: ContentDigest,
     pub priority: CachePriority,
 }
 
 impl EntryLocation {
     pub fn encode(self) -> [u8; LOCATION_RECORD_SIZE] {
         let mut output = [0; LOCATION_RECORD_SIZE];
-        output[..4].copy_from_slice(&LOCATION_MAGIC);
-        output[4] = EXTENT_FORMAT_VERSION as u8;
-        output[5] = self.priority.to_byte();
-        put_u64(&mut output, 8, self.data_offset);
-        put_u32(&mut output, 16, self.extent_generation);
-        put_u32(&mut output, 20, self.stored_len);
-        put_u32(&mut output, 24, self.checksum);
+        put_u64(&mut output, 0, self.data_offset);
+        put_u32(&mut output, 8, self.extent_generation);
+        put_u32(&mut output, 12, self.stored_len);
+        output[16..16 + CONTENT_DIGEST_SIZE].copy_from_slice(&self.content_digest);
+        output[27] = self.priority.to_byte();
         let checksum = checksum(&output[..28]);
         put_u32(&mut output, 28, checksum);
         output
     }
 
     pub fn decode(input: &[u8]) -> Option<Self> {
-        if input.len() != LOCATION_RECORD_SIZE
-            || input[..4] != LOCATION_MAGIC
-            || input[4] != EXTENT_FORMAT_VERSION as u8
-            || checksum(&input[..28]) != get_u32(input, 28)
-        {
+        if input.len() != LOCATION_RECORD_SIZE || checksum(&input[..28]) != get_u32(input, 28) {
             return None;
         }
+        let mut content_digest = [0; CONTENT_DIGEST_SIZE];
+        content_digest.copy_from_slice(&input[16..16 + CONTENT_DIGEST_SIZE]);
         Some(Self {
-            data_offset: get_u64(input, 8),
-            extent_generation: get_u32(input, 16),
-            stored_len: get_u32(input, 20),
-            checksum: get_u32(input, 24),
-            priority: CachePriority::from_byte(input[5])?,
+            data_offset: get_u64(input, 0),
+            extent_generation: get_u32(input, 8),
+            stored_len: get_u32(input, 12),
+            content_digest,
+            priority: CachePriority::from_byte(input[27])?,
         })
     }
 }
@@ -463,7 +457,7 @@ pub struct EntryOwner {
     pub extent_offset: u32,
     pub stored_len: u32,
     pub value_len: u32,
-    pub checksum: u32,
+    pub content_digest: ContentDigest,
     pub priority: CachePriority,
     pub sequence: u64,
 }
@@ -471,40 +465,36 @@ pub struct EntryOwner {
 impl EntryOwner {
     pub fn encode(self) -> [u8; ENTRY_OWNER_SIZE] {
         let mut output = [0; ENTRY_OWNER_SIZE];
-        output[..4].copy_from_slice(&ENTRY_OWNER_MAGIC);
-        output[4] = EXTENT_FORMAT_VERSION as u8;
-        output[5] = self.priority.to_byte();
-        output[8..32].copy_from_slice(self.key_digest.as_bytes());
-        put_u32(&mut output, 32, self.extent_generation);
-        put_u32(&mut output, 36, self.extent_offset);
-        put_u32(&mut output, 40, self.stored_len);
-        put_u32(&mut output, 44, self.value_len);
-        put_u32(&mut output, 48, self.checksum);
-        put_u64(&mut output, 52, self.sequence);
+        output[..24].copy_from_slice(self.key_digest.as_bytes());
+        put_u32(&mut output, 24, self.extent_generation);
+        put_u32(&mut output, 28, self.extent_offset);
+        put_u32(&mut output, 32, self.stored_len);
+        put_u32(&mut output, 36, self.value_len);
+        put_u64(&mut output, 40, self.sequence);
+        output[48..48 + CONTENT_DIGEST_SIZE].copy_from_slice(&self.content_digest);
+        output[59] = self.priority.to_byte();
         let checksum = checksum(&output[..60]);
         put_u32(&mut output, 60, checksum);
         output
     }
 
     pub fn decode(input: &[u8]) -> Option<Self> {
-        if input.len() != ENTRY_OWNER_SIZE
-            || input[..4] != ENTRY_OWNER_MAGIC
-            || input[4] != EXTENT_FORMAT_VERSION as u8
-            || checksum(&input[..60]) != get_u32(input, 60)
-        {
+        if input.len() != ENTRY_OWNER_SIZE || checksum(&input[..60]) != get_u32(input, 60) {
             return None;
         }
         let mut key_digest = [0; 24];
-        key_digest.copy_from_slice(&input[8..32]);
+        key_digest.copy_from_slice(&input[..24]);
+        let mut content_digest = [0; CONTENT_DIGEST_SIZE];
+        content_digest.copy_from_slice(&input[48..48 + CONTENT_DIGEST_SIZE]);
         Some(Self {
             key_digest: KeyDigest::new(key_digest),
-            extent_generation: get_u32(input, 32),
-            extent_offset: get_u32(input, 36),
-            stored_len: get_u32(input, 40),
-            value_len: get_u32(input, 44),
-            checksum: get_u32(input, 48),
-            priority: CachePriority::from_byte(input[5])?,
-            sequence: get_u64(input, 52),
+            extent_generation: get_u32(input, 24),
+            extent_offset: get_u32(input, 28),
+            stored_len: get_u32(input, 32),
+            value_len: get_u32(input, 36),
+            content_digest,
+            priority: CachePriority::from_byte(input[59])?,
+            sequence: get_u64(input, 40),
         })
     }
 }
@@ -586,6 +576,18 @@ mod tests {
             Some(layout)
         );
 
+        let mut previous_version = encoded.clone();
+        put_u32(&mut previous_version, 8, EXTENT_FORMAT_VERSION - 1);
+        assert_eq!(
+            StoreLayout::discover(
+                &previous_version,
+                layout.data_file_size,
+                layout.entry_directory_file_size,
+                (layout.state_copy_size * 2) as u64,
+            ),
+            None
+        );
+
         encoded[STATE_HEADER_SIZE + 3] ^= 0xff;
         assert!(ExtentPoolState::decode(&encoded, layout, 0).is_none());
     }
@@ -599,10 +601,14 @@ mod tests {
             data_offset: 99,
             extent_generation: 3,
             stored_len: 4_096,
-            checksum: 123,
+            content_digest: [123; CONTENT_DIGEST_SIZE],
             priority: CachePriority::High,
         };
-        assert_eq!(EntryLocation::decode(&location.encode()), Some(location));
+        let location_record = location.encode();
+        assert_eq!(EntryLocation::decode(&location_record), Some(location));
+        let mut corrupt_location = location_record;
+        corrupt_location[16] ^= 1;
+        assert_eq!(EntryLocation::decode(&corrupt_location), None);
 
         let owner = EntryOwner {
             key_digest: KeyDigest::for_key(&key),
@@ -610,10 +616,14 @@ mod tests {
             extent_offset: 99,
             stored_len: 4_096,
             value_len: 4_000,
-            checksum: 123,
+            content_digest: [123; CONTENT_DIGEST_SIZE],
             priority: CachePriority::High,
             sequence: 88,
         };
-        assert_eq!(EntryOwner::decode(&owner.encode()), Some(owner));
+        let owner_record = owner.encode();
+        assert_eq!(EntryOwner::decode(&owner_record), Some(owner));
+        let mut corrupt_owner = owner_record;
+        corrupt_owner[48] ^= 1;
+        assert_eq!(EntryOwner::decode(&corrupt_owner), None);
     }
 }

@@ -46,8 +46,9 @@ The store directory contains:
 | `index-lsm/` | FixedRecordLSM WAL, manifests, and SSTs |
 
 An Entry-directory record binds one allocation's byte offset to the key digest, extent generation,
-value length, checksum, sequence, and priority. Reclaim enumerates this compact sidecar instead of
-reading the entire payload extent. Exact key validation remains in the Stored Entry.
+value length, 88-bit value-content digest, sequence, and priority. The record itself has a CRC.
+Reclaim enumerates this compact sidecar instead of reading the entire payload extent. Exact key
+validation remains in the Stored Entry.
 
 The capacity calculation includes all four components. One extent is excluded from usable
 capacity as reclaim headroom, and fewer than five physical extents are rejected. Allocation is
@@ -70,12 +71,13 @@ meanwhile. This closes the miss race without invalidating readers for every unre
 mutation.
 
 After a single-Entry index lookup, `ExtentPool` validates the extent generation, reads the indexed
-byte range in runs bounded by `read_run_size`, checksum-checks the Stored Entry, and rechecks the
-generation. Direct I/O expands the read to the covering 4 KiB frame span; buffered I/O reads only
-the logical bytes. This path does not read Entry-directory metadata, so a hot index lookup does not
-add a sidecar I/O. Directory records exist for reclaim and tail recovery, not foreground lookup.
-Any stale, torn, or mismatched location is a miss/error boundary, never an unverified hit. There is
-deliberately no second batch-read implementation beside Foyer's point-load interface.
+byte range in runs bounded by `read_run_size`, validates the Stored Entry header and seeded 88-bit
+XXH3 value-content digest, compares the complete key, and rechecks the generation. Direct I/O
+expands the read to the covering 4 KiB frame span; buffered I/O reads only the logical bytes. This
+path does not read Entry-directory metadata, so a hot index lookup does not add a sidecar I/O.
+Directory records exist for reclaim and tail recovery, not foreground lookup. Any stale, torn, or
+mismatched location is a miss/error boundary, never an unverified hit. There is deliberately no
+second batch-read implementation beside Foyer's point-load interface.
 
 ## I/O admission
 
@@ -107,6 +109,12 @@ the frame boundary, installs locations in the active overlay, and synchronizes t
 publication fence. It then advances a logical epoch. Once `checkpoint_bytes` is reached, or the
 periodic cache worker requests one, the coordinator captures immutable allocator and index images
 under the mutation lock and releases it.
+
+The value-content digest is computed once on submission and stored in both the directory record and
+index location. A repeated key, encoded length, digest, and priority is idempotent without reading
+the old payload. The previous V4 CRC32 shortcut could suppress an update for an easily constructed
+collision; V5 uses an 88-bit seeded XXH3 identity while retaining the same 32-byte location and
+64-byte directory record sizes. The complete key is still compared on every returned hit.
 
 Durable checkpoint order is:
 
@@ -183,7 +191,7 @@ accounting, and rejected index implementations are specified in
 
 ## Failure model
 
-- A frozen V3 fixture covers the former payload, owner, allocator, manifest, and WAL layout. V4 must
+- A frozen V3 fixture covers the former payload, owner, allocator, manifest, and WAL layout. V5 must
   reject it and the explicit recreate path must remove legacy owned files before creating the new
   directory layout. Current-format tests separately cover append, reopen, active-tail recovery,
   reclaim, and process abort.
@@ -199,14 +207,14 @@ accounting, and rejected index implementations are specified in
 ## Design rationale and rejected alternatives
 
 - **Fixed allocation slots** simplified alignment but imposed severe tail padding on small Entries.
-  V4 packs exact byte ranges and uses page alignment only for physical I/O frames.
+  V5 packs exact byte ranges and uses page alignment only for physical I/O frames.
 - **Cross-extent Entry descriptors** would reduce boundary waste but make reads, reclaim, and crash
   recovery span multiple generations. Extent seals the current cache extent instead.
 - **Payload scanning during reclaim or recovery** would remove the Entry directory at the cost of a
   full payload read. The compact sidecar keeps these paths bounded without entering foreground
   lookup.
 - **One directory record per page or slot** duplicates Entry identity and inflates index cardinality.
-  V4 stores one directory record and one EntryIndex location per complete Entry.
+  V5 stores one directory record and one EntryIndex location per complete Entry.
 - **Fixed priority partitions** strand capacity when one class is idle. Borrowable floors preserve
   minimum residency while allowing repayment under later demand.
 - **An independent background reclaimer** would race the total mutation order and generation

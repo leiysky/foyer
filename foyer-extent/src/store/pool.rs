@@ -15,7 +15,8 @@ use crate::{
         AlignedBuffer, ensure_cache_file_reserved, open_cache_file, read_exact_at, reserve_cache_file, write_all_at,
     },
     format::{
-        PAGE_SIZE, copy_stored_entry_range, decode_entry_value, decode_stored_entry, stored_entry_len, value_checksum,
+        ContentDigest, PAGE_SIZE, copy_stored_entry_range, decode_entry_value, decode_stored_entry,
+        encoded_entry_value_digest, stored_entry_len,
     },
     model::{CachePriority, EntryKey, KeyDigest},
     store::{
@@ -54,7 +55,7 @@ pub struct EntryWrite<'a> {
     pub key: &'a EntryKey,
     pub key_digest: KeyDigest,
     pub value: &'a [u8],
-    pub checksum: u32,
+    pub content_digest: ContentDigest,
 }
 
 impl EntryWrite<'_> {
@@ -469,7 +470,7 @@ impl ExtentPool {
                 data_offset: write.allocation.data_offset,
                 extent_generation: write.allocation.extent_generation,
                 stored_len: u32::try_from(write.stored_len()).expect("validated stored entry length must fit u32"),
-                checksum: write.checksum,
+                content_digest: write.content_digest,
                 priority: write.allocation.priority,
             });
         }
@@ -576,7 +577,7 @@ impl ExtentPool {
             let state = mutex_lock(&self.state);
             state.extents[extent as usize].generation == location.extent_generation
         };
-        if value_checksum(&value) != location.checksum || !generation_matches {
+        if encoded_entry_value_digest(&value) != Some(location.content_digest) || !generation_matches {
             return Ok(result);
         }
         result.value = Some(value);
@@ -1113,7 +1114,7 @@ impl ExtentPool {
                     extent_offset: write.allocation.extent_offset,
                     stored_len: u32::try_from(write.stored_len()).expect("validated stored entry length must fit u32"),
                     value_len: u32::try_from(write.value.len()).expect("validated value length must fit u32"),
-                    checksum: write.checksum,
+                    content_digest: write.content_digest,
                     priority: write.allocation.priority,
                     sequence: write.allocation.sequence,
                 }
@@ -1294,7 +1295,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        format::{PAGE_SIZE, stored_entry_checksum},
+        format::{PAGE_SIZE, stored_entry_checksum, value_digest},
         store::config::{ExtentStoreConfig, ExtentStoreOptions},
     };
 
@@ -1346,7 +1347,7 @@ mod tests {
                 key: &keys[index],
                 key_digest: KeyDigest::for_key(&keys[index]),
                 value,
-                checksum: stored_entry_checksum(&keys[index], value),
+                content_digest: value_digest(value),
             })
             .collect::<Vec<_>>();
         let result = pool.write_batch(&writes).unwrap();
@@ -1406,7 +1407,7 @@ mod tests {
                 key: &key,
                 key_digest,
                 value: &old_value,
-                checksum,
+                content_digest: value_digest(&old_value),
             }])
             .unwrap()
             .locations[0];
@@ -1424,7 +1425,7 @@ mod tests {
                     key: &key,
                     key_digest,
                     value: &replacement,
-                    checksum,
+                    content_digest: value_digest(&replacement),
                 }])?;
                 Ok(())
             })
@@ -1459,7 +1460,7 @@ mod tests {
             key: &keys[index],
             key_digest: KeyDigest::for_key(&keys[index]),
             value: &values[index],
-            checksum: stored_entry_checksum(&keys[index], &values[index]),
+            content_digest: value_digest(&values[index]),
         });
         let locations = pool.write_batch(&writes).unwrap().locations;
 
@@ -1484,7 +1485,7 @@ mod tests {
             key: &first_key,
             key_digest: KeyDigest::for_key(&first_key),
             value: &value,
-            checksum: stored_entry_checksum(&first_key, &value),
+            content_digest: value_digest(&value),
         }])
         .unwrap();
         pool.sync_payload().unwrap();
@@ -1497,7 +1498,7 @@ mod tests {
             key: &tail_key,
             key_digest: KeyDigest::for_key(&tail_key),
             value: &value,
-            checksum: stored_entry_checksum(&tail_key, &value),
+            content_digest: value_digest(&value),
         }])
         .unwrap();
         pool.sync_payload().unwrap();

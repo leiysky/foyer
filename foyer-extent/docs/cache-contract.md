@@ -66,7 +66,7 @@ all of these checks:
 
 1. the indexed location is within the configured layout;
 2. the cache-extent generation matches before payload I/O;
-3. the Stored Entry header, length, and checksum are valid;
+3. the Stored Entry header, length, and value-content digest are valid;
 4. the complete stored key equals the requested key; and
 5. the generation still matches after payload I/O.
 

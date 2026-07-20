@@ -1,8 +1,17 @@
+#[cfg(test)]
 use crc_fast::{CrcAlgorithm, Digest};
+use twox_hash::XxHash3_128;
 
 use crate::model::{EntryKey, MAX_KEY_SIZE};
 
 pub const PAGE_SIZE: usize = 4 * 1024;
+/// Persisted value identity used for idempotence and payload validation.
+///
+/// Eleven bytes fit both fixed metadata records without increasing their size. The records retain
+/// a separate CRC for torn-write detection, while complete keys are still verified on every hit.
+pub(crate) const CONTENT_DIGEST_SIZE: usize = 11;
+pub(crate) type ContentDigest = [u8; CONTENT_DIGEST_SIZE];
+const CONTENT_DIGEST_SEED: u64 = 0x4f1b_bcdd_94d0_49bb;
 /// The minimum capacity charge used to bound entry-directory and index cardinality.
 ///
 /// Stored Entries are packed by byte inside an extent. This charge is an accounting bound, not a
@@ -12,10 +21,6 @@ pub const DEFAULT_ENTRY_CHARGE: usize = PAGE_SIZE;
 const STORED_ENTRY_MAGIC: [u8; 4] = *b"SCBL";
 const STORED_ENTRY_VERSION: u8 = 1;
 pub(crate) const STORED_ENTRY_HEADER_SIZE: usize = 16;
-
-pub fn value_checksum(value: &[u8]) -> u32 {
-    crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32IsoHdlc, value) as u32
-}
 
 pub(crate) fn stored_entry_len(key: &EntryKey, value: &[u8]) -> Option<usize> {
     u16::try_from(key.len()).ok()?;
@@ -27,6 +32,21 @@ pub(crate) fn stored_entry_len(key: &EntryKey, value: &[u8]) -> Option<usize> {
     Some(len)
 }
 
+pub(crate) fn value_digest(value: &[u8]) -> ContentDigest {
+    let digest = XxHash3_128::oneshot_with_seed(CONTENT_DIGEST_SEED, value).to_le_bytes();
+    let mut output = [0; CONTENT_DIGEST_SIZE];
+    output.copy_from_slice(&digest[..CONTENT_DIGEST_SIZE]);
+    output
+}
+
+pub(crate) fn encoded_entry_value_digest(stored: &[u8]) -> Option<ContentDigest> {
+    let (key_len, value_len) = decode_stored_entry_header(stored)?;
+    let value_offset = STORED_ENTRY_HEADER_SIZE.checked_add(key_len)?;
+    let value_end = value_offset.checked_add(value_len)?;
+    Some(value_digest(stored.get(value_offset..value_end)?))
+}
+
+#[cfg(test)]
 pub(crate) fn stored_entry_checksum(key: &EntryKey, value: &[u8]) -> u32 {
     let header = stored_entry_header(key, value);
     let mut digest = Digest::new(CrcAlgorithm::Crc32IsoHdlc);

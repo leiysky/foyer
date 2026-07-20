@@ -53,7 +53,7 @@ Each Stored Entry has one fixed directory record, and a cache extent is reused a
 Object ranges, application-specific key encoding, and remote-storage behavior belong outside the
 project.
 
-Capacity is the only production static input. The V4 format owns a 64 MiB cache extent, a 4 KiB I/O
+Capacity is the only production static input. The V5 format owns a 64 MiB cache extent, a 4 KiB I/O
 frame, and a 4 KiB minimum Entry charge. The charge bounds directory and index cardinality but does
 not round physical Entry allocations. Changing these choices, layout derivation, record encoding,
 or an incompatible embedded-index format requires an `EXTENT_FORMAT_VERSION` bump. Layout
@@ -81,8 +81,8 @@ discards the unstarted queue tail, and publishes one final durable checkpoint. T
 is explicitly counted. This bounds shutdown by one batch plus checkpoint work without exposing a
 partially published entry; cache writes remain best effort and the source remains authoritative.
 
-Compatibility CI reconstructs a frozen complete V3 store image and verifies that V4 rejects it and
-can recreate the expendable cache without leaving its legacy owner file behind. V4 round-trip,
+Compatibility CI reconstructs a frozen complete V3 store image and verifies that V5 rejects it and
+can recreate the expendable cache without leaving its legacy owner file behind. V5 round-trip,
 tail-recovery, and process-crash tests cover the current directory, allocator, checkpoint, and
 reclaim publication paths.
 
@@ -94,7 +94,7 @@ Design documentation is organized by boundary:
   integrity;
 - [`docs/foyer-integration.md`](docs/foyer-integration.md) — Foyer engine adaptation, queues,
   lifecycle, and observability;
-- [`docs/extent-store.md`](docs/extent-store.md) — V4 physical layout, checkpoint, reclaim, and
+- [`docs/extent-store.md`](docs/extent-store.md) — V5 physical layout, checkpoint, reclaim, and
   failure model; and
 - [`docs/entry-index.md`](docs/entry-index.md) — overlays, FixedRecordLSM, recovery, and index-space
   accounting.

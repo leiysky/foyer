@@ -20,6 +20,14 @@ Every fresh image stores a scenario manifest next to the engine directory. Recov
 a missing or mismatched manifest, including a different seed, size list, priority workload, or
 scenario-generator version. Images created by an older benchmark must therefore be repopulated.
 
+`EXTENT_BENCH_REWRITE_PASSES` adds measured same-value rewrite passes after the initial population.
+Each pass visits every existing key exactly once through an independent seeded random permutation,
+waits for the storage queue at the same byte-wave boundaries as initial population, and reports
+foreground latency, end-to-end throughput, and physical read/write I/O separately. This isolates
+idempotent-update overhead without changing the recovered key/value set. Keep the default of zero
+for capacity and recovery comparisons; use at least three unrelated seeds and alternate candidate
+and baseline run order when using rewrite passes as a regression gate.
+
 The benchmark refuses to run without `EXTENT_BENCH_PATH`; point it at a real SSD directory, never a
 tmpfs. It deletes only the selected `block` and `extent` children when reset is enabled.
 

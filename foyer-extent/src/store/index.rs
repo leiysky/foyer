@@ -533,7 +533,7 @@ mod tests {
             data_offset: index,
             extent_generation: 1,
             stored_len: PAGE_SIZE as u32,
-            checksum: index as u32,
+            content_digest: [index as u8; crate::format::CONTENT_DIGEST_SIZE],
             priority: CachePriority::Normal,
         }
     }

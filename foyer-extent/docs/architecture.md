@@ -90,7 +90,8 @@ exact.
 
 Foyer puts are fire-and-forget, queue reservations are bounded, reads do not wait for storage
 capacity, and low-value work may be shed. This weak admission contract is paired with a strong
-integrity contract: every hit must pass location, generation, checksum, and complete-key checks.
+integrity contract: every hit must pass location, generation, value-content-digest, and complete-key
+checks.
 
 ## Cross-layer invariants
 
@@ -121,7 +122,7 @@ the workspace-pinned Foyer fork are upgraded together.
   and integrity.
 - [Foyer integration](foyer-integration.md) — engine boundary, queues, read/write paths, lifecycle,
   and observability.
-- [ExtentStore design](extent-store.md) — V4 physical layout, checkpoint, reclaim, and failure
+- [ExtentStore design](extent-store.md) — V5 physical layout, checkpoint, reclaim, and failure
   model.
 - [EntryIndex design](entry-index.md) — overlays, FixedRecordLSM, recovery, accounting, and rejected
   index shapes.

@@ -22,9 +22,10 @@ The digest is a 192-bit BLAKE3 value derived internally from the complete variab
 key. The complete key is stored once with the payload and is compared on every hit, so index
 collisions can cause only replacement or a miss, never a wrong value.
 
-`EntryLocation` identifies one complete Stored Entry by byte offset, encoded length, checksum,
-priority, and cache-extent generation. EntryIndex does not interpret any of those fields. It also
-stores one opaque `u64` application state used by ExtentStore for the durable live-entry count.
+`EntryLocation` identifies one complete Stored Entry by byte offset, encoded length, an 88-bit
+value-content digest, priority, and cache-extent generation. Its 32-byte encoding has an independent
+CRC, and EntryIndex does not interpret any of those fields. It also stores one opaque `u64`
+application state used by ExtentStore for the durable live-entry count.
 
 ## Volatile overlays
 
@@ -132,9 +133,10 @@ a cache-health failure.
 
 ## Corruption and miss policy
 
-EntryIndex reports structural corruption precisely to ExtentStore. A digest lookup that returns a
-location is still provisional until ExtentPool validates generation, payload checksum, and the
-complete stored key. A stale or colliding location therefore becomes a miss at the cache boundary.
+EntryIndex reports structural corruption precisely to ExtentStore. A key-digest lookup that returns
+a location is still provisional until ExtentPool validates generation, the value-content digest,
+and the complete stored key. A stale or colliding location therefore becomes a miss at the cache
+boundary.
 
 This division keeps index validation narrow while preserving the public invariant that every hit
 belongs to the requested complete key.

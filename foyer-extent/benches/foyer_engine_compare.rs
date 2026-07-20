@@ -39,6 +39,7 @@ const STREAM_HISTORICAL_HIGH_ORDER: u64 = 0x05;
 const STREAM_HISTORICAL_NORMAL_ORDER: u64 = 0x06;
 const STREAM_KEY_CONTENT: u64 = 0x07;
 const STREAM_VALUE_CONTENT: u64 = 0x08;
+const STREAM_REWRITE_ORDER: u64 = 0x09;
 const STREAM_READ_WARMUP: u64 = 0x10;
 const STREAM_READ_PRIMARY: u64 = 0x11;
 const STREAM_READ_PAIRED: u64 = 0x12;
@@ -129,6 +130,7 @@ struct Config {
     recover_only: bool,
     recover_write_wave: bool,
     populate_only: bool,
+    rewrite_passes: u64,
     reset: bool,
 }
 
@@ -237,6 +239,7 @@ impl Config {
             recover_only,
             recover_write_wave: env_bool("EXTENT_BENCH_RECOVER_WRITE_WAVE", false)?,
             populate_only,
+            rewrite_passes: env_u64("EXTENT_BENCH_REWRITE_PASSES", 0)?,
             reset: env_bool("EXTENT_BENCH_RESET", !recover_only)?,
         })
     }
@@ -341,11 +344,11 @@ impl Workload {
         }
     }
 
-    fn write_wave_end(&self, start: u64, target_bytes: usize) -> u64 {
+    fn write_pass_wave_end(&self, start: u64, target_bytes: usize, pass: WritePass) -> u64 {
         let mut end = start;
         let mut bytes = 0_u64;
         while end < self.entries && (end == start || bytes < target_bytes as u64) {
-            bytes = bytes.saturating_add(self.entry_size(self.write_index(end)) as u64);
+            bytes = bytes.saturating_add(self.entry_size(pass.index(self, end)) as u64);
             end += 1;
         }
         end
@@ -392,6 +395,35 @@ impl Workload {
             self.priority.label(),
             self.write_order_label(),
         )
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WritePass {
+    Initial,
+    Rewrite { order: Permutation, pass: u64 },
+}
+
+impl WritePass {
+    fn index(self, workload: &Workload, position: u64) -> u64 {
+        match self {
+            Self::Initial => workload.write_index(position),
+            Self::Rewrite { order, .. } => order.get(position),
+        }
+    }
+
+    const fn latency_stream(self) -> u64 {
+        match self {
+            Self::Initial => STREAM_WRITE_ORDER,
+            Self::Rewrite { pass, .. } => STREAM_REWRITE_ORDER ^ mix64(pass),
+        }
+    }
+
+    const fn progress_phase(self) -> &'static str {
+        match self {
+            Self::Initial => "write_progress",
+            Self::Rewrite { .. } => "rewrite_progress",
+        }
     }
 }
 
@@ -469,7 +501,7 @@ async fn main() -> AnyResult<()> {
     fs::create_dir_all(&config.root)?;
 
     println!(
-        "foyer-engine benchmark: scenario_version={} seed={} seed_hex={:#018x} generator=counter-splitmix64-prp-v1 path={} engines={} entries={} payload_mib={:.1} capacity_mib={} memory_mib={} entry_kib={} key_bytes={} write_order={} priority_workload={} read_pattern={} read_hotset={} read_warmup={} warmup_order=random-permutation read_source={} concurrency={} (>=2x cores) put_concurrency={} io={} extent_read_priority_us={} extent_priority_floors={}/{} recover_only={} recover_write_wave={} populate_only={}",
+        "foyer-engine benchmark: scenario_version={} seed={} seed_hex={:#018x} generator=counter-splitmix64-prp-v1 path={} engines={} entries={} payload_mib={:.1} capacity_mib={} memory_mib={} entry_kib={} key_bytes={} write_order={} priority_workload={} read_pattern={} read_hotset={} read_warmup={} warmup_order=random-permutation read_source={} concurrency={} (>=2x cores) put_concurrency={} io={} extent_read_priority_us={} extent_priority_floors={}/{} recover_only={} recover_write_wave={} populate_only={} rewrite_passes={}",
         SCENARIO_VERSION,
         workload.seed,
         workload.seed,
@@ -501,6 +533,7 @@ async fn main() -> AnyResult<()> {
         config.recover_only,
         config.recover_write_wave,
         config.populate_only,
+        config.rewrite_passes,
     );
 
     for engine in config.engines.iter().copied() {
@@ -554,6 +587,30 @@ async fn run_engine(engine: DiskEngine, config: &Config, workload: Arc<Workload>
     );
     print_latencies(engine, "put_foreground", &write.latencies);
     print_extent_write_stats(engine, &built.extent)?;
+
+    for pass in 0..config.rewrite_passes {
+        let io_before = io_measurements(&built.cache);
+        let rewrite = run_rewrite_pass(&built.cache, config, workload.clone(), pass).await?;
+        let io = io_delta(io_measurements(&built.cache), io_before);
+        let elapsed = rewrite.foreground + rewrite.drain;
+        println!(
+            "engine={} phase=rewrite pass={} operations={} logical_mib={:.1} foreground_seconds={:.3} drain_seconds={:.3} end_to_end_seconds={:.3} foreground_mib_s={:.1} end_to_end_mib_s={:.1} disk_read_mib={:.1} disk_write_mib={:.1} disk_read_ios={} disk_write_ios={}",
+            engine.label(),
+            pass,
+            rewrite.operations,
+            as_mib(rewrite.bytes),
+            rewrite.foreground.as_secs_f64(),
+            rewrite.drain.as_secs_f64(),
+            elapsed.as_secs_f64(),
+            throughput_mib(rewrite.bytes, rewrite.foreground),
+            throughput_mib(rewrite.bytes, elapsed),
+            as_mib(io.read_bytes as u64),
+            as_mib(io.write_bytes as u64),
+            io.read_ios,
+            io.write_ios,
+        );
+        print_latencies(engine, "put_rewrite_foreground", &rewrite.latencies);
+    }
 
     built.cache.close().await?;
     drop(built);
@@ -800,13 +857,33 @@ async fn build_cache(
 }
 
 async fn run_writes(cache: &BenchCache, config: &Config, workload: Arc<Workload>) -> AnyResult<WriteMeasurements> {
+    run_write_pass(cache, config, workload, WritePass::Initial).await
+}
+
+async fn run_rewrite_pass(
+    cache: &BenchCache,
+    config: &Config,
+    workload: Arc<Workload>,
+    pass: u64,
+) -> AnyResult<WriteMeasurements> {
+    let order = Permutation::new(workload.entries, workload.seed, STREAM_REWRITE_ORDER ^ mix64(pass));
+    run_write_pass(cache, config, workload, WritePass::Rewrite { order, pass }).await
+}
+
+async fn run_write_pass(
+    cache: &BenchCache,
+    config: &Config,
+    workload: Arc<Workload>,
+    pass: WritePass,
+) -> AnyResult<WriteMeasurements> {
     let mut measurements = WriteMeasurements::default();
     let mut start = 0u64;
     let progress_stride = (workload.entries / 20).max(1);
     let mut next_progress = progress_stride;
+    let latency_stream = STREAM_LATENCY_SAMPLE ^ pass.latency_stream();
 
     while start < workload.entries {
-        let end = workload.write_wave_end(start, config.wave_bytes);
+        let end = workload.write_pass_wave_end(start, config.wave_bytes, pass);
         let worker_count = config.put_concurrency.min((end - start) as usize).max(1);
         let wave_started = Instant::now();
         let mut workers = Vec::with_capacity(worker_count);
@@ -817,7 +894,7 @@ async fn run_writes(cache: &BenchCache, config: &Config, workload: Arc<Workload>
                 let mut result = WriteMeasurements::default();
                 let mut position = start + worker as u64;
                 while position < end {
-                    let index = workload.write_index(position);
+                    let index = pass.index(&workload, position);
                     let key = make_key(index, workload.key_size(index), workload.seed);
                     let value = make_value(index, workload.entry_size(index), workload.seed);
                     let priority = workload.priority(index);
@@ -832,7 +909,7 @@ async fn run_writes(cache: &BenchCache, config: &Config, workload: Arc<Workload>
                         workload.entries,
                         LATENCY_SAMPLE_TARGET,
                         workload.seed,
-                        STREAM_LATENCY_SAMPLE ^ STREAM_WRITE_ORDER,
+                        latency_stream,
                     ) {
                         result.latencies.push(submitted.elapsed());
                     }
@@ -858,7 +935,8 @@ async fn run_writes(cache: &BenchCache, config: &Config, workload: Arc<Workload>
 
         if start >= next_progress || start == workload.entries {
             println!(
-                "phase=write_progress entries={}/{} percent={:.1}",
+                "phase={} entries={}/{} percent={:.1}",
+                pass.progress_phase(),
                 start,
                 workload.entries,
                 start as f64 * 100.0 / workload.entries as f64,

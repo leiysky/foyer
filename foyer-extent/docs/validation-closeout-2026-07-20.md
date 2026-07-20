@@ -2,8 +2,8 @@
 
 Date: 2026-07-20
 
-> Historical V3 baseline. The current implementation uses an incompatible packed V4 layout.
-> Recovery/index conclusions remain architectural evidence, but V4 must repeat the
+> Historical V3 baseline. The current implementation uses an incompatible packed V5 layout.
+> Recovery/index conclusions remain architectural evidence, but V5 must repeat the
 > write-throughput, capacity-retention, read-tail, crash, and long-running reclaim gates before a
 > production canary.
 

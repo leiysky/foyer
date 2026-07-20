@@ -2,6 +2,7 @@ use std::{cmp::Reverse, collections::HashSet};
 
 use crate::{
     error::Result,
+    format::ContentDigest,
     model::{CachePriority, EntryKey, KeyDigest},
     store::{
         checkpoint::CheckpointCoordinator,
@@ -195,7 +196,7 @@ impl<'a> Reclaimer<'a> {
                 key_digest,
                 allocation,
                 value,
-                checksum: entry.location.checksum,
+                content_digest: entry.location.content_digest,
             });
         }
         let writes = promotions
@@ -205,7 +206,7 @@ impl<'a> Reclaimer<'a> {
                 key: &promotion.key,
                 key_digest: promotion.key_digest,
                 value: &promotion.value,
-                checksum: promotion.checksum,
+                content_digest: promotion.content_digest,
             })
             .collect::<Vec<_>>();
         let written = self.pool.write_batch(&writes)?;
@@ -297,7 +298,7 @@ struct Promotion {
     key_digest: KeyDigest,
     allocation: EntryAllocation,
     value: Vec<u8>,
-    checksum: u32,
+    content_digest: ContentDigest,
 }
 
 fn select_victim(

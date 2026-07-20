@@ -8,12 +8,14 @@ use std::{
 };
 
 #[cfg(test)]
+use crate::format::stored_entry_checksum;
+#[cfg(test)]
 use crate::model::CachePriority;
 #[cfg(test)]
 use crate::store::reclaim::promotion_limit;
 use crate::{
     error::{Error, Result},
-    format::{stored_entry_checksum, stored_entry_len},
+    format::{ContentDigest, stored_entry_len, value_digest},
     model::{EntryKey, KeyDigest},
     store::{
         checkpoint::{CheckpointCoordinator, CheckpointStats},
@@ -277,29 +279,22 @@ impl ExtentStore {
                 let key_digest = KeyDigest::for_key(insert.key);
                 let stored_len =
                     stored_entry_len(insert.key, insert.value).expect("validated stored entry length must fit usize");
-                let checksum = stored_entry_checksum(insert.key, insert.value);
+                let content_digest = value_digest(insert.value);
                 let (would_admit, exact_match) = if let Some(known) = known.get(&key_digest) {
                     (
                         true,
                         known.location.stored_len as usize == stored_len
-                            && known.location.checksum == checksum
+                            && known.location.content_digest == content_digest
                             && insert.priority == known.location.priority
-                            && insert.key == known.key
-                            && insert.value == known.value,
+                            && insert.key == known.key,
                     )
                 } else {
                     let (current, would_admit) = self.index.probe(key_digest, insert.priority)?;
-                    let exact_match = if let Some(current) = current
-                        && current.stored_len as usize == stored_len
-                        && current.checksum == checksum
-                        && insert.priority == current.priority
-                    {
-                        self.pool.read_stored_entry(current)?.is_some_and(|(key, value)| {
-                            key.as_bytes() == insert.key.as_bytes() && value.as_slice() == insert.value
-                        })
-                    } else {
-                        false
-                    };
+                    let exact_match = current.is_some_and(|current| {
+                        current.stored_len as usize == stored_len
+                            && current.content_digest == content_digest
+                            && insert.priority == current.priority
+                    });
                     (would_admit, exact_match)
                 };
                 if exact_match {
@@ -336,7 +331,7 @@ impl ExtentStore {
                     data_offset: allocation.data_offset,
                     extent_generation: allocation.extent_generation,
                     stored_len: u32::try_from(stored_len).expect("validated stored entry length must fit u32"),
-                    checksum,
+                    content_digest,
                     priority: stored_priority,
                 };
                 known.insert(
@@ -344,7 +339,6 @@ impl ExtentStore {
                     KnownInsert {
                         location,
                         key: insert.key,
-                        value: insert.value,
                     },
                 );
                 protected_extents.insert(allocation.extent);
@@ -354,7 +348,7 @@ impl ExtentStore {
                     key: insert.key,
                     key_digest,
                     value: insert.value,
-                    checksum,
+                    content_digest,
                 });
                 input_index += 1;
             }
@@ -375,7 +369,7 @@ impl ExtentStore {
                     key: pending.key,
                     key_digest: pending.key_digest,
                     value: pending.value,
-                    checksum: pending.checksum,
+                    content_digest: pending.content_digest,
                 })
                 .collect::<Vec<_>>();
             let physical = self.pool.write_batch(&writes)?;
@@ -553,14 +547,13 @@ struct PendingInsert<'a> {
     key: &'a EntryKey,
     key_digest: KeyDigest,
     value: &'a [u8],
-    checksum: u32,
+    content_digest: ContentDigest,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct KnownInsert<'a> {
     location: EntryLocation,
     key: &'a EntryKey,
-    value: &'a [u8],
 }
 
 fn validate_options(options: ExtentStoreOptions) -> Result<()> {
@@ -746,6 +739,7 @@ mod tests {
             stored_entry_checksum(&batched_key, &old),
             stored_entry_checksum(&batched_key, &replacement)
         );
+        assert_ne!(value_digest(&old), value_digest(&replacement));
 
         store.insert(&first_key, &old, CachePriority::Normal).unwrap();
         store.insert(&first_key, &replacement, CachePriority::Normal).unwrap();
