@@ -1,6 +1,6 @@
 # FixedRecordLSM
 
-`foyer-fixed-lsm` is the specialized durable index for Extent's `SegmentEngine`. It is deliberately
+`foyer-fixed-lsm` is the specialized durable index for Extent's `ExtentStore`. It is deliberately
 not a general-purpose key/value database. Its performance and operational reference is RocksDB under
 Extent's exact 24-byte key, 32-byte location, high-churn point-lookup workload.
 
@@ -8,7 +8,7 @@ Extent's exact 24-byte key, 32-byte location, high-churn point-lookup workload.
 
 - Keys are exactly 24 bytes and values are exactly 32 bytes.
 - The only mutations are put and delete; a write batch becomes visible atomically.
-- A write batch may atomically carry one opaque `u64` application state. SegmentEngine uses it for
+- A write batch may atomically carry one opaque `u64` application state. ExtentStore uses it for
   the exact durable live-entry count, so recovery never scans keys to rebuild cardinality.
 - Reads are exact point lookups. There is no public iterator, range API, snapshot, transaction,
   column family, merge operator, TTL, or compression policy.
@@ -43,7 +43,7 @@ A crash can therefore leave orphan files or duplicate old WAL records, but canno
 reference an unsynced table. Open validates referenced tables, ignores already-flushed WAL records,
 and removes only unreferenced temporary/orphan files after the live version is established.
 
-The SegmentEngine adapter supplies a hard disk budget derived from its static layout. WAL frames,
+The ExtentStore adapter supplies a hard disk budget derived from its static layout. WAL frames,
 temporary manifest copies, flush SSTs, and all compaction outputs reserve space before I/O.
 Reservations include transient input/output overlap and are released only after obsolete files are
 unlinked and the directory is synced. Capacity exhaustion fails the write or maintenance pipeline
@@ -72,22 +72,22 @@ from one tenth of the four-write-buffer base through the full base, matching the
 level sizing: L0 enters near the bottom without first merging an unnecessarily large level. Smaller
 levels remain empty. This is one static dynamic-level policy, not a user-selectable compaction mode.
 
-## SegmentEngine integration
+## ExtentStore integration
 
-The segment adapter keeps an active mutation overlay and at most one immutable frozen overlay in
+The ExtentStore adapter keeps an active mutation overlay and at most one immutable frozen overlay in
 front of `FixedLsm`. Reads check active, frozen, and durable state in that order. Retiring a
 persisted frozen overlay increments a base revision; a durable lookup rechecks the overlays and
 revision after I/O so a concurrent checkpoint cannot expose a stale base result. Ordinary active
 mutations are caught by the overlay recheck without invalidating unrelated reads.
 
-A checkpoint rotates the active overlay while holding SegmentEngine's mutation lock, then persists
+A checkpoint rotates the active overlay while holding ExtentStore's mutation lock, then persists
 payload, allocator state, and the frozen index batch in that order. The index batch uses a synced
 WAL frame and carries the captured live-entry count as application state. Retiring the frozen
 overlay is only an in-memory step after that frame succeeds. A crash may leak allocator space, but
 cannot publish an index location whose payload and allocator generation are not already durable.
 
-The storage layer remains an ordinary blob store. It neither exposes range semantics to the index
-nor derives its payload layout from an index file. FixedRecordLSM is the sole SegmentEngine index;
+ExtentPool remains an ordinary physical payload store. It neither exposes range semantics to the index
+nor derives its payload layout from an index file. FixedRecordLSM is the sole EntryIndex backend;
 RocksDB is retained only as an isolated benchmark reference.
 
 ## Measured evidence
@@ -135,6 +135,6 @@ At 100M live entries and at least `core * 2` clients, the implementation is reta
 - enforces the cache's physical disk budget including transient compaction space, and passes
   process-crash, kill-loop, corruption, and long-running churn tests.
 
-Failure means deleting this experiment and using RocksDB behind the same segment-index adapter.
+Failure means deleting this experiment and using RocksDB behind the same EntryIndex adapter.
 Passing keeps it as a canary candidate; production replacement still requires accepting the much
 larger correctness and maintenance burden of owning a storage engine.

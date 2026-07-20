@@ -1,11 +1,11 @@
 use crate::error::{Error, Result};
 
-pub const MAX_BLOB_KEY_SIZE: usize = 1024;
+pub const MAX_KEY_SIZE: usize = 1024;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
-pub struct BlobKey(Box<[u8]>);
+pub struct EntryKey(Box<[u8]>);
 
-impl BlobKey {
+impl EntryKey {
     pub fn new(bytes: impl AsRef<[u8]>) -> Result<Self> {
         let bytes = bytes.as_ref();
         Self::validate(bytes)?;
@@ -16,10 +16,10 @@ impl BlobKey {
         if bytes.is_empty() {
             return Err(Error::EmptyKey);
         }
-        if bytes.len() > MAX_BLOB_KEY_SIZE {
+        if bytes.len() > MAX_KEY_SIZE {
             return Err(Error::KeyTooLarge {
                 len: bytes.len(),
-                maximum: MAX_BLOB_KEY_SIZE,
+                maximum: MAX_KEY_SIZE,
             });
         }
         Ok(())
@@ -34,7 +34,7 @@ impl BlobKey {
     }
 }
 
-impl AsRef<[u8]> for BlobKey {
+impl AsRef<[u8]> for EntryKey {
     fn as_ref(&self) -> &[u8] {
         self.as_bytes()
     }
@@ -44,7 +44,7 @@ impl AsRef<[u8]> for BlobKey {
 pub(crate) struct KeyDigest([u8; 24]);
 
 impl KeyDigest {
-    pub(crate) fn for_key(key: &BlobKey) -> Self {
+    pub(crate) fn for_key(key: &EntryKey) -> Self {
         let hash = blake3::hash(key.as_bytes());
         let mut digest = [0; 24];
         digest.copy_from_slice(&hash.as_bytes()[..24]);

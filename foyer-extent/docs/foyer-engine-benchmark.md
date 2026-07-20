@@ -61,7 +61,7 @@ checkpoint performed by `wait` or close.
 `EXTENT_BENCH_IO_READ_PRIORITY_US` controls Extent's cooperative payload-I/O policy and accepts
 zero as a complete bypass. The benchmark prints `extent_io_scheduler` records with the number and
 duration of actual write-admission waits. For scheduler A/B runs, keep initial payload plus the
-write wave within usable segment capacity and require the same hit set and comparable physical I/O
+write wave within usable extent capacity and require the same hit set and comparable physical I/O
 on both sides. A run that also changes eviction, accepted writes, or hit ratio measures a different
 workload and cannot establish scheduler latency benefit.
 
@@ -115,7 +115,7 @@ with `EXTENT_BENCH_RECOVER_ONLY` and leaves a clean image for repeated cold-reco
 Important tuning variables remain explicit: `EXTENT_BENCH_ENGINES`, `EXTENT_BENCH_CONCURRENCY`,
 `EXTENT_BENCH_PUT_CONCURRENCY`, `EXTENT_BENCH_SHARDS`, `EXTENT_BENCH_BLOCK_MIB`,
 `EXTENT_BENCH_BLOCK_BUFFER_MIB`,
-`EXTENT_BENCH_SEGMENT_MIB`, `EXTENT_BENCH_SLOT_KIB`, `EXTENT_BENCH_INDEX_CACHE_MIB`,
+`EXTENT_BENCH_EXTENT_MIB`, `EXTENT_BENCH_SLOT_KIB`, `EXTENT_BENCH_INDEX_CACHE_MIB`,
 `EXTENT_BENCH_INDEX_WRITE_BUFFER_MIB`, `EXTENT_BENCH_EXTENT_WRITE_CONCURRENCY`, and
 `EXTENT_BENCH_IO_READ_PRIORITY_US`. Priority-isolation experiments may also override
 `EXTENT_BENCH_HIGH_CAPACITY_PERCENT` and `EXTENT_BENCH_NORMAL_CAPACITY_PERCENT`; their sum must not

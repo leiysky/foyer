@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use bytes::Bytes;
 use foyer::{Code, Error as FoyerError, ErrorKind as FoyerErrorKind};
 
-use crate::{CachePriority, Error, Result, model::BlobKey};
+use crate::{CachePriority, Error, Result, model::EntryKey};
 
 const ENGINE_VALUE_HEADER_SIZE: usize = 9;
 
@@ -20,7 +20,7 @@ pub struct Entry {
 impl Entry {
     pub fn new(key: impl Into<Bytes>, value: impl Into<Bytes>, priority: CachePriority) -> Result<Self> {
         let key = key.into();
-        BlobKey::validate(&key)?;
+        EntryKey::validate(&key)?;
         let value = value.into();
         if value.is_empty() {
             return Err(Error::EmptyValue);
@@ -60,7 +60,7 @@ impl Entry {
 
 /// The value half used at the Foyer engine boundary.
 ///
-/// Most callers should use [`Entry`]. This type is public so an Extent engine can be installed
+/// Most callers should use [`Entry`]. This type is public so an ExtentEngine can be installed
 /// directly in `foyer::HybridCache<Bytes, EngineValue>` without another adapter value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineValue {

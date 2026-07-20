@@ -14,62 +14,62 @@ use crate::{
     file::{
         AlignedBuffer, ensure_cache_file_reserved, open_cache_file, read_exact_at, reserve_cache_file, write_all_at,
     },
-    format::{copy_blob_range, decode_blob, decode_stored_blob, stored_blob_len, value_checksum},
-    model::{BlobKey, CachePriority, KeyDigest},
-    segment::{
-        format::{AllocatorState, OWNER_RECORD_SIZE, OwnerRecord, SegmentLayout, SegmentLocation, SegmentRole},
-        io::{IoSchedulerStats, SegmentIoScheduler},
-        stats::{PhysicalWriteStats, PriorityOccupancy},
+    format::{copy_stored_entry_range, decode_entry_value, decode_stored_entry, stored_entry_len, value_checksum},
+    model::{CachePriority, EntryKey, KeyDigest},
+    store::{
+        format::{EntryLocation, ExtentPoolState, ExtentRole, SLOT_OWNER_SIZE, SlotOwner, StoreLayout},
+        io::{IoSchedulerStats, PayloadIoScheduler},
+        stats::{ExtentOccupancy, PhysicalWriteStats},
     },
 };
 
 pub(crate) const DATA_FILE: &str = "data";
-pub(crate) const OWNER_FILE: &str = "owners";
+pub(crate) const SLOT_OWNER_FILE: &str = "owners";
 pub(crate) const STATE_FILE: &str = "state";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SegmentAllocation {
-    pub physical_slot: u64,
-    pub segment: u32,
-    pub slot: u32,
-    pub slots: u32,
-    pub segment_generation: u32,
+pub struct EntryAllocation {
+    pub first_slot: u64,
+    pub extent: u32,
+    pub extent_slot: u32,
+    pub slot_count: u32,
+    pub extent_generation: u32,
     pub priority: CachePriority,
     pub sequence: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SegmentAllocationResult {
-    Allocated(SegmentAllocation),
+pub enum AllocationResult {
+    Allocated(EntryAllocation),
     ReclaimRequired,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct SegmentWrite<'a> {
-    pub allocation: SegmentAllocation,
-    pub key: &'a BlobKey,
+pub struct EntryWrite<'a> {
+    pub allocation: EntryAllocation,
+    pub key: &'a EntryKey,
     pub key_digest: KeyDigest,
     pub value: &'a [u8],
     pub checksum: u32,
 }
 
-impl SegmentWrite<'_> {
+impl EntryWrite<'_> {
     fn stored_len(self) -> usize {
-        stored_blob_len(self.key, self.value).expect("validated stored blob length must fit usize")
+        stored_entry_len(self.key, self.value).expect("validated stored entry length must fit usize")
     }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct SegmentWriteResult {
-    pub locations: Vec<SegmentLocation>,
+pub struct EntryWriteResult {
+    pub locations: Vec<EntryLocation>,
     pub data_runs: usize,
-    pub owner_runs: usize,
+    pub slot_owner_runs: usize,
     pub data_bytes: usize,
-    pub owner_bytes: usize,
+    pub slot_owner_bytes: usize,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct SegmentBlobReadResult {
+pub struct StoredEntryRead {
     pub value: Option<Vec<u8>>,
     pub data_slots: usize,
     pub data_runs: usize,
@@ -77,8 +77,8 @@ pub struct SegmentBlobReadResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SegmentVictim {
-    pub segment: u32,
+pub struct ExtentVictim {
+    pub extent: u32,
     pub generation: u32,
     pub used: u32,
     pub priority: CachePriority,
@@ -87,22 +87,20 @@ pub struct SegmentVictim {
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ReclaimCandidates {
-    occupied_segments: [u32; 3],
-    sealed: [Option<SegmentVictim>; 3],
-    current: [Option<SegmentVictim>; 3],
+    occupied_extents: [u32; 3],
+    sealed: [Option<ExtentVictim>; 3],
+    current: [Option<ExtentVictim>; 3],
 }
 
 impl ReclaimCandidates {
-    pub const fn occupied_segments(self, priority: CachePriority) -> u32 {
-        self.occupied_segments[priority as usize]
+    pub const fn occupied_extents(self, priority: CachePriority) -> u32 {
+        self.occupied_extents[priority as usize]
     }
 
-    pub fn oldest(self, priority: CachePriority) -> Option<(SegmentVictim, bool)> {
+    pub fn oldest(self, priority: CachePriority) -> Option<(ExtentVictim, bool)> {
         let priority = priority as usize;
         match (self.sealed[priority], self.current[priority]) {
-            (Some(sealed), Some(current))
-                if (current.sequence, current.segment) < (sealed.sequence, sealed.segment) =>
-            {
+            (Some(sealed), Some(current)) if (current.sequence, current.extent) < (sealed.sequence, sealed.extent) => {
                 Some((current, true))
             }
             (Some(sealed), _) => Some((sealed, false)),
@@ -114,59 +112,59 @@ impl ReclaimCandidates {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReclaimTransaction {
-    pub source: SegmentVictim,
+    pub source: ExtentVictim,
     pub target: u32,
     pub target_generation: u32,
     pub priority: CachePriority,
 }
 
-/// An immutable allocator image captured at one engine publication boundary.
+/// An immutable allocator image captured at one store publication boundary.
 ///
-/// Allocations may continue after capture. Only the generation/page cursor is installed back into
+/// Allocations may continue after capture. Only the pool-state generation/page cursor is installed back into
 /// the live allocator after this exact image reaches durable storage; reclaim persistence is
 /// serialized separately and therefore cannot race this cursor transition.
 #[derive(Debug)]
-pub struct AllocatorCheckpoint {
-    base_generation: u64,
+pub struct ExtentPoolCheckpoint {
+    base_state_generation: u64,
     base_page: u8,
-    next_generation: u64,
+    next_state_generation: u64,
     next_page: u8,
     encoded: Vec<u8>,
 }
 
 #[derive(Debug)]
-pub struct SegmentStore {
+pub struct ExtentPool {
     data: File,
     owners: File,
     state_file: File,
-    io: SegmentIoScheduler,
-    layout: SegmentLayout,
+    io: PayloadIoScheduler,
+    layout: StoreLayout,
     direct_io: bool,
     write_concurrency: usize,
     read_run_slots: usize,
     write_run_slots: usize,
     allocated_size: u64,
-    state: Mutex<AllocatorState>,
-    writes: StoreWriteCounters,
+    state: Mutex<ExtentPoolState>,
+    writes: PoolWriteCounters,
 }
 
 #[derive(Debug, Default)]
-struct StoreWriteCounters {
+struct PoolWriteCounters {
     data_runs: AtomicU64,
     data_bytes: AtomicU64,
-    owner_runs: AtomicU64,
-    owner_bytes: AtomicU64,
+    slot_owner_runs: AtomicU64,
+    slot_owner_bytes: AtomicU64,
     allocator_runs: AtomicU64,
     allocator_bytes: AtomicU64,
 }
 
-impl StoreWriteCounters {
+impl PoolWriteCounters {
     fn snapshot(&self) -> PhysicalWriteStats {
         PhysicalWriteStats {
             data_runs: self.data_runs.load(Ordering::Relaxed),
             data_bytes: self.data_bytes.load(Ordering::Relaxed),
-            owner_runs: self.owner_runs.load(Ordering::Relaxed),
-            owner_bytes: self.owner_bytes.load(Ordering::Relaxed),
+            slot_owner_runs: self.slot_owner_runs.load(Ordering::Relaxed),
+            slot_owner_bytes: self.slot_owner_bytes.load(Ordering::Relaxed),
             allocator_runs: self.allocator_runs.load(Ordering::Relaxed),
             allocator_bytes: self.allocator_bytes.load(Ordering::Relaxed),
             ..Default::default()
@@ -174,40 +172,40 @@ impl StoreWriteCounters {
     }
 }
 
-impl SegmentStore {
+impl ExtentPool {
     pub fn create(
         root: &Path,
-        layout: SegmentLayout,
+        layout: StoreLayout,
         direct_io: bool,
         write_concurrency: usize,
         io_read_priority_duration: Duration,
         read_run_size: usize,
         write_run_size: usize,
     ) -> Result<Self> {
-        fs::create_dir_all(root).map_err(|error| Error::io("create segment cache directory", error))?;
+        fs::create_dir_all(root).map_err(|error| Error::io("create extent cache directory", error))?;
         let data = open_cache_file(&root.join(DATA_FILE), true, direct_io)
-            .map_err(|error| Error::io("create segment data file", error))?;
+            .map_err(|error| Error::io("create extent data file", error))?;
         reserve_cache_file(&data, layout.data_file_size)
-            .map_err(|error| Error::io("reserve segment data file", error))?;
-        let owners = open_cache_file(&root.join(OWNER_FILE), true, false)
-            .map_err(|error| Error::io("create segment owner file", error))?;
-        reserve_cache_file(&owners, layout.owner_file_size)
-            .map_err(|error| Error::io("reserve segment owner file", error))?;
+            .map_err(|error| Error::io("reserve extent data file", error))?;
+        let owners = open_cache_file(&root.join(SLOT_OWNER_FILE), true, false)
+            .map_err(|error| Error::io("create extent owner file", error))?;
+        reserve_cache_file(&owners, layout.slot_owner_file_size)
+            .map_err(|error| Error::io("reserve extent owner file", error))?;
         let state_file = open_cache_file(&root.join(STATE_FILE), true, false)
-            .map_err(|error| Error::io("create segment state file", error))?;
+            .map_err(|error| Error::io("create extent state file", error))?;
         let state_file_size = state_file_size(layout)?;
         reserve_cache_file(&state_file, state_file_size)
-            .map_err(|error| Error::io("reserve segment state file", error))?;
+            .map_err(|error| Error::io("reserve extent state file", error))?;
 
-        let state = AllocatorState::empty(layout);
+        let state = ExtentPoolState::empty(layout);
         write_all_at(&state_file, &state.encode(layout)?, 0)
-            .map_err(|error| Error::io("write initial segment state", error))?;
+            .map_err(|error| Error::io("write initial extent state", error))?;
         state_file
             .sync_data()
-            .map_err(|error| Error::io("sync initial segment state", error))?;
+            .map_err(|error| Error::io("sync initial extent state", error))?;
         let allocated_size = layout_allocated_size(layout)?;
-        let io = SegmentIoScheduler::new(write_concurrency, io_read_priority_duration)
-            .map_err(|error| Error::io("configure segment I/O scheduler", error))?;
+        let io = PayloadIoScheduler::new(write_concurrency, io_read_priority_duration)
+            .map_err(|error| Error::io("configure extent I/O scheduler", error))?;
         Ok(Self {
             data,
             owners,
@@ -220,7 +218,7 @@ impl SegmentStore {
             write_run_slots: write_run_size.div_ceil(layout.slot_size),
             allocated_size,
             state: Mutex::new(state),
-            writes: StoreWriteCounters::default(),
+            writes: PoolWriteCounters::default(),
         })
     }
 
@@ -233,22 +231,22 @@ impl SegmentStore {
         write_run_size: usize,
     ) -> Result<Self> {
         let data = open_cache_file(&root.join(DATA_FILE), false, direct_io)
-            .map_err(|error| Error::io("open segment data file", error))?;
-        let owners = open_cache_file(&root.join(OWNER_FILE), false, false)
-            .map_err(|error| Error::io("open segment owner file", error))?;
+            .map_err(|error| Error::io("open extent data file", error))?;
+        let owners = open_cache_file(&root.join(SLOT_OWNER_FILE), false, false)
+            .map_err(|error| Error::io("open extent owner file", error))?;
         let state_file = open_cache_file(&root.join(STATE_FILE), false, false)
-            .map_err(|error| Error::io("open segment state file", error))?;
+            .map_err(|error| Error::io("open extent state file", error))?;
         let data_size = data
             .metadata()
-            .map_err(|error| Error::io("read segment data file size", error))?
+            .map_err(|error| Error::io("read extent data file size", error))?
             .len();
         let owner_size = owners
             .metadata()
-            .map_err(|error| Error::io("read segment owner file size", error))?
+            .map_err(|error| Error::io("read extent owner file size", error))?
             .len();
         let state_size = state_file
             .metadata()
-            .map_err(|error| Error::io("read segment state file size", error))?
+            .map_err(|error| Error::io("read extent state file size", error))?
             .len();
         if state_size == 0 || !state_size.is_multiple_of(2) {
             return Err(invalid_state("state file does not contain two equal copies"));
@@ -261,15 +259,15 @@ impl SegmentStore {
                 .ok()
                 .and_then(|page| page.checked_mul(state_size / 2))
                 .ok_or_else(|| invalid_state("state copy offset overflows u64"))?;
-            read_exact_at(&state_file, output, offset).map_err(|error| Error::io("read segment state copy", error))?;
+            read_exact_at(&state_file, output, offset).map_err(|error| Error::io("read extent state copy", error))?;
         }
 
         let mut candidates = Vec::new();
         for (page, input) in copies.iter().enumerate() {
-            let Some(layout) = SegmentLayout::discover(input, data_size, owner_size, state_size) else {
+            let Some(layout) = StoreLayout::discover(input, data_size, owner_size, state_size) else {
                 continue;
             };
-            let Some(state) = AllocatorState::decode(input, layout, page as u8) else {
+            let Some(state) = ExtentPoolState::decode(input, layout, page as u8) else {
                 continue;
             };
             candidates.push((layout, state));
@@ -279,21 +277,21 @@ impl SegmentStore {
         }
         let Some((layout, state)) = candidates
             .into_iter()
-            .max_by_key(|(_, state)| (state.generation, state.active_page))
+            .max_by_key(|(_, state)| (state.state_generation, state.active_page))
         else {
             return Err(invalid_state("both allocator state copies are invalid"));
         };
         ensure_cache_file_reserved(&data, layout.data_file_size)
-            .map_err(|error| Error::io("verify segment data reservation", error))?;
-        ensure_cache_file_reserved(&owners, layout.owner_file_size)
-            .map_err(|error| Error::io("verify segment owner reservation", error))?;
+            .map_err(|error| Error::io("verify extent data reservation", error))?;
+        ensure_cache_file_reserved(&owners, layout.slot_owner_file_size)
+            .map_err(|error| Error::io("verify extent owner reservation", error))?;
         ensure_cache_file_reserved(&state_file, state_file_size(layout)?)
-            .map_err(|error| Error::io("verify segment state reservation", error))?;
+            .map_err(|error| Error::io("verify extent state reservation", error))?;
         let allocated_size = layout_allocated_size(layout)?;
-        let io = SegmentIoScheduler::new(write_concurrency, io_read_priority_duration)
-            .map_err(|error| Error::io("configure segment I/O scheduler", error))?;
+        let io = PayloadIoScheduler::new(write_concurrency, io_read_priority_duration)
+            .map_err(|error| Error::io("configure extent I/O scheduler", error))?;
 
-        let store = Self {
+        let pool = Self {
             data,
             owners,
             state_file,
@@ -305,13 +303,13 @@ impl SegmentStore {
             write_run_slots: write_run_size.div_ceil(layout.slot_size),
             allocated_size,
             state: Mutex::new(state),
-            writes: StoreWriteCounters::default(),
+            writes: PoolWriteCounters::default(),
         };
-        store.recover_current_tails()?;
-        Ok(store)
+        pool.recover_current_tails()?;
+        Ok(pool)
     }
 
-    pub const fn layout(&self) -> SegmentLayout {
+    pub const fn layout(&self) -> StoreLayout {
         self.layout
     }
 
@@ -327,174 +325,168 @@ impl SegmentStore {
         self.io.stats()
     }
 
-    pub fn allocate(&self, priority: CachePriority, slots: u32) -> Result<SegmentAllocationResult> {
-        if slots == 0 || slots > self.layout.slots_per_segment {
-            return Err(invalid_state(
-                "segment allocation must fit completely within one segment",
-            ));
+    pub fn allocate(&self, priority: CachePriority, slots: u32) -> Result<AllocationResult> {
+        if slots == 0 || slots > self.layout.slots_per_extent {
+            return Err(invalid_state("extent allocation must fit completely within one extent"));
         }
         let priority_index = usize::from(priority.to_byte());
         let mut state = mutex_lock(&self.state);
         loop {
-            if let Some(segment) = state.current[priority_index] {
-                let segment_index = segment as usize;
+            if let Some(extent) = state.current[priority_index] {
+                let entry_index = extent as usize;
                 let remaining = self
                     .layout
-                    .slots_per_segment
-                    .saturating_sub(state.segments[segment_index].used);
+                    .slots_per_extent
+                    .saturating_sub(state.extents[entry_index].used);
                 if remaining >= slots {
-                    let slot = state.segments[segment_index].used;
-                    let segment_generation = state.segments[segment_index].generation;
-                    state.segments[segment_index].used += slots;
+                    let extent_slot = state.extents[entry_index].used;
+                    let extent_generation = state.extents[entry_index].generation;
+                    state.extents[entry_index].used += slots;
                     let sequence = state.next_sequence;
                     state.next_sequence = state
                         .next_sequence
                         .checked_add(1)
-                        .ok_or_else(|| invalid_state("segment allocation sequence is exhausted"))?;
-                    let physical_slot = self
+                        .ok_or_else(|| invalid_state("extent allocation sequence is exhausted"))?;
+                    let first_slot = self
                         .layout
-                        .physical_slot(segment, slot)
-                        .expect("current segment slot must be in the layout");
-                    return Ok(SegmentAllocationResult::Allocated(SegmentAllocation {
-                        physical_slot,
-                        segment,
-                        slot,
-                        slots,
-                        segment_generation,
+                        .slot_index(extent, extent_slot)
+                        .expect("current extent slot must be in the layout");
+                    return Ok(AllocationResult::Allocated(EntryAllocation {
+                        first_slot,
+                        extent,
+                        extent_slot,
+                        slot_count: slots,
+                        extent_generation,
                         priority,
                         sequence,
                     }));
                 }
-                state.segments[segment_index].role = SegmentRole::Sealed;
+                state.extents[entry_index].role = ExtentRole::Sealed;
                 state.current[priority_index] = None;
                 continue;
             }
 
-            let Some(segment) = state
-                .segments
-                .iter()
-                .position(|segment| segment.role == SegmentRole::Free)
-            else {
-                return Ok(SegmentAllocationResult::ReclaimRequired);
+            let Some(extent) = state.extents.iter().position(|extent| extent.role == ExtentRole::Free) else {
+                return Ok(AllocationResult::ReclaimRequired);
             };
-            let segment = u32::try_from(segment).map_err(|_| invalid_state("free segment index does not fit u32"))?;
+            let extent = u32::try_from(extent).map_err(|_| invalid_state("free extent index does not fit u32"))?;
             let sequence = state.next_sequence;
-            let segment_state = &mut state.segments[segment as usize];
-            segment_state.used = 0;
-            segment_state.sequence = sequence;
-            segment_state.priority = priority;
-            segment_state.role = SegmentRole::Current;
-            state.current[priority_index] = Some(segment);
+            let extent_state = &mut state.extents[extent as usize];
+            extent_state.used = 0;
+            extent_state.sequence = sequence;
+            extent_state.priority = priority;
+            extent_state.role = ExtentRole::Current;
+            state.current[priority_index] = Some(extent);
 
             // Normal allocator transitions are folded into the next coordinated checkpoint.
-            // SegmentEngine persists this state after payload sync and before index publication.
+            // ExtentStore persists this state after payload sync and before index publication.
         }
     }
 
-    pub fn write_batch(&self, writes: &[SegmentWrite<'_>]) -> Result<SegmentWriteResult> {
+    pub fn write_batch(&self, writes: &[EntryWrite<'_>]) -> Result<EntryWriteResult> {
         if writes.is_empty() {
-            return Ok(SegmentWriteResult::default());
+            return Ok(EntryWriteResult::default());
         }
         for write in writes {
             if write.value.is_empty() {
                 return Err(Error::EmptyValue);
             }
             let stored_len = write.stored_len();
-            if stored_len > self.layout.segment_size {
-                return Err(Error::ValueTooLarge {
+            if stored_len > self.layout.extent_size {
+                return Err(Error::StoredEntryTooLarge {
                     len: stored_len,
-                    maximum: self.layout.segment_size,
+                    maximum: self.layout.extent_size,
                 });
             }
             let slots = stored_len.div_ceil(self.layout.slot_size);
-            if usize::try_from(write.allocation.slots).ok() != Some(slots) {
-                return Err(invalid_state("segment allocation does not match the value length"));
+            if usize::try_from(write.allocation.slot_count).ok() != Some(slots) {
+                return Err(invalid_state("extent allocation does not match the value length"));
             }
         }
 
         let mut order = (0..writes.len()).collect::<Vec<_>>();
-        order.sort_unstable_by_key(|index| writes[*index].allocation.physical_slot);
+        order.sort_unstable_by_key(|index| writes[*index].allocation.first_slot);
         for pair in order.windows(2) {
             let previous = writes[pair[0]].allocation;
             let previous_end = previous
-                .physical_slot
-                .checked_add(u64::from(previous.slots))
-                .ok_or_else(|| invalid_state("segment allocation end overflows u64"))?;
-            if previous_end > writes[pair[1]].allocation.physical_slot {
-                return Err(invalid_state("segment batch allocations overlap"));
+                .first_slot
+                .checked_add(u64::from(previous.slot_count))
+                .ok_or_else(|| invalid_state("extent allocation end overflows u64"))?;
+            if previous_end > writes[pair[1]].allocation.first_slot {
+                return Err(invalid_state("extent batch allocations overlap"));
             }
         }
-        let owner_runs = segment_write_runs(&order, writes, usize::MAX);
-        let data_runs = segment_write_runs(&order, writes, self.write_run_slots);
+        let slot_owner_runs = data_write_runs(&order, writes, usize::MAX);
+        let data_runs = data_write_runs(&order, writes, self.write_run_slots);
         self.write_data_runs(writes, &data_runs)?;
-        self.write_owner_runs(writes, &owner_runs)?;
+        self.write_slot_owner_runs(writes, &slot_owner_runs)?;
 
         let mut locations = vec![None; writes.len()];
         for (index, write) in writes.iter().enumerate() {
-            locations[index] = Some(SegmentLocation {
-                physical_slot: write.allocation.physical_slot,
-                segment_generation: write.allocation.segment_generation,
-                stored_len: u32::try_from(write.stored_len()).expect("validated stored blob length must fit u32"),
+            locations[index] = Some(EntryLocation {
+                first_slot: write.allocation.first_slot,
+                extent_generation: write.allocation.extent_generation,
+                stored_len: u32::try_from(write.stored_len()).expect("validated stored entry length must fit u32"),
                 checksum: write.checksum,
                 priority: write.allocation.priority,
             });
         }
         let allocated_slots = writes.iter().fold(0usize, |slots, write| {
-            slots.saturating_add(write.allocation.slots as usize)
+            slots.saturating_add(write.allocation.slot_count as usize)
         });
-        Ok(SegmentWriteResult {
+        Ok(EntryWriteResult {
             locations: locations
                 .into_iter()
                 .map(|location| location.expect("every write must have a location"))
                 .collect(),
             data_runs: data_runs.len(),
-            owner_runs: owner_runs.len(),
+            slot_owner_runs: slot_owner_runs.len(),
             data_bytes: allocated_slots.saturating_mul(self.layout.slot_size),
-            owner_bytes: allocated_slots.saturating_mul(OWNER_RECORD_SIZE),
+            slot_owner_bytes: allocated_slots.saturating_mul(SLOT_OWNER_SIZE),
         })
     }
 
-    fn location_slots(&self, location: SegmentLocation) -> Option<(u32, u32, u32)> {
+    fn location_slots(&self, location: EntryLocation) -> Option<(u32, u32, u32)> {
         let len = location.stored_len as usize;
-        if len == 0 || len > self.layout.segment_size {
+        if len == 0 || len > self.layout.extent_size {
             return None;
         }
         let slots = u32::try_from(len.div_ceil(self.layout.slot_size)).ok()?;
-        let (segment, slot) = self.layout.segment_for_slot(location.physical_slot)?;
-        (slot.checked_add(slots)? <= self.layout.slots_per_segment).then_some((segment, slot, slots))
+        let (extent, extent_slot) = self.layout.locate_slot(location.first_slot)?;
+        (extent_slot.checked_add(slots)? <= self.layout.slots_per_extent).then_some((extent, extent_slot, slots))
     }
 
-    pub fn get_blob(&self, key: &BlobKey, location: SegmentLocation) -> Result<SegmentBlobReadResult> {
-        let mut result = self.read_stored_blob(location)?;
-        result.value = result.value.and_then(|stored| decode_blob(stored, key));
+    pub fn read_entry(&self, key: &EntryKey, location: EntryLocation) -> Result<StoredEntryRead> {
+        let mut result = self.read_encoded_entry(location)?;
+        result.value = result.value.and_then(|stored| decode_entry_value(stored, key));
         Ok(result)
     }
 
-    pub fn get_stored_blob(&self, location: SegmentLocation) -> Result<Option<(BlobKey, Vec<u8>)>> {
-        let result = self.read_stored_blob(location)?;
-        Ok(result.value.and_then(decode_stored_blob))
+    pub fn read_stored_entry(&self, location: EntryLocation) -> Result<Option<(EntryKey, Vec<u8>)>> {
+        let result = self.read_encoded_entry(location)?;
+        Ok(result.value.and_then(decode_stored_entry))
     }
 
-    fn read_stored_blob(&self, location: SegmentLocation) -> Result<SegmentBlobReadResult> {
-        self.read_stored_blob_after_validation(location, || Ok(()))
+    fn read_encoded_entry(&self, location: EntryLocation) -> Result<StoredEntryRead> {
+        self.read_encoded_entry_after_validation(location, || Ok(()))
     }
 
-    fn read_stored_blob_after_validation<F>(
+    fn read_encoded_entry_after_validation<F>(
         &self,
-        location: SegmentLocation,
+        location: EntryLocation,
         after_validation: F,
-    ) -> Result<SegmentBlobReadResult>
+    ) -> Result<StoredEntryRead>
     where
         F: FnOnce() -> Result<()>,
     {
-        let mut result = SegmentBlobReadResult::default();
-        let Some((segment, slot, slots)) = self.location_slots(location) else {
+        let mut result = StoredEntryRead::default();
+        let Some((extent, slot, slots)) = self.location_slots(location) else {
             return Ok(result);
         };
         {
             let state = mutex_lock(&self.state);
-            let state = state.segments[segment as usize];
-            if state.generation != location.segment_generation || state.used < slot.saturating_add(slots) {
+            let state = state.extents[extent as usize];
+            if state.generation != location.extent_generation || state.used < slot.saturating_add(slots) {
                 return Ok(result);
             }
         }
@@ -508,24 +500,24 @@ impl SegmentStore {
                 let remaining = location.stored_len as usize - value.len();
                 let logical_len = remaining.min(run_slots * self.layout.slot_size);
                 let physical_slot = location
-                    .physical_slot
+                    .first_slot
                     .checked_add(slot_offset as u64)
-                    .ok_or_else(|| invalid_state("segment blob slot overflows u64"))?;
+                    .ok_or_else(|| invalid_state("stored entry slot overflows u64"))?;
                 let file_offset = physical_slot
                     .checked_mul(self.layout.slot_size as u64)
-                    .ok_or_else(|| invalid_state("segment blob offset overflows u64"))?;
+                    .ok_or_else(|| invalid_state("stored entry offset overflows u64"))?;
                 if self.direct_io {
                     let physical_len = run_slots * self.layout.slot_size;
                     let mut input = AlignedBuffer::new(physical_len);
                     read_exact_at(&self.data, input.as_mut_slice(), file_offset)
-                        .map_err(|error| Error::io("read segment blob", error))?;
+                        .map_err(|error| Error::io("read stored entry", error))?;
                     value.extend_from_slice(&input.as_slice()[..logical_len]);
                     result.data_bytes = result.data_bytes.saturating_add(physical_len);
                 } else {
                     let start = value.len();
                     value.resize(start + logical_len, 0);
                     read_exact_at(&self.data, &mut value[start..], file_offset)
-                        .map_err(|error| Error::io("read segment blob", error))?;
+                        .map_err(|error| Error::io("read stored entry", error))?;
                     result.data_bytes = result.data_bytes.saturating_add(logical_len);
                 }
                 result.data_runs = result.data_runs.saturating_add(1);
@@ -536,7 +528,7 @@ impl SegmentStore {
         })?;
         let generation_matches = {
             let state = mutex_lock(&self.state);
-            state.segments[segment as usize].generation == location.segment_generation
+            state.extents[extent as usize].generation == location.extent_generation
         };
         if value_checksum(&value) != location.checksum || !generation_matches {
             return Ok(result);
@@ -548,108 +540,108 @@ impl SegmentStore {
     pub fn reclaim_candidates(&self) -> ReclaimCandidates {
         let state = mutex_lock(&self.state);
         let mut candidates = ReclaimCandidates::default();
-        for (index, segment) in state.segments.iter().enumerate() {
-            let priority = segment.priority as usize;
+        for (index, extent) in state.extents.iter().enumerate() {
+            let priority = extent.priority as usize;
             if matches!(
-                segment.role,
-                SegmentRole::Current | SegmentRole::Sealed | SegmentRole::ReclaimSource
+                extent.role,
+                ExtentRole::Current | ExtentRole::Sealed | ExtentRole::ReclaimSource
             ) {
-                candidates.occupied_segments[priority] = candidates.occupied_segments[priority].saturating_add(1);
+                candidates.occupied_extents[priority] = candidates.occupied_extents[priority].saturating_add(1);
             }
-            let target = match segment.role {
-                SegmentRole::Current => &mut candidates.current[priority],
-                SegmentRole::Sealed => &mut candidates.sealed[priority],
+            let target = match extent.role {
+                ExtentRole::Current => &mut candidates.current[priority],
+                ExtentRole::Sealed => &mut candidates.sealed[priority],
                 _ => continue,
             };
-            let victim = SegmentVictim {
-                segment: u32::try_from(index).expect("segment index must fit u32"),
-                generation: segment.generation,
-                used: segment.used,
-                priority: segment.priority,
-                sequence: segment.sequence,
+            let victim = ExtentVictim {
+                extent: u32::try_from(index).expect("extent index must fit u32"),
+                generation: extent.generation,
+                used: extent.used,
+                priority: extent.priority,
+                sequence: extent.sequence,
             };
-            if target.is_none_or(|current| (victim.sequence, victim.segment) < (current.sequence, current.segment)) {
+            if target.is_none_or(|current| (victim.sequence, victim.extent) < (current.sequence, current.extent)) {
                 *target = Some(victim);
             }
         }
         candidates
     }
 
-    pub fn priority_occupancy(&self, capacity_floor_segments: [u32; 3]) -> PriorityOccupancy {
+    pub fn extent_occupancy(&self, capacity_floor_extents: [u32; 3]) -> ExtentOccupancy {
         let state = mutex_lock(&self.state);
-        let mut occupied_segments = [0u32; 3];
+        let mut occupied_extents = [0u32; 3];
         let mut used_slots = [0u64; 3];
-        for segment in &state.segments {
+        for extent in &state.extents {
             if !matches!(
-                segment.role,
-                SegmentRole::Current | SegmentRole::Sealed | SegmentRole::ReclaimSource
+                extent.role,
+                ExtentRole::Current | ExtentRole::Sealed | ExtentRole::ReclaimSource
             ) {
                 continue;
             }
-            let priority = segment.priority as usize;
-            occupied_segments[priority] = occupied_segments[priority].saturating_add(1);
-            used_slots[priority] = used_slots[priority].saturating_add(u64::from(segment.used));
+            let priority = extent.priority as usize;
+            occupied_extents[priority] = occupied_extents[priority].saturating_add(1);
+            used_slots[priority] = used_slots[priority].saturating_add(u64::from(extent.used));
         }
-        PriorityOccupancy::new(
-            self.layout.segment_count.saturating_sub(1),
-            self.layout.slots_per_segment,
+        ExtentOccupancy::new(
+            self.layout.extent_count.saturating_sub(1),
+            self.layout.slots_per_extent,
             self.layout.slot_size,
-            occupied_segments,
+            occupied_extents,
             used_slots,
-            capacity_floor_segments,
+            capacity_floor_extents,
         )
     }
 
-    pub fn seal_current(&self, victim: SegmentVictim) -> Result<SegmentVictim> {
+    pub fn seal_current(&self, victim: ExtentVictim) -> Result<ExtentVictim> {
         let mut state = mutex_lock(&self.state);
-        let segment = state
-            .segments
-            .get(victim.segment as usize)
+        let extent = state
+            .extents
+            .get(victim.extent as usize)
             .copied()
             .ok_or_else(|| invalid_state("current reclaim victim is out of range"))?;
         let priority = usize::from(victim.priority.to_byte());
-        if segment.role != SegmentRole::Current
-            || segment.generation != victim.generation
-            || segment.used != victim.used
-            || segment.priority != victim.priority
-            || segment.sequence != victim.sequence
-            || state.current[priority] != Some(victim.segment)
+        if extent.role != ExtentRole::Current
+            || extent.generation != victim.generation
+            || extent.used != victim.used
+            || extent.priority != victim.priority
+            || extent.sequence != victim.sequence
+            || state.current[priority] != Some(victim.extent)
         {
             return Err(invalid_state("current reclaim victim changed before seal"));
         }
-        state.segments[victim.segment as usize].role = SegmentRole::Sealed;
+        state.extents[victim.extent as usize].role = ExtentRole::Sealed;
         state.current[priority] = None;
         Ok(victim)
     }
 
-    pub fn begin_reclaim(&self, victim: SegmentVictim) -> Result<ReclaimTransaction> {
+    pub fn begin_reclaim(&self, victim: ExtentVictim) -> Result<ReclaimTransaction> {
         let mut state = mutex_lock(&self.state);
         let source = state
-            .segments
-            .get(victim.segment as usize)
+            .extents
+            .get(victim.extent as usize)
             .copied()
             .ok_or_else(|| invalid_state("reclaim source is out of range"))?;
-        if source.role != SegmentRole::Sealed
+        if source.role != ExtentRole::Sealed
             || source.generation != victim.generation
             || source.used != victim.used
             || source.priority != victim.priority
             || state.current[usize::from(victim.priority.to_byte())].is_some()
         {
-            return Err(invalid_state("reclaim source is not a stable sealed segment"));
+            return Err(invalid_state("reclaim source is not a stable sealed extent"));
         }
         let target = state.reserve;
-        let target_state = state.segments[target as usize];
-        if target_state.role != SegmentRole::Reserve || target == victim.segment {
+        let target_state = state.extents[target as usize];
+        if target_state.role != ExtentRole::Reserve || target == victim.extent {
             return Err(invalid_state("reclaim target reserve is invalid"));
         }
 
-        state.segments[victim.segment as usize].role = SegmentRole::ReclaimSource;
+        state.extents[victim.extent as usize].role = ExtentRole::ReclaimSource;
         let sequence = state.next_sequence;
-        let target_state = &mut state.segments[target as usize];
+        let target_state = &mut state.extents[target as usize];
         target_state.used = 0;
         target_state.sequence = sequence;
         target_state.priority = victim.priority;
-        target_state.role = SegmentRole::ReclaimTarget;
+        target_state.role = ExtentRole::ReclaimTarget;
         let target_generation = target_state.generation;
         self.persist_state_locked(&mut state)?;
         Ok(ReclaimTransaction {
@@ -663,18 +655,18 @@ impl SegmentStore {
     pub fn pending_reclaim(&self) -> Option<ReclaimTransaction> {
         let state = mutex_lock(&self.state);
         let (source, source_state) = state
-            .segments
+            .extents
             .iter()
             .enumerate()
-            .find(|(_, segment)| segment.role == SegmentRole::ReclaimSource)?;
+            .find(|(_, extent)| extent.role == ExtentRole::ReclaimSource)?;
         let (target, target_state) = state
-            .segments
+            .extents
             .iter()
             .enumerate()
-            .find(|(_, segment)| segment.role == SegmentRole::ReclaimTarget)?;
+            .find(|(_, extent)| extent.role == ExtentRole::ReclaimTarget)?;
         Some(ReclaimTransaction {
-            source: SegmentVictim {
-                segment: u32::try_from(source).ok()?,
+            source: ExtentVictim {
+                extent: u32::try_from(source).ok()?,
                 generation: source_state.generation,
                 used: source_state.used,
                 priority: source_state.priority,
@@ -690,39 +682,39 @@ impl SegmentStore {
         &self,
         transaction: ReclaimTransaction,
         slots: u32,
-    ) -> Result<Option<SegmentAllocation>> {
-        if slots == 0 || slots > self.layout.slots_per_segment {
+    ) -> Result<Option<EntryAllocation>> {
+        if slots == 0 || slots > self.layout.slots_per_extent {
             return Err(invalid_state(
-                "reclaim allocation must fit completely within one segment",
+                "reclaim allocation must fit completely within one extent",
             ));
         }
         let mut state = mutex_lock(&self.state);
-        let target = &mut state.segments[transaction.target as usize];
-        if target.role != SegmentRole::ReclaimTarget
+        let target = &mut state.extents[transaction.target as usize];
+        if target.role != ExtentRole::ReclaimTarget
             || target.generation != transaction.target_generation
             || target.priority != transaction.priority
         {
             return Err(invalid_state("reclaim target changed during compaction"));
         }
-        if self.layout.slots_per_segment.saturating_sub(target.used) < slots {
+        if self.layout.slots_per_extent.saturating_sub(target.used) < slots {
             return Ok(None);
         }
-        let slot = target.used;
+        let extent_slot = target.used;
         target.used += slots;
         let sequence = state.next_sequence;
         state.next_sequence = state
             .next_sequence
             .checked_add(1)
-            .ok_or_else(|| invalid_state("segment allocation sequence is exhausted"))?;
-        Ok(Some(SegmentAllocation {
-            physical_slot: self
+            .ok_or_else(|| invalid_state("extent allocation sequence is exhausted"))?;
+        Ok(Some(EntryAllocation {
+            first_slot: self
                 .layout
-                .physical_slot(transaction.target, slot)
+                .slot_index(transaction.target, extent_slot)
                 .expect("reclaim target slot must be in the layout"),
-            segment: transaction.target,
-            slot,
-            slots,
-            segment_generation: transaction.target_generation,
+            extent: transaction.target,
+            extent_slot,
+            slot_count: slots,
+            extent_generation: transaction.target_generation,
             priority: transaction.priority,
             sequence,
         }))
@@ -730,80 +722,79 @@ impl SegmentStore {
 
     pub fn finish_reclaim(&self, transaction: ReclaimTransaction) -> Result<()> {
         let mut state = mutex_lock(&self.state);
-        let source = state.segments[transaction.source.segment as usize];
-        let target = state.segments[transaction.target as usize];
-        if source.role != SegmentRole::ReclaimSource
+        let source = state.extents[transaction.source.extent as usize];
+        let target = state.extents[transaction.target as usize];
+        if source.role != ExtentRole::ReclaimSource
             || source.generation != transaction.source.generation
-            || target.role != SegmentRole::ReclaimTarget
+            || target.role != ExtentRole::ReclaimTarget
             || target.generation != transaction.target_generation
             || target.priority != transaction.priority
         {
             return Err(invalid_state("reclaim transaction changed before commit"));
         }
 
-        let source = &mut state.segments[transaction.source.segment as usize];
+        let source = &mut state.extents[transaction.source.extent as usize];
         source.generation = source
             .generation
             .checked_add(1)
-            .ok_or_else(|| invalid_state("segment generation is exhausted"))?;
+            .ok_or_else(|| invalid_state("extent generation is exhausted"))?;
         source.used = 0;
         source.sequence = 0;
         source.priority = CachePriority::Low;
-        source.role = SegmentRole::Reserve;
-        state.reserve = transaction.source.segment;
+        source.role = ExtentRole::Reserve;
+        state.reserve = transaction.source.extent;
 
-        let target = &mut state.segments[transaction.target as usize];
-        if target.used < self.layout.slots_per_segment {
-            target.role = SegmentRole::Current;
+        let target = &mut state.extents[transaction.target as usize];
+        if target.used < self.layout.slots_per_extent {
+            target.role = ExtentRole::Current;
             state.current[usize::from(transaction.priority.to_byte())] = Some(transaction.target);
         } else {
-            target.role = SegmentRole::Sealed;
+            target.role = ExtentRole::Sealed;
         }
         self.persist_state_locked(&mut state)
     }
 
-    pub fn owners(&self, victim: SegmentVictim) -> Result<Vec<(u64, OwnerRecord)>> {
+    pub fn slot_owners(&self, victim: ExtentVictim) -> Result<Vec<(u64, SlotOwner)>> {
         let mut owners = Vec::new();
         for slot in 0..victim.used {
             let physical_slot = self
                 .layout
-                .physical_slot(victim.segment, slot)
+                .slot_index(victim.extent, slot)
                 .expect("victim slot must be in the layout");
-            let Some(owner) = self.read_owner(physical_slot)? else {
+            let Some(owner) = self.read_slot_owner(physical_slot)? else {
                 continue;
             };
-            if owner.segment_generation == victim.generation {
+            if owner.extent_generation == victim.generation {
                 owners.push((physical_slot, owner));
             }
         }
         Ok(owners)
     }
 
-    pub fn release(&self, victim: SegmentVictim) -> Result<()> {
+    pub fn release(&self, victim: ExtentVictim) -> Result<()> {
         let mut state = mutex_lock(&self.state);
-        let segment = &mut state.segments[victim.segment as usize];
-        if segment.role != SegmentRole::Sealed || segment.generation != victim.generation || segment.used != victim.used
-        {
-            return Err(invalid_state("segment victim changed during reclamation"));
+        let extent = &mut state.extents[victim.extent as usize];
+        if extent.role != ExtentRole::Sealed || extent.generation != victim.generation || extent.used != victim.used {
+            return Err(invalid_state("extent victim changed during reclamation"));
         }
-        segment.generation = segment
+        extent.generation = extent
             .generation
             .checked_add(1)
-            .ok_or_else(|| invalid_state("segment generation is exhausted"))?;
-        segment.used = 0;
-        segment.sequence = 0;
-        segment.priority = CachePriority::Low;
-        segment.role = SegmentRole::Free;
+            .ok_or_else(|| invalid_state("extent generation is exhausted"))?;
+        extent.used = 0;
+        extent.sequence = 0;
+        extent.priority = CachePriority::Low;
+        extent.role = ExtentRole::Free;
         self.persist_state_locked(&mut state)
     }
 
     pub fn sync_payload(&self) -> Result<()> {
         self.io
             .write(|| self.data.sync_data())
-            .map_err(|error| Error::io("sync segment data", error))?;
+            .map_err(|error| Error::io("sync extent data", error))?;
         self.io
             .write(|| self.owners.sync_data())
-            .map_err(|error| Error::io("sync segment owners", error))
+            .map_err(|error| Error::io("sync extent owners", error))
     }
 
     pub fn checkpoint_state(&self) -> Result<()> {
@@ -811,26 +802,26 @@ impl SegmentStore {
         self.persist_checkpoint_state(&checkpoint)
     }
 
-    pub fn prepare_checkpoint_state(&self) -> Result<AllocatorCheckpoint> {
+    pub fn prepare_checkpoint_state(&self) -> Result<ExtentPoolCheckpoint> {
         let state = mutex_lock(&self.state);
-        let next_generation = state
-            .generation
+        let next_state_generation = state
+            .state_generation
             .checked_add(1)
             .ok_or_else(|| invalid_state("allocator state generation is exhausted"))?;
         let next_page = 1 - state.active_page;
         let mut snapshot = state.clone();
-        snapshot.generation = next_generation;
+        snapshot.state_generation = next_state_generation;
         snapshot.active_page = next_page;
-        Ok(AllocatorCheckpoint {
-            base_generation: state.generation,
+        Ok(ExtentPoolCheckpoint {
+            base_state_generation: state.state_generation,
             base_page: state.active_page,
-            next_generation,
+            next_state_generation,
             next_page,
             encoded: snapshot.encode(self.layout)?,
         })
     }
 
-    pub fn persist_checkpoint_state(&self, checkpoint: &AllocatorCheckpoint) -> Result<()> {
+    pub fn persist_checkpoint_state(&self, checkpoint: &ExtentPoolCheckpoint) -> Result<()> {
         let offset = u64::from(checkpoint.next_page)
             .checked_mul(self.layout.state_copy_size as u64)
             .ok_or_else(|| invalid_state("allocator state offset overflows u64"))?;
@@ -845,18 +836,18 @@ impl SegmentStore {
             .map_err(|error| Error::io("sync allocator state", error))?;
 
         let mut state = mutex_lock(&self.state);
-        if state.generation != checkpoint.base_generation || state.active_page != checkpoint.base_page {
+        if state.state_generation != checkpoint.base_state_generation || state.active_page != checkpoint.base_page {
             return Err(invalid_state(
                 "allocator checkpoint cursor changed while persistence was in flight",
             ));
         }
-        state.generation = checkpoint.next_generation;
+        state.state_generation = checkpoint.next_state_generation;
         state.active_page = checkpoint.next_page;
         Ok(())
     }
 
     #[cfg(test)]
-    fn state_snapshot(&self) -> AllocatorState {
+    fn state_snapshot(&self) -> ExtentPoolState {
         mutex_lock(&self.state).clone()
     }
 
@@ -867,65 +858,65 @@ impl SegmentStore {
             .current
             .iter()
             .enumerate()
-            .filter_map(|(priority, segment)| {
-                segment.map(|segment| {
+            .filter_map(|(priority, extent)| {
+                extent.map(|extent| {
                     (
-                        segment,
+                        extent,
                         CachePriority::from_byte(priority as u8).expect("current priority index must be valid"),
                     )
                 })
             })
             .collect::<Vec<_>>();
-        if let Some((target, segment)) = state
-            .segments
+        if let Some((target, extent)) = state
+            .extents
             .iter()
             .enumerate()
-            .find(|(_, segment)| segment.role == SegmentRole::ReclaimTarget)
+            .find(|(_, extent)| extent.role == ExtentRole::ReclaimTarget)
         {
             tails.push((
-                u32::try_from(target).expect("segment index must fit u32"),
-                segment.priority,
+                u32::try_from(target).expect("extent index must fit u32"),
+                extent.priority,
             ));
         }
-        for (segment, priority) in tails {
-            let segment_index = segment as usize;
-            let generation = state.segments[segment_index].generation;
-            let start = state.segments[segment_index].used;
+        for (extent, priority) in tails {
+            let entry_index = extent as usize;
+            let generation = state.extents[entry_index].generation;
+            let start = state.extents[entry_index].used;
             let mut recovered_used = start;
-            for slot in start..self.layout.slots_per_segment {
+            for slot in start..self.layout.slots_per_extent {
                 let physical_slot = self
                     .layout
-                    .physical_slot(segment, slot)
-                    .expect("current segment slot must be in the layout");
-                let Some(owner) = self.read_owner(physical_slot)? else {
+                    .slot_index(extent, slot)
+                    .expect("current extent slot must be in the layout");
+                let Some(owner) = self.read_slot_owner(physical_slot)? else {
                     break;
                 };
-                if owner.segment_generation != generation
+                if owner.extent_generation != generation
                     || owner.priority != priority
                     || owner.stored_len == 0
-                    || owner.stored_len as usize > self.layout.segment_size
+                    || owner.stored_len as usize > self.layout.extent_size
                 {
                     break;
                 }
                 recovered_used = slot + 1;
                 next_sequence = next_sequence.max(owner.sequence.saturating_add(1));
             }
-            state.segments[segment_index].used = recovered_used;
+            state.extents[entry_index].used = recovered_used;
         }
         state.next_sequence = next_sequence;
         Ok(())
     }
 
-    fn read_owner(&self, physical_slot: u64) -> Result<Option<OwnerRecord>> {
+    fn read_slot_owner(&self, physical_slot: u64) -> Result<Option<SlotOwner>> {
         let offset = physical_slot
-            .checked_mul(OWNER_RECORD_SIZE as u64)
-            .ok_or_else(|| invalid_state("segment owner offset overflows u64"))?;
-        let mut input = [0; OWNER_RECORD_SIZE];
-        read_exact_at(&self.owners, &mut input, offset).map_err(|error| Error::io("read segment owner", error))?;
-        Ok(OwnerRecord::decode(&input))
+            .checked_mul(SLOT_OWNER_SIZE as u64)
+            .ok_or_else(|| invalid_state("extent owner offset overflows u64"))?;
+        let mut input = [0; SLOT_OWNER_SIZE];
+        read_exact_at(&self.owners, &mut input, offset).map_err(|error| Error::io("read extent owner", error))?;
+        Ok(SlotOwner::decode(&input))
     }
 
-    fn write_data_runs(&self, writes: &[SegmentWrite<'_>], runs: &[SegmentWriteRun]) -> Result<()> {
+    fn write_data_runs(&self, writes: &[EntryWrite<'_>], runs: &[DataWriteRun]) -> Result<()> {
         let next = AtomicUsize::new(0);
         let concurrency = self.write_concurrency.min(runs.len());
         std::thread::scope(|scope| {
@@ -940,64 +931,64 @@ impl SegmentStore {
                         let len = run
                             .slots
                             .checked_mul(self.layout.slot_size)
-                            .ok_or_else(|| invalid_state("segment data batch size overflows usize"))?;
+                            .ok_or_else(|| invalid_state("extent data batch size overflows usize"))?;
                         let mut output = AlignedBuffer::new(len);
                         for piece in &run.pieces {
                             let write = writes[piece.index];
                             let input_start = piece
                                 .write_slot
                                 .checked_mul(self.layout.slot_size)
-                                .ok_or_else(|| invalid_state("segment write input overflows"))?;
+                                .ok_or_else(|| invalid_state("extent write input overflows"))?;
                             let input_end = piece
                                 .write_slot
                                 .saturating_add(piece.slots)
                                 .checked_mul(self.layout.slot_size)
                                 .map(|end| end.min(write.stored_len()))
-                                .ok_or_else(|| invalid_state("segment write input overflows"))?;
+                                .ok_or_else(|| invalid_state("extent write input overflows"))?;
                             let output_start = piece
                                 .run_slot
                                 .checked_mul(self.layout.slot_size)
-                                .ok_or_else(|| invalid_state("segment write output overflows"))?;
+                                .ok_or_else(|| invalid_state("extent write output overflows"))?;
                             let output_end = output_start
                                 .checked_add(input_end.saturating_sub(input_start))
-                                .ok_or_else(|| invalid_state("segment write output overflows"))?;
-                            if !copy_blob_range(
+                                .ok_or_else(|| invalid_state("extent write output overflows"))?;
+                            if !copy_stored_entry_range(
                                 write.key,
                                 write.value,
                                 input_start,
                                 &mut output.as_mut_slice()[output_start..output_end],
                             ) {
-                                return Err(invalid_state("segment stored blob slice is invalid"));
+                                return Err(invalid_state("extent stored entry slice is invalid"));
                             }
                         }
                         let offset = run
                             .first_slot
                             .checked_mul(self.layout.slot_size as u64)
-                            .ok_or_else(|| invalid_state("segment data offset overflows u64"))?;
+                            .ok_or_else(|| invalid_state("extent data offset overflows u64"))?;
                         self.io
                             .write(|| write_all_at(&self.data, output.as_slice(), offset))
-                            .map_err(|error| Error::io("write segment data batch", error))?;
+                            .map_err(|error| Error::io("write extent data batch", error))?;
                         self.writes.data_runs.fetch_add(1, Ordering::Relaxed);
                         self.writes.data_bytes.fetch_add(len as u64, Ordering::Relaxed);
                     }
                 }));
             }
             for worker in workers {
-                worker.join().expect("segment data writer must not panic")?;
+                worker.join().expect("extent data writer must not panic")?;
             }
             Ok(())
         })
     }
 
-    fn write_owner_runs(&self, writes: &[SegmentWrite<'_>], runs: &[SegmentWriteRun]) -> Result<()> {
+    fn write_slot_owner_runs(&self, writes: &[EntryWrite<'_>], runs: &[DataWriteRun]) -> Result<()> {
         for run in runs {
-            let mut output = vec![0; run.slots * OWNER_RECORD_SIZE];
+            let mut output = vec![0; run.slots * SLOT_OWNER_SIZE];
             for piece in &run.pieces {
                 let write = writes[piece.index];
-                let owner = OwnerRecord {
+                let owner = SlotOwner {
                     key_digest: write.key_digest,
-                    segment_generation: write.allocation.segment_generation,
-                    stored_len: u32::try_from(write.stored_len()).expect("validated stored blob length must fit u32"),
+                    extent_generation: write.allocation.extent_generation,
+                    stored_len: u32::try_from(write.stored_len()).expect("validated stored entry length must fit u32"),
                     value_len: u32::try_from(write.value.len()).expect("validated value length must fit u32"),
                     checksum: write.checksum,
                     priority: write.allocation.priority,
@@ -1005,33 +996,33 @@ impl SegmentStore {
                 }
                 .encode();
                 for slot in piece.run_slot..piece.run_slot + piece.slots {
-                    let start = slot * OWNER_RECORD_SIZE;
-                    output[start..start + OWNER_RECORD_SIZE].copy_from_slice(&owner);
+                    let start = slot * SLOT_OWNER_SIZE;
+                    output[start..start + SLOT_OWNER_SIZE].copy_from_slice(&owner);
                 }
             }
             let offset = run
                 .first_slot
-                .checked_mul(OWNER_RECORD_SIZE as u64)
-                .ok_or_else(|| invalid_state("segment owner offset overflows u64"))?;
+                .checked_mul(SLOT_OWNER_SIZE as u64)
+                .ok_or_else(|| invalid_state("extent owner offset overflows u64"))?;
             self.io
                 .write(|| write_all_at(&self.owners, &output, offset))
-                .map_err(|error| Error::io("write segment owner batch", error))?;
-            self.writes.owner_runs.fetch_add(1, Ordering::Relaxed);
+                .map_err(|error| Error::io("write extent owner batch", error))?;
+            self.writes.slot_owner_runs.fetch_add(1, Ordering::Relaxed);
             self.writes
-                .owner_bytes
+                .slot_owner_bytes
                 .fetch_add(output.len() as u64, Ordering::Relaxed);
         }
         Ok(())
     }
 
-    fn persist_state_locked(&self, state: &mut AllocatorState) -> Result<()> {
-        let generation = state
-            .generation
+    fn persist_state_locked(&self, state: &mut ExtentPoolState) -> Result<()> {
+        let state_generation = state
+            .state_generation
             .checked_add(1)
             .ok_or_else(|| invalid_state("allocator state generation is exhausted"))?;
         let page = 1 - state.active_page;
         let mut next = state.clone();
-        next.generation = generation;
+        next.state_generation = state_generation;
         next.active_page = page;
         let offset = u64::from(page)
             .checked_mul(self.layout.state_copy_size as u64)
@@ -1051,46 +1042,46 @@ impl SegmentStore {
 }
 
 #[derive(Debug)]
-struct SegmentWriteRun {
+struct DataWriteRun {
     first_slot: u64,
     slots: usize,
-    pieces: Vec<SegmentWritePiece>,
+    pieces: Vec<DataWritePiece>,
 }
 
 #[derive(Debug)]
-struct SegmentWritePiece {
+struct DataWritePiece {
     index: usize,
     run_slot: usize,
     write_slot: usize,
     slots: usize,
 }
 
-fn segment_write_runs(order: &[usize], writes: &[SegmentWrite<'_>], maximum_slots: usize) -> Vec<SegmentWriteRun> {
+fn data_write_runs(order: &[usize], writes: &[EntryWrite<'_>], maximum_slots: usize) -> Vec<DataWriteRun> {
     debug_assert!(maximum_slots > 0);
-    let mut runs: Vec<SegmentWriteRun> = Vec::new();
+    let mut runs: Vec<DataWriteRun> = Vec::new();
     for index in order.iter().copied() {
         let write = writes[index];
         let mut write_slot = 0usize;
-        let write_slots = write.allocation.slots as usize;
+        let write_slots = write.allocation.slot_count as usize;
         while write_slot < write_slots {
             let physical_slot = write
                 .allocation
-                .physical_slot
+                .first_slot
                 .checked_add(write_slot as u64)
-                .expect("validated segment write must fit the data file");
+                .expect("validated extent write must fit the data file");
             let append = runs.last().is_some_and(|run| {
                 run.first_slot.checked_add(run.slots as u64) == Some(physical_slot) && run.slots < maximum_slots
             });
             if !append {
-                runs.push(SegmentWriteRun {
+                runs.push(DataWriteRun {
                     first_slot: physical_slot,
                     slots: 0,
                     pieces: Vec::new(),
                 });
             }
-            let run = runs.last_mut().expect("segment write run must exist");
+            let run = runs.last_mut().expect("extent write run must exist");
             let slots = (write_slots - write_slot).min(maximum_slots - run.slots);
-            run.pieces.push(SegmentWritePiece {
+            run.pieces.push(DataWritePiece {
                 index,
                 run_slot: run.slots,
                 write_slot,
@@ -1103,23 +1094,23 @@ fn segment_write_runs(order: &[usize], writes: &[SegmentWrite<'_>], maximum_slot
     runs
 }
 
-fn state_file_size(layout: SegmentLayout) -> Result<u64> {
+fn state_file_size(layout: StoreLayout) -> Result<u64> {
     layout
         .state_copy_size
         .checked_mul(2)
         .and_then(|size| u64::try_from(size).ok())
-        .ok_or_else(|| invalid_state("segment state file size overflows u64"))
+        .ok_or_else(|| invalid_state("extent state file size overflows u64"))
 }
 
-fn layout_allocated_size(layout: SegmentLayout) -> Result<u64> {
+fn layout_allocated_size(layout: StoreLayout) -> Result<u64> {
     layout
         .total_file_size
         .checked_sub(layout.index_capacity_bytes)
-        .ok_or_else(|| invalid_state("segment file allocation underflows total layout size"))
+        .ok_or_else(|| invalid_state("extent file allocation underflows total layout size"))
 }
 
 fn invalid_state(message: &str) -> Error {
-    Error::InvalidSuperblock(format!("segment state: {message}"))
+    Error::InvalidSuperblock(format!("extent state: {message}"))
 }
 
 fn mutex_lock<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1132,83 +1123,83 @@ mod tests {
 
     use super::*;
     use crate::{
-        format::{PAGE_SIZE, blob_checksum},
-        segment::config::{SegmentEngineConfig, SegmentEngineOptions},
+        format::{PAGE_SIZE, stored_entry_checksum},
+        store::config::{ExtentStoreConfig, ExtentStoreOptions},
     };
 
-    fn create_store(root: &Path) -> SegmentStore {
-        let options = SegmentEngineOptions::default().with_segment_size(PAGE_SIZE * 8);
-        let layout = SegmentLayout::create(
-            SegmentEngineConfig::new(4 * 1024 * 1024)
+    fn create_pool(root: &Path) -> ExtentPool {
+        let options = ExtentStoreOptions::default().with_extent_size(PAGE_SIZE * 8);
+        let layout = StoreLayout::create(
+            ExtentStoreConfig::new(4 * 1024 * 1024)
                 .with_slot_size(PAGE_SIZE)
                 .with_options(options),
         )
         .unwrap();
-        SegmentStore::create(root, layout, false, 2, Duration::ZERO, PAGE_SIZE * 4, PAGE_SIZE * 4).unwrap()
+        ExtentPool::create(root, layout, false, 2, Duration::ZERO, PAGE_SIZE * 4, PAGE_SIZE * 4).unwrap()
     }
 
-    fn key(index: u64) -> BlobKey {
+    fn key(index: u64) -> EntryKey {
         let mut bytes = [index as u8; 24];
         bytes[16..].copy_from_slice(&index.to_le_bytes());
-        BlobKey::new(bytes).unwrap()
+        EntryKey::new(bytes).unwrap()
     }
 
-    fn allocated(result: SegmentAllocationResult) -> SegmentAllocation {
+    fn allocated(result: AllocationResult) -> EntryAllocation {
         match result {
-            SegmentAllocationResult::Allocated(allocation) => allocation,
-            SegmentAllocationResult::ReclaimRequired => panic!("test allocation needs reclaim"),
+            AllocationResult::Allocated(allocation) => allocation,
+            AllocationResult::ReclaimRequired => panic!("test allocation needs reclaim"),
         }
     }
 
     #[test]
     fn batch_write_read_checkpoint_and_reopen() {
         let dir = tempdir().unwrap();
-        let store = create_store(dir.path());
+        let pool = create_pool(dir.path());
         let values = (0..12).map(|index| vec![index as u8; 100 + index]).collect::<Vec<_>>();
         let allocations = (0..values.len())
-            .map(|_| allocated(store.allocate(CachePriority::Normal, 1).unwrap()))
+            .map(|_| allocated(pool.allocate(CachePriority::Normal, 1).unwrap()))
             .collect::<Vec<_>>();
         let keys = (0..values.len()).map(|index| key(index as u64)).collect::<Vec<_>>();
         let writes = values
             .iter()
             .enumerate()
-            .map(|(index, value)| SegmentWrite {
+            .map(|(index, value)| EntryWrite {
                 allocation: allocations[index],
                 key: &keys[index],
                 key_digest: KeyDigest::for_key(&keys[index]),
                 value,
-                checksum: blob_checksum(&keys[index], value),
+                checksum: stored_entry_checksum(&keys[index], value),
             })
             .collect::<Vec<_>>();
-        let result = store.write_batch(&writes).unwrap();
+        let result = pool.write_batch(&writes).unwrap();
         assert_eq!(result.data_runs, 3);
-        assert_eq!(result.owner_runs, 1);
+        assert_eq!(result.slot_owner_runs, 1);
         for (index, location) in result.locations.iter().enumerate() {
             assert_eq!(
-                store.get_blob(&keys[index], *location).unwrap(),
-                SegmentBlobReadResult {
+                pool.read_entry(&keys[index], *location).unwrap(),
+                StoredEntryRead {
                     value: Some(values[index].clone()),
                     data_slots: 1,
                     data_runs: 1,
-                    data_bytes: stored_blob_len(&keys[index], &values[index]).unwrap(),
+                    data_bytes: stored_entry_len(&keys[index], &values[index]).unwrap(),
                 }
             );
         }
-        store.sync_payload().unwrap();
-        store.checkpoint_state().unwrap();
-        let layout = store.layout();
-        drop(store);
+        pool.sync_payload().unwrap();
+        pool.checkpoint_state().unwrap();
+        let layout = pool.layout();
+        drop(pool);
 
-        let reopened = SegmentStore::open(dir.path(), false, 2, Duration::ZERO, PAGE_SIZE * 4, PAGE_SIZE * 4).unwrap();
+        let reopened = ExtentPool::open(dir.path(), false, 2, Duration::ZERO, PAGE_SIZE * 4, PAGE_SIZE * 4).unwrap();
         assert_eq!(reopened.layout(), layout);
         for (index, location) in result.locations.iter().enumerate() {
             assert_eq!(
-                reopened.get_blob(&keys[index], *location).unwrap(),
-                SegmentBlobReadResult {
+                reopened.read_entry(&keys[index], *location).unwrap(),
+                StoredEntryRead {
                     value: Some(values[index].clone()),
                     data_slots: 1,
                     data_runs: 1,
-                    data_bytes: stored_blob_len(&keys[index], &values[index]).unwrap(),
+                    data_bytes: stored_entry_len(&keys[index], &values[index]).unwrap(),
                 }
             );
         }
@@ -1217,19 +1208,19 @@ mod tests {
     #[test]
     fn point_read_rechecks_generation_after_payload_io() {
         let dir = tempdir().unwrap();
-        let store = create_store(dir.path());
+        let pool = create_pool(dir.path());
         let old_value = vec![0x11; 512];
         let mut replacement = vec![0x22; 512];
         replacement[508..].copy_from_slice(&[0xce, 0xe0, 0x15, 0xb2]);
         let key = key(1);
         let key_digest = KeyDigest::for_key(&key);
-        let checksum = blob_checksum(&key, &old_value);
+        let checksum = stored_entry_checksum(&key, &old_value);
         assert_ne!(old_value, replacement);
-        assert_eq!(blob_checksum(&key, &replacement), checksum);
+        assert_eq!(stored_entry_checksum(&key, &replacement), checksum);
 
-        let allocation = allocated(store.allocate(CachePriority::Normal, 1).unwrap());
-        let location = store
-            .write_batch(&[SegmentWrite {
+        let allocation = allocated(pool.allocate(CachePriority::Normal, 1).unwrap());
+        let location = pool
+            .write_batch(&[EntryWrite {
                 allocation,
                 key: &key,
                 key_digest,
@@ -1238,16 +1229,16 @@ mod tests {
             }])
             .unwrap()
             .locations[0];
-        let (victim, is_current) = store.reclaim_candidates().oldest(CachePriority::Normal).unwrap();
+        let (victim, is_current) = pool.reclaim_candidates().oldest(CachePriority::Normal).unwrap();
         assert!(is_current);
-        let victim = store.seal_current(victim).unwrap();
+        let victim = pool.seal_current(victim).unwrap();
 
-        let value = store
-            .read_stored_blob_after_validation(location, || {
-                store.release(victim)?;
-                let replacement_allocation = allocated(store.allocate(CachePriority::Normal, 1)?);
-                assert_eq!(replacement_allocation.physical_slot, allocation.physical_slot);
-                store.write_batch(&[SegmentWrite {
+        let value = pool
+            .read_encoded_entry_after_validation(location, || {
+                pool.release(victim)?;
+                let replacement_allocation = allocated(pool.allocate(CachePriority::Normal, 1)?);
+                assert_eq!(replacement_allocation.first_slot, allocation.first_slot);
+                pool.write_batch(&[EntryWrite {
                     allocation: replacement_allocation,
                     key: &key,
                     key_digest,
@@ -1261,50 +1252,49 @@ mod tests {
         assert_eq!(value.value, None);
         assert_eq!(value.data_runs, 1);
         assert_eq!(value.data_slots, 1);
-        assert_eq!(value.data_bytes, stored_blob_len(&key, &old_value).unwrap());
+        assert_eq!(value.data_bytes, stored_entry_len(&key, &old_value).unwrap());
     }
 
     #[test]
     fn reopen_recovers_uncheckpointed_current_tail() {
         let dir = tempdir().unwrap();
-        let store = create_store(dir.path());
-        let allocation = allocated(store.allocate(CachePriority::High, 1).unwrap());
-        store.checkpoint_state().unwrap();
+        let pool = create_pool(dir.path());
+        let allocation = allocated(pool.allocate(CachePriority::High, 1).unwrap());
+        pool.checkpoint_state().unwrap();
         let value = vec![9; 512];
         let key = key(1);
-        store
-            .write_batch(&[SegmentWrite {
-                allocation,
-                key: &key,
-                key_digest: KeyDigest::for_key(&key),
-                value: &value,
-                checksum: blob_checksum(&key, &value),
-            }])
-            .unwrap();
-        store.sync_payload().unwrap();
-        drop(store);
+        pool.write_batch(&[EntryWrite {
+            allocation,
+            key: &key,
+            key_digest: KeyDigest::for_key(&key),
+            value: &value,
+            checksum: stored_entry_checksum(&key, &value),
+        }])
+        .unwrap();
+        pool.sync_payload().unwrap();
+        drop(pool);
 
-        let reopened = SegmentStore::open(dir.path(), false, 1, Duration::ZERO, PAGE_SIZE * 4, PAGE_SIZE * 4).unwrap();
+        let reopened = ExtentPool::open(dir.path(), false, 1, Duration::ZERO, PAGE_SIZE * 4, PAGE_SIZE * 4).unwrap();
         let next = allocated(reopened.allocate(CachePriority::High, 1).unwrap());
-        assert_eq!(next.segment, allocation.segment);
-        assert_eq!(next.slot, allocation.slot + 1);
+        assert_eq!(next.extent, allocation.extent);
+        assert_eq!(next.extent_slot, allocation.extent_slot + 1);
     }
 
     #[test]
     fn falls_back_to_the_older_valid_state_copy() {
         let dir = tempdir().unwrap();
-        let store = create_store(dir.path());
-        store.checkpoint_state().unwrap();
-        let state = store.state_snapshot();
-        let layout = store.layout();
-        drop(store);
+        let pool = create_pool(dir.path());
+        pool.checkpoint_state().unwrap();
+        let state = pool.state_snapshot();
+        let layout = pool.layout();
+        drop(pool);
 
         let state_file = open_cache_file(&dir.path().join(STATE_FILE), false, false).unwrap();
         let offset = u64::from(state.active_page) * layout.state_copy_size as u64;
         write_all_at(&state_file, &[0xff], offset).unwrap();
         state_file.sync_data().unwrap();
 
-        let reopened = SegmentStore::open(dir.path(), false, 1, Duration::ZERO, PAGE_SIZE * 4, PAGE_SIZE * 4).unwrap();
-        assert!(reopened.state_snapshot().generation < state.generation);
+        let reopened = ExtentPool::open(dir.path(), false, 1, Duration::ZERO, PAGE_SIZE * 4, PAGE_SIZE * 4).unwrap();
+        assert!(reopened.state_snapshot().state_generation < state.state_generation);
     }
 }

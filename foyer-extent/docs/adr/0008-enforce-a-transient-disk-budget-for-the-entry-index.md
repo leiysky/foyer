@@ -2,9 +2,9 @@
 status: accepted
 ---
 
-# Enforce a transient disk budget for the segment index
+# Enforce a transient disk budget for EntryIndex
 
-SegmentEngine reserves a hard index disk budget inside the configured cache capacity, and
+ExtentStore reserves a hard index disk budget inside the configured cache capacity, and
 FixedRecordLSM must reserve from it before writing WAL frames, temporary manifests, flush SSTs, or
 compaction output. The static reservation represents three bounded copies of the maximum fixed
 record state: steady SSTs, atomic compaction output, and the WAL/L0 write tail. Obsolete bytes are

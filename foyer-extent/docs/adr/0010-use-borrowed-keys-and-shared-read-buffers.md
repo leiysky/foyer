@@ -4,10 +4,10 @@ status: accepted
 
 # Use borrowed lookups and shared cache entries
 
-Extent's public point operations accept blob keys as borrowed byte slices. A successful read
+Extent's public point operations accept Entry keys as borrowed byte slices. A successful read
 returns the complete `Entry`; a miss returns no entry. An `Entry` owns `bytes::Bytes` handles
 for its key and value together with its cache priority. Returned entries own their lifetime
-independently of the engine, are immutable, and may be cloned or sliced without copying key or blob
+independently of the cache, are immutable, and may be cloned or sliced without copying key or value
 contents.
 
 ## Why
@@ -24,7 +24,7 @@ slice, inspect priority, or fan out a cache hit.
 
 ## Consequences
 
-- `BlobKey` remains the domain name for the complete key but need not be a public Rust struct.
+- `EntryKey` remains the domain name for the complete key but need not be a public Rust struct.
 - `Entry { key: Bytes, value: Bytes, priority: CachePriority }` is the core public data type for
   insertion and hits; it is not reused as a physical disk or index record.
 - Point lookup has the shape `async get(&[u8]) -> Option<Entry>`. Invalid input, throttling, storage
@@ -39,7 +39,7 @@ slice, inspect priority, or fan out a cache hit.
 - Put consumes an `Entry` and returns `()`. Whether it was admitted, rejected, throttled, queued,
   dropped, or failed is internal statistics rather than a public result. Static input validity is
   established when constructing the entry.
-- The public Extent cache is a Foyer HybridCache configured with ExtentEngine. SegmentEngine is its
+- The public Extent cache is a Foyer HybridCache configured with ExtentEngine. ExtentStore is its
   internal disk tier rather than the primary public API; Extent does not reimplement Foyer's upper
   hybrid layer.
 - Public get is asynchronous so a memory miss can read the disk tier. Put and delete are

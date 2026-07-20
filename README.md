@@ -134,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
 ### Extent SSD Engine (leiysky fork)
 
 This fork vendors Extent as a separate workspace extension. `foyer-storage` retains the generic
-disk-engine contract; `foyer-extent` provides a segment-based, priority-aware SSD engine and its
+disk-engine contract; `foyer-extent` provides a cache-extent-based, priority-aware SSD engine and its
 specialized, path-private `foyer-fixed-lsm` index. Downstream users must resolve `foyer` and
 `foyer-extent` from the same fork revision. The extension also checks
 `foyer::DISK_ENGINE_API_VERSION` at compile time, so mixing it with crates.io Foyer or an

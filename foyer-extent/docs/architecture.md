@@ -9,25 +9,25 @@ Foyer or the public cache facade.
    A bounded submission queue owns backpressure reservations, one write worker owns ordered batch
    publication and periodic checkpoint requests, and the recovery-policy and statistics modules
    translate Foyer-specific behavior.
-3. **Segment engine** — `SegmentEngine` owns ordered entry publication and coordinates the
+3. **Extent store** — `ExtentStore` owns ordered entry publication and coordinates the
    checkpoint frontier. Its concrete `Reclaimer` owns allocation pressure, priority-aware victim
    selection, generation-reuse fencing, and bounded hot-entry promotion.
-4. **Persistence** — `SegmentStore` owns physical payload, owner, and allocator files. Its
+4. **Persistence** — `ExtentPool` owns physical payload, owner, and allocator files. Its
    cooperative I/O scheduler admits payload reads, publication writes, and payload syncs without
-   owning buffers or executing work on another thread. `SegmentIndex` owns digest-to-location
+   owning buffers or executing work on another thread. `EntryIndex` owns digest-to-location
    lookup through FixedRecordLSM. FixedRecordLSM remains a separate fixed-record storage crate and
-   has no cache or segment knowledge.
+   has no cache or extent knowledge.
 
 The boundaries are concrete module boundaries rather than interchangeable backend traits. There
-is one accepted segment index and one physical layout. A new abstraction is justified only when it
+is one accepted EntryIndex and one physical layout. A new abstraction is justified only when it
 owns an invariant or allows an accepted implementation to be replaced without exposing its
 details upward.
 
 Within the Foyer layer, a command retains its queue reservation for its entire queued/in-flight
-lifetime. Within the segment layer, reclaim is invoked only while the engine mutation lock is held.
+lifetime. Within the store layer, reclaim is invoked only while the store mutation lock is held.
 Those ownership rules are module invariants, not conventions repeated at call sites.
 
-I/O admission is intentionally below Foyer and above positional file calls. A logical blob read
+I/O admission is intentionally below Foyer and above positional file calls. A logical Entry read
 holds one lock-free read permit across all of its bounded physical runs. A write run waits for a
 read-quiescent point for at most the configured read-priority duration, then proceeds; reads never
 queue behind an admitted write. The default synchronous implementation keeps syscall execution and
@@ -47,12 +47,12 @@ retains and exposes that handle, shared Foyer statistics, and storage usage afte
 engine config. Physical-I/O accounting includes payload and FixedRecordLSM index work. A payload
 read is counted even when generation or key validation turns it into a cache miss; cumulative index
 counters are reconciled under one accounting lock so concurrent readers report every delta once.
-Storage-usage polling does no directory walk: SegmentStore captures its fixed allocation once and
+Storage-usage polling does no directory walk: ExtentPool captures its fixed allocation once and
 FixedRecordLSM exposes the disk budget it already maintains for admission and compaction.
 
 Test-only injection points exercise no-space, short-write, sync, and flush-worker panic behavior.
-They are compiled out of production code. A frozen full-engine V3 image is decoded and advanced by
-the current engine, while subprocess crash tests cover publication boundaries that cannot be
+They are compiled out of production code. A frozen full-store V3 image is decoded and advanced by
+the current store, while subprocess crash tests cover publication boundaries that cannot be
 represented by returned I/O errors.
 
 Benchmark and reference-engine code belongs outside production modules. It may use public

@@ -86,8 +86,8 @@ pub struct Metrics {
     pub storage_engine_checkpoint_durable: BoxedGauge,
     pub storage_engine_checkpoint_in_flight: BoxedGauge,
     pub storage_engine_checkpoint_dirty: BoxedGauge,
-    pub storage_engine_priority_segments: [BoxedGauge; 3],
-    pub storage_engine_priority_floor_segments: [BoxedGauge; 3],
+    pub storage_engine_priority_extents: [BoxedGauge; 3],
+    pub storage_engine_priority_floor_extents: [BoxedGauge; 3],
     pub storage_engine_priority_allocated_bytes: [BoxedGauge; 3],
     pub storage_engine_healthy: BoxedGauge,
 
@@ -251,9 +251,9 @@ impl Metrics {
             "foyer disk engine checkpoint frontiers and dirty work".into(),
             &["name", "measure"],
         );
-        let foyer_storage_engine_priority_segments = registry.register_gauge_vec(
-            "foyer_storage_engine_priority_segments".into(),
-            "foyer disk engine occupied and protected-floor segments by cache priority".into(),
+        let foyer_storage_engine_priority_extents = registry.register_gauge_vec(
+            "foyer_storage_engine_priority_extents".into(),
+            "foyer disk engine occupied and protected-floor extents by cache priority".into(),
             &["name", "priority", "state"],
         );
         let foyer_storage_engine_priority_allocated_bytes = registry.register_gauge_vec(
@@ -405,15 +405,11 @@ impl Metrics {
         let storage_engine_checkpoint_dirty =
             foyer_storage_engine_checkpoint.gauge(&[name.clone(), "dirty_changes".into()]);
         let priorities = ["low", "normal", "high"];
-        let storage_engine_priority_segments = std::array::from_fn(|priority| {
-            foyer_storage_engine_priority_segments.gauge(&[
-                name.clone(),
-                priorities[priority].into(),
-                "occupied".into(),
-            ])
+        let storage_engine_priority_extents = std::array::from_fn(|priority| {
+            foyer_storage_engine_priority_extents.gauge(&[name.clone(), priorities[priority].into(), "occupied".into()])
         });
-        let storage_engine_priority_floor_segments = std::array::from_fn(|priority| {
-            foyer_storage_engine_priority_segments.gauge(&[name.clone(), priorities[priority].into(), "floor".into()])
+        let storage_engine_priority_floor_extents = std::array::from_fn(|priority| {
+            foyer_storage_engine_priority_extents.gauge(&[name.clone(), priorities[priority].into(), "floor".into()])
         });
         let storage_engine_priority_allocated_bytes = std::array::from_fn(|priority| {
             foyer_storage_engine_priority_allocated_bytes.gauge(&[name.clone(), priorities[priority].into()])
@@ -542,8 +538,8 @@ impl Metrics {
             storage_engine_checkpoint_durable,
             storage_engine_checkpoint_in_flight,
             storage_engine_checkpoint_dirty,
-            storage_engine_priority_segments,
-            storage_engine_priority_floor_segments,
+            storage_engine_priority_extents,
+            storage_engine_priority_floor_extents,
             storage_engine_priority_allocated_bytes,
             storage_engine_healthy,
             storage_disk_write,

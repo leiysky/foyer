@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::format::DEFAULT_SLOT_SIZE;
 
-pub const DEFAULT_SEGMENT_SIZE: usize = 64 * 1024 * 1024;
+pub const DEFAULT_EXTENT_SIZE: usize = 64 * 1024 * 1024;
 pub const DEFAULT_HIGH_PRIORITY_CAPACITY_PERCENT: u8 = 10;
 pub const DEFAULT_NORMAL_PRIORITY_CAPACITY_PERCENT: u8 = 70;
 const DEFAULT_READ_RUN_SIZE: usize = DEFAULT_SLOT_SIZE;
@@ -33,15 +33,15 @@ impl PriorityCapacityFloors {
         self.normal_percent
     }
 
-    pub fn segment_floors(self, usable_segments: u32) -> [u32; 3] {
+    pub fn extent_floors(self, usable_extents: u32) -> [u32; 3] {
         let floor = |percent: u8| {
             if percent == 0 {
                 0
             } else {
-                let segments = u64::from(usable_segments)
+                let extents = u64::from(usable_extents)
                     .saturating_mul(u64::from(percent))
                     .div_ceil(100);
-                u32::try_from(segments).expect("a capacity floor cannot exceed the usable segment count")
+                u32::try_from(extents).expect("a capacity floor cannot exceed the usable extent count")
             }
         };
         [0, floor(self.normal_percent), floor(self.high_percent)]
@@ -58,8 +58,8 @@ impl Default for PriorityCapacityFloors {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SegmentEngineOptions {
-    pub segment_size: usize,
+pub struct ExtentStoreOptions {
+    pub extent_size: usize,
     pub write_concurrency: usize,
     pub io_read_priority_duration: Duration,
     pub read_run_size: usize,
@@ -73,10 +73,10 @@ pub struct SegmentEngineOptions {
     pub direct_io: bool,
 }
 
-impl Default for SegmentEngineOptions {
+impl Default for ExtentStoreOptions {
     fn default() -> Self {
         Self {
-            segment_size: DEFAULT_SEGMENT_SIZE,
+            extent_size: DEFAULT_EXTENT_SIZE,
             write_concurrency: 1,
             io_read_priority_duration: DEFAULT_IO_READ_PRIORITY_DURATION,
             read_run_size: DEFAULT_READ_RUN_SIZE,
@@ -93,9 +93,9 @@ impl Default for SegmentEngineOptions {
 }
 
 #[cfg(test)]
-impl SegmentEngineOptions {
-    pub fn with_segment_size(mut self, segment_size: usize) -> Self {
-        self.segment_size = segment_size;
+impl ExtentStoreOptions {
+    pub fn with_extent_size(mut self, extent_size: usize) -> Self {
+        self.extent_size = extent_size;
         self
     }
 
@@ -142,18 +142,18 @@ impl SegmentEngineOptions {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SegmentEngineConfig {
+pub struct ExtentStoreConfig {
     pub capacity_bytes: u64,
     pub slot_size: usize,
-    pub options: SegmentEngineOptions,
+    pub options: ExtentStoreOptions,
 }
 
-impl SegmentEngineConfig {
+impl ExtentStoreConfig {
     pub fn new(capacity_bytes: u64) -> Self {
         Self {
             capacity_bytes,
             slot_size: DEFAULT_SLOT_SIZE,
-            options: SegmentEngineOptions::default(),
+            options: ExtentStoreOptions::default(),
         }
     }
 
@@ -164,7 +164,7 @@ impl SegmentEngineConfig {
     }
 
     #[cfg(test)]
-    pub fn with_options(mut self, options: SegmentEngineOptions) -> Self {
+    pub fn with_options(mut self, options: ExtentStoreOptions) -> Self {
         self.options = options;
         self
     }
@@ -176,7 +176,7 @@ mod tests {
 
     #[test]
     fn priority_capacity_rounds_up_to_reclaim_units() {
-        assert_eq!(PriorityCapacityFloors::new(10, 70).segment_floors(5), [0, 4, 1]);
-        assert_eq!(PriorityCapacityFloors::new(0, 100).segment_floors(5), [0, 5, 0]);
+        assert_eq!(PriorityCapacityFloors::new(10, 70).extent_floors(5), [0, 4, 1]);
+        assert_eq!(PriorityCapacityFloors::new(0, 100).extent_floors(5), [0, 5, 0]);
     }
 }

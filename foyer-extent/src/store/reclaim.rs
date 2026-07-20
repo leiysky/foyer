@@ -2,17 +2,17 @@ use std::{cmp::Reverse, collections::HashSet};
 
 use crate::{
     error::Result,
-    model::{BlobKey, CachePriority, KeyDigest},
-    segment::{
+    model::{CachePriority, EntryKey, KeyDigest},
+    store::{
         checkpoint::CheckpointCoordinator,
-        format::{OwnerRecord, SegmentLocation},
-        index::SegmentIndex,
+        format::{EntryLocation, SlotOwner},
+        index::EntryIndex,
         operation::InsertOutcome,
-        stats::ReclaimStats,
-        store::{
-            ReclaimCandidates, ReclaimTransaction, SegmentAllocation, SegmentAllocationResult, SegmentStore,
-            SegmentVictim, SegmentWrite,
+        pool::{
+            AllocationResult, EntryAllocation, EntryWrite, ExtentPool, ExtentVictim, ReclaimCandidates,
+            ReclaimTransaction,
         },
+        stats::ReclaimStats,
     },
 };
 
@@ -20,11 +20,11 @@ const PROMOTION_PORTION_DENOMINATOR: u32 = 8;
 
 /// Coordinates allocation pressure, eviction, and bounded hot-entry promotion.
 ///
-/// The caller owns the engine mutation lock. This component owns the generation-reuse fence and
+/// The caller owns the store mutation lock. This component owns the generation-reuse fence and
 /// therefore cannot be invoked independently of the ordered publication path.
 pub struct Reclaimer<'a> {
-    index: &'a SegmentIndex,
-    store: &'a SegmentStore,
+    index: &'a EntryIndex,
+    pool: &'a ExtentPool,
     checkpoints: &'a CheckpointCoordinator,
     slot_size: usize,
     priority_capacity_floors: [u32; 3],
@@ -34,8 +34,8 @@ pub struct Reclaimer<'a> {
 
 impl<'a> Reclaimer<'a> {
     pub fn new(
-        index: &'a SegmentIndex,
-        store: &'a SegmentStore,
+        index: &'a EntryIndex,
+        pool: &'a ExtentPool,
         checkpoints: &'a CheckpointCoordinator,
         slot_size: usize,
         priority_capacity_floors: [u32; 3],
@@ -44,7 +44,7 @@ impl<'a> Reclaimer<'a> {
     ) -> Self {
         Self {
             index,
-            store,
+            pool,
             checkpoints,
             slot_size,
             priority_capacity_floors,
@@ -57,26 +57,26 @@ impl<'a> Reclaimer<'a> {
         &self,
         priority: CachePriority,
         slots: u32,
-        protected_segments: &HashSet<u32>,
+        protected_extents: &HashSet<u32>,
     ) -> Result<AllocationDecision> {
         self.recover_pending()?;
         let mut reclaimed = ReclaimResult::default();
         loop {
-            match self.store.allocate(priority, slots)? {
-                SegmentAllocationResult::Allocated(allocation) => {
+            match self.pool.allocate(priority, slots)? {
+                AllocationResult::Allocated(allocation) => {
                     return Ok(AllocationDecision::Allocated(allocation, reclaimed));
                 }
-                SegmentAllocationResult::ReclaimRequired => {}
+                AllocationResult::ReclaimRequired => {}
             }
-            let candidate = select_victim(self.store.reclaim_candidates(), priority, self.priority_capacity_floors);
+            let candidate = select_victim(self.pool.reclaim_candidates(), priority, self.priority_capacity_floors);
             let Some((victim, is_current)) = candidate else {
                 return Ok(AllocationDecision::Rejected(reclaimed));
             };
-            if protected_segments.contains(&victim.segment) {
+            if protected_extents.contains(&victim.extent) {
                 return Ok(AllocationDecision::FlushRequired(reclaimed));
             }
             let victim = if is_current {
-                self.store.seal_current(victim)?
+                self.pool.seal_current(victim)?
             } else {
                 victim
             };
@@ -85,39 +85,39 @@ impl<'a> Reclaimer<'a> {
     }
 
     pub fn recover_pending(&self) -> Result<()> {
-        let Some(transaction) = self.store.pending_reclaim() else {
+        let Some(transaction) = self.pool.pending_reclaim() else {
             return Ok(());
         };
-        self.store.sync_payload()?;
+        self.pool.sync_payload()?;
         let mut removed = Vec::new();
-        for (physical_slot, owner) in self.store.owners(transaction.source)? {
+        for (physical_slot, owner) in self.pool.slot_owners(transaction.source)? {
             let Some(location) = self.index.peek(owner.key_digest)? else {
                 continue;
             };
-            if location.physical_slot == physical_slot && location.segment_generation == transaction.source.generation {
+            if location.first_slot == physical_slot && location.extent_generation == transaction.source.generation {
                 removed.push(owner.key_digest);
             }
         }
         self.index.remove_batch(&removed)?;
         self.index.checkpoint()?;
-        self.store.finish_reclaim(transaction)
+        self.pool.finish_reclaim(transaction)
     }
 
-    fn reclaim(&self, victim: SegmentVictim, incoming: CachePriority) -> Result<ReclaimResult> {
+    fn reclaim(&self, victim: ExtentVictim, incoming: CachePriority) -> Result<ReclaimResult> {
         // Generation reuse cannot pass an immutable checkpoint that may still reference this
         // victim. Reclaim closes the durability frontier inline while the caller holds the
-        // mutation lock. The payload fence also covers earlier pieces of the current engine batch.
-        self.store.sync_payload()?;
+        // mutation lock. The payload fence also covers earlier pieces of the current store batch.
+        self.pool.sync_payload()?;
         self.checkpoints.checkpoint_inline_locked()?;
         let live = self.live_victims(victim)?;
         let hot_frequency = self.frequency_threshold(victim.priority);
         if victim.priority == incoming
-            && promotion_limit(self.store.layout().slots_per_segment) > 0
+            && promotion_limit(self.pool.layout().slots_per_extent) > 0
             && live.iter().any(|entry| entry.frequency >= hot_frequency)
         {
-            let transaction = self.store.begin_reclaim(victim)?;
+            let transaction = self.pool.begin_reclaim(victim)?;
             #[cfg(test)]
-            crate::segment::crash_if_requested("segment_reclaim_after_begin");
+            crate::store::crash_if_requested("extent_reclaim_after_begin");
             return self.compact(transaction, live, hot_frequency);
         }
 
@@ -127,15 +127,15 @@ impl<'a> Reclaimer<'a> {
         });
         let keys = live.into_iter().map(|entry| entry.owner.key_digest).collect::<Vec<_>>();
         self.index.remove_batch(&keys)?;
-        self.store.checkpoint_state()?;
+        self.pool.checkpoint_state()?;
         #[cfg(test)]
-        crate::segment::crash_if_requested("segment_evict_after_allocator_state");
+        crate::store::crash_if_requested("extent_evict_after_allocator_state");
         self.index.checkpoint()?;
         #[cfg(test)]
-        crate::segment::crash_if_requested("segment_evict_after_index_checkpoint");
-        self.store.release(victim)?;
+        crate::store::crash_if_requested("extent_evict_after_index_checkpoint");
+        self.pool.release(victim)?;
         #[cfg(test)]
-        crate::segment::crash_if_requested("segment_evict_after_release");
+        crate::store::crash_if_requested("extent_evict_after_release");
         let mut stats = ReclaimStats::default();
         stats.record(victim.priority, evicted_entries, 0, evicted_bytes, 0);
         Ok(ReclaimResult {
@@ -144,13 +144,13 @@ impl<'a> Reclaimer<'a> {
         })
     }
 
-    fn live_victims(&self, victim: SegmentVictim) -> Result<Vec<LiveVictim>> {
+    fn live_victims(&self, victim: ExtentVictim) -> Result<Vec<LiveVictim>> {
         let mut live = Vec::new();
-        for (physical_slot, owner) in self.store.owners(victim)? {
+        for (physical_slot, owner) in self.pool.slot_owners(victim)? {
             let Some(location) = self.index.peek(owner.key_digest)? else {
                 continue;
             };
-            if location.physical_slot == physical_slot && location.segment_generation == victim.generation {
+            if location.first_slot == physical_slot && location.extent_generation == victim.generation {
                 live.push(LiveVictim {
                     owner,
                     location,
@@ -170,7 +170,7 @@ impl<'a> Reclaimer<'a> {
         live.sort_unstable_by_key(|entry| (Reverse(entry.frequency), Reverse(entry.owner.sequence)));
         // Retain at most the hottest eighth. That guarantees each compaction frees seven eighths
         // of its source and caps promotion write amplification at one seventh.
-        let promotion_limit = promotion_limit(self.store.layout().slots_per_segment);
+        let promotion_limit = promotion_limit(self.pool.layout().slots_per_extent);
         let mut promoted_slots = 0usize;
         let mut promotions = Vec::new();
         for entry in live.iter().filter(|entry| entry.frequency >= hot_frequency) {
@@ -178,14 +178,14 @@ impl<'a> Reclaimer<'a> {
             if promoted_slots.saturating_add(slots as usize) > promotion_limit {
                 continue;
             }
-            let Some((key, value)) = self.store.get_stored_blob(entry.location)? else {
+            let Some((key, value)) = self.pool.read_stored_entry(entry.location)? else {
                 continue;
             };
             let key_digest = KeyDigest::for_key(&key);
             if key_digest != entry.owner.key_digest {
                 continue;
             }
-            let Some(allocation) = self.store.allocate_reclaim_target(transaction, slots)? else {
+            let Some(allocation) = self.pool.allocate_reclaim_target(transaction, slots)? else {
                 break;
             };
             promoted_slots += slots as usize;
@@ -199,7 +199,7 @@ impl<'a> Reclaimer<'a> {
         }
         let writes = promotions
             .iter()
-            .map(|promotion| SegmentWrite {
+            .map(|promotion| EntryWrite {
                 allocation: promotion.allocation,
                 key: &promotion.key,
                 key_digest: promotion.key_digest,
@@ -207,10 +207,10 @@ impl<'a> Reclaimer<'a> {
                 checksum: promotion.checksum,
             })
             .collect::<Vec<_>>();
-        let written = self.store.write_batch(&writes)?;
-        self.store.sync_payload()?;
+        let written = self.pool.write_batch(&writes)?;
+        self.pool.sync_payload()?;
         #[cfg(test)]
-        crate::segment::crash_if_requested("segment_reclaim_after_payload_sync");
+        crate::store::crash_if_requested("extent_reclaim_after_payload_sync");
 
         let removed = live.iter().map(|entry| entry.owner.key_digest).collect::<Vec<_>>();
         self.index.remove_batch(&removed)?;
@@ -229,8 +229,8 @@ impl<'a> Reclaimer<'a> {
         );
         self.index.checkpoint()?;
         #[cfg(test)]
-        crate::segment::crash_if_requested("segment_reclaim_after_index_checkpoint");
-        self.store.finish_reclaim(transaction)?;
+        crate::store::crash_if_requested("extent_reclaim_after_index_checkpoint");
+        self.pool.finish_reclaim(transaction)?;
         let promoted_entries = promotions.len();
         let promoted_bytes = promotions
             .iter()
@@ -248,8 +248,8 @@ impl<'a> Reclaimer<'a> {
         );
         Ok(ReclaimResult {
             stats,
-            write_runs: written.data_runs.saturating_add(written.owner_runs),
-            written_bytes: written.data_bytes.saturating_add(written.owner_bytes),
+            write_runs: written.data_runs.saturating_add(written.slot_owner_runs),
+            written_bytes: written.data_bytes.saturating_add(written.slot_owner_bytes),
         })
     }
 
@@ -261,13 +261,13 @@ impl<'a> Reclaimer<'a> {
     }
 
     fn slots_for_len(&self, len: usize) -> u32 {
-        u32::try_from(len.div_ceil(self.slot_size)).expect("a validated segment value must use at most u32 slots")
+        u32::try_from(len.div_ceil(self.slot_size)).expect("a validated extent value must use at most u32 slots")
     }
 }
 
 #[derive(Debug)]
 pub enum AllocationDecision {
-    Allocated(SegmentAllocation, ReclaimResult),
+    Allocated(EntryAllocation, ReclaimResult),
     FlushRequired(ReclaimResult),
     Rejected(ReclaimResult),
 }
@@ -289,16 +289,16 @@ impl ReclaimResult {
 
 #[derive(Debug, Clone, Copy)]
 struct LiveVictim {
-    owner: OwnerRecord,
-    location: SegmentLocation,
+    owner: SlotOwner,
+    location: EntryLocation,
     frequency: u8,
 }
 
 #[derive(Debug)]
 struct Promotion {
-    key: BlobKey,
+    key: EntryKey,
     key_digest: KeyDigest,
-    allocation: SegmentAllocation,
+    allocation: EntryAllocation,
     value: Vec<u8>,
     checksum: u32,
 }
@@ -307,9 +307,9 @@ fn select_victim(
     candidates: ReclaimCandidates,
     incoming: CachePriority,
     capacity_floors: [u32; 3],
-) -> Option<(SegmentVictim, bool)> {
+) -> Option<(ExtentVictim, bool)> {
     let borrowed = |priority| {
-        if candidates.occupied_segments(priority) > capacity_floors[priority as usize] {
+        if candidates.occupied_extents(priority) > capacity_floors[priority as usize] {
             candidates.oldest(priority)
         } else {
             None
@@ -328,7 +328,7 @@ fn select_victim(
     }
 }
 
-pub fn promotion_limit(slots_per_segment: u32) -> usize {
-    let limit = (slots_per_segment / PROMOTION_PORTION_DENOMINATOR).min(slots_per_segment.saturating_sub(1));
-    usize::try_from(limit).expect("segment promotion limit must fit usize")
+pub fn promotion_limit(slots_per_extent: u32) -> usize {
+    let limit = (slots_per_extent / PROMOTION_PORTION_DENOMINATOR).min(slots_per_extent.saturating_sub(1));
+    usize::try_from(limit).expect("extent promotion limit must fit usize")
 }

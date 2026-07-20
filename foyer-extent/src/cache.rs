@@ -5,7 +5,9 @@ use foyer::{
     Hint, HybridCache, HybridCachePolicy, HybridCacheProperties, RecoverMode, Spawner, Statistics, StorageUsage,
 };
 
-use crate::{CachePriority, EngineValue, Entry, Error, ExtentEngineConfig, ExtentEngineHandle, Result, model::BlobKey};
+use crate::{
+    CachePriority, EngineValue, Entry, Error, ExtentEngineConfig, ExtentEngineHandle, Result, model::EntryKey,
+};
 
 const CACHE_ENTRY_META_SIZE: usize = 64;
 
@@ -37,7 +39,7 @@ impl Cache {
     ///
     /// Storage errors and throttling are cache misses at this best-effort boundary.
     pub async fn get(&self, key: &[u8]) -> Option<Entry> {
-        if BlobKey::validate(key).is_err() {
+        if EntryKey::validate(key).is_err() {
             return None;
         }
         let key = Bytes::copy_from_slice(key);
@@ -51,7 +53,7 @@ impl Cache {
 
     /// Offer a best-effort deletion without waiting for the disk engine.
     pub fn delete(&self, key: &[u8]) {
-        if BlobKey::validate(key).is_err() {
+        if EntryKey::validate(key).is_err() {
             return;
         }
         self.inner.remove(&Bytes::copy_from_slice(key));
@@ -87,7 +89,10 @@ impl Cache {
     /// disk-only entries during write bursts and must not be used for correctness decisions.
     pub fn estimated_entry_count(&self) -> u64 {
         let memory_entries = u64::try_from(self.inner.memory().entries()).unwrap_or(u64::MAX);
-        let disk_entries = self.engine_handle.index_stats().map_or(0, |stats| stats.live_entries);
+        let disk_entries = self
+            .engine_handle
+            .entry_index_stats()
+            .map_or(0, |stats| stats.live_entries);
         memory_entries.max(disk_entries)
     }
 }

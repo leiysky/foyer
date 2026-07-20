@@ -41,7 +41,7 @@ const fn encode_key(key: [u8; KEY_SIZE]) -> [u8; KEY_SIZE] {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BenchmarkLocation {
     physical_slot: u64,
-    segment_generation: u32,
+    extent_generation: u32,
     stored_len: u32,
     checksum: u32,
     priority: u8,
@@ -51,7 +51,7 @@ impl BenchmarkLocation {
     fn encode(self) -> [u8; VALUE_SIZE] {
         let mut output = [0; VALUE_SIZE];
         output[..8].copy_from_slice(&self.physical_slot.to_le_bytes());
-        output[8..12].copy_from_slice(&self.segment_generation.to_le_bytes());
+        output[8..12].copy_from_slice(&self.extent_generation.to_le_bytes());
         output[12..16].copy_from_slice(&self.stored_len.to_le_bytes());
         output[16..20].copy_from_slice(&self.checksum.to_le_bytes());
         output[20] = self.priority;
@@ -64,7 +64,7 @@ impl BenchmarkLocation {
         }
         Some(Self {
             physical_slot: u64::from_le_bytes(input[..8].try_into().ok()?),
-            segment_generation: u32::from_le_bytes(input[8..12].try_into().ok()?),
+            extent_generation: u32::from_le_bytes(input[8..12].try_into().ok()?),
             stored_len: u32::from_le_bytes(input[12..16].try_into().ok()?),
             checksum: u32::from_le_bytes(input[16..20].try_into().ok()?),
             priority: input[20],
@@ -75,7 +75,7 @@ impl BenchmarkLocation {
 fn scale_location(index: u64, generation: u32) -> BenchmarkLocation {
     BenchmarkLocation {
         physical_slot: index,
-        segment_generation: generation,
+        extent_generation: generation,
         stored_len: 16 * 1024,
         checksum: (index as u32).rotate_left(generation % 31),
         priority: (index % 3) as u8,

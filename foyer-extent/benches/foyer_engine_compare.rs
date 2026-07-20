@@ -15,7 +15,7 @@ use foyer::{
 };
 use foyer_extent::{
     CachePriority, DEFAULT_HIGH_PRIORITY_CAPACITY_PERCENT, DEFAULT_NORMAL_PRIORITY_CAPACITY_PERCENT, EngineValue,
-    ExtentEngineConfig, ExtentEngineHandle, MAX_BLOB_KEY_SIZE,
+    ExtentEngineConfig, ExtentEngineHandle, MAX_KEY_SIZE,
 };
 
 const KIB: usize = 1024;
@@ -82,7 +82,7 @@ struct Config {
     block_size_bytes: usize,
     block_buffer_pool_bytes: usize,
     extent_slot_size: usize,
-    extent_segment_size: usize,
+    extent_size: usize,
     extent_index_cache_bytes: usize,
     extent_index_write_buffer_bytes: usize,
     extent_io_read_priority: Duration,
@@ -182,7 +182,7 @@ impl Config {
             block_size_bytes,
             block_buffer_pool_bytes: env_mib("EXTENT_BENCH_BLOCK_BUFFER_MIB", 256)?,
             extent_slot_size: env_kib("EXTENT_BENCH_SLOT_KIB", foyer_extent::DEFAULT_SLOT_SIZE / KIB)?,
-            extent_segment_size: env_mib("EXTENT_BENCH_SEGMENT_MIB", 64)?,
+            extent_size: env_mib("EXTENT_BENCH_EXTENT_MIB", 64)?,
             extent_index_cache_bytes: env_mib("EXTENT_BENCH_INDEX_CACHE_MIB", 1024)?,
             extent_index_write_buffer_bytes: env_mib("EXTENT_BENCH_INDEX_WRITE_BUFFER_MIB", 64)?,
             extent_io_read_priority: Duration::from_micros(
@@ -222,11 +222,8 @@ impl Workload {
     fn from_env() -> AnyResult<Self> {
         let entry_sizes = env_list_kib("EXTENT_BENCH_ENTRY_KIB", &[4, 16, 64, 256, 1024])?;
         let key_sizes = env_list_usize("EXTENT_BENCH_KEY_BYTES", &[32, 96, 256, 1024])?;
-        if key_sizes.iter().any(|size| *size == 0 || *size > MAX_BLOB_KEY_SIZE) {
-            return Err(invalid(format!(
-                "EXTENT_BENCH_KEY_BYTES values must be in 1..={MAX_BLOB_KEY_SIZE}"
-            ))
-            .into());
+        if key_sizes.iter().any(|size| *size == 0 || *size > MAX_KEY_SIZE) {
+            return Err(invalid(format!("EXTENT_BENCH_KEY_BYTES values must be in 1..={MAX_KEY_SIZE}")).into());
         }
         let cycle_bytes = entry_sizes.iter().try_fold(0u64, |sum, size| {
             sum.checked_add(*size as u64)
@@ -635,7 +632,7 @@ async fn build_cache(
         DiskEngine::Extent => {
             let queue_entries = (config.queue_bytes / (4 * KIB)).max(1);
             let extent = ExtentEngineConfig::new(path.join("extent-engine"), config.capacity_bytes as u64)
-                .with_test_layout(config.extent_slot_size, config.extent_segment_size)
+                .with_test_layout(config.extent_slot_size, config.extent_size)
                 .with_write_concurrency(config.write_concurrency)
                 .with_io_read_priority_duration(config.extent_io_read_priority)
                 .with_index_cache_size(config.extent_index_cache_bytes)
@@ -1001,7 +998,7 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
             as_mib(stats.total_bytes()),
             stats.total_runs(),
             as_mib(stats.data_bytes),
-            as_mib(stats.owner_bytes),
+            as_mib(stats.slot_owner_bytes),
             as_mib(stats.index_bytes),
             as_mib(stats.allocator_bytes),
         );
@@ -1022,7 +1019,7 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
             stats.waiting_writes,
         );
     }
-    if let Some(index) = handle.index_stats() {
+    if let Some(index) = handle.entry_index_stats() {
         println!(
             "engine={} phase=extent_index live_entries={} wal_mib={:.1} sst_files={} sst_mib={:.1} cache_resident_mib={:.1}",
             engine.label(),
@@ -1033,20 +1030,20 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
             as_mib(index.cache_resident_bytes),
         );
     }
-    if let Some(occupancy) = handle.priority_occupancy() {
+    if let Some(occupancy) = handle.extent_occupancy() {
         println!(
-            "engine={} phase=extent_priority usable_segments={} high_segments={} high_floor={} high_borrowed={} high_mib={:.1} normal_segments={} normal_floor={} normal_borrowed={} normal_mib={:.1} low_segments={} low_mib={:.1}",
+            "engine={} phase=extent_priority usable_extents={} high_extents={} high_floor={} high_borrowed={} high_mib={:.1} normal_extents={} normal_floor={} normal_borrowed={} normal_mib={:.1} low_extents={} low_mib={:.1}",
             engine.label(),
-            occupancy.usable_segments(),
-            occupancy.occupied_segments(CachePriority::High),
-            occupancy.capacity_floor_segments(CachePriority::High),
-            occupancy.borrowed_segments(CachePriority::High),
+            occupancy.usable_extents(),
+            occupancy.occupied_extents(CachePriority::High),
+            occupancy.capacity_floor_extents(CachePriority::High),
+            occupancy.borrowed_extents(CachePriority::High),
             as_mib(occupancy.used_bytes(CachePriority::High)),
-            occupancy.occupied_segments(CachePriority::Normal),
-            occupancy.capacity_floor_segments(CachePriority::Normal),
-            occupancy.borrowed_segments(CachePriority::Normal),
+            occupancy.occupied_extents(CachePriority::Normal),
+            occupancy.capacity_floor_extents(CachePriority::Normal),
+            occupancy.borrowed_extents(CachePriority::Normal),
             as_mib(occupancy.used_bytes(CachePriority::Normal)),
-            occupancy.occupied_segments(CachePriority::Low),
+            occupancy.occupied_extents(CachePriority::Low),
             as_mib(occupancy.used_bytes(CachePriority::Low)),
         );
     }
@@ -1113,7 +1110,7 @@ fn print_extent_read_stats(engine: DiskEngine, handle: &Option<ExtentEngineHandl
             as_mib(read.data_bytes),
         );
     }
-    if let Some(index) = handle.index_read_stats() {
+    if let Some(index) = handle.entry_index_read_stats() {
         println!(
             "engine={} phase=extent_index_read cache_hits={} cache_misses={} read_ops={} read_mib={:.1} filter_checks={} filter_positives={} false_positives={} data_reads={}",
             engine.label(),

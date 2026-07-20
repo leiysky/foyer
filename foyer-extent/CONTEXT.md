@@ -1,121 +1,147 @@
 # Extent
 
-Extent is a standalone non-authoritative blob cache for local SSDs. This language separates its
-logical cache contract from its physical allocation model.
+Extent is a standalone, non-authoritative blob cache for local SSDs. Its language keeps the public
+cache contract, Foyer integration, logical disk store, and physical extent pool distinct.
 
 ## Language
 
-**Extent**:
-The proper name of this project. It is not the name of a logical value, physical allocation, or
-storage unit.
-_Avoid_: Extent key, cache extent, allocation extent
+### Public cache contract
 
-**Extent cache**:
-The public hybrid cache formed by configuring Foyer's shared hybrid-cache layer with ExtentEngine
-as its disk engine, exposed behind one best-effort Entry API.
-_Avoid_: SegmentEngine, disk store, ScopeDB cache adapter
+**Extent**:
+The proper name of this project, derived from its cache-extent storage model. Use **cache extent**,
+not bare “extent”, for one physical reclaim unit.
+_Avoid_: Extent key, Extent entry, Extent value
+
+**Cache** (`Cache`):
+The public hybrid facade combining Foyer's memory tier and ExtentEngine's disk tier behind the
+best-effort Entry API.
+_Avoid_: Store, engine, disk cache
 
 **Blob cache**:
-A non-authoritative cache with a key-value-shaped interface that maps opaque blob keys to cache
-entries. An entry may be absent or evicted, but a returned hit must match its key exactly.
-_Avoid_: KV store, range store, extent store
+A non-authoritative cache with a key-value-shaped interface for opaque byte values. The source of
+truth remains outside Extent, and a miss or shed operation falls back to that source.
+_Avoid_: KV database, range store, object store
 
-**Blob key**:
-The complete, non-empty, bounded variable-length opaque byte identity under which one cache blob
-is stored and looked up. Equality is exact byte equality.
-_Avoid_: Object range, range key, extent key, digest key
+**Entry** (`Entry`):
+The core logical cache object: one entry key, one blob value, and one cache priority. Its key alone
+defines identity, and successful `get` returns the complete Entry through cheap shared byte handles.
+_Avoid_: Blob, index record, owner record
 
-**Cache blob**:
-The immutable, bounded variable-length byte value carried by a cache entry.
-_Avoid_: Cache extent, cache chunk, mutable buffer
+**Entry key** (`EntryKey` internally):
+The complete, non-empty, bounded variable-length opaque byte identity of one Entry.
+_Avoid_: Blob key, range key, extent key, digest key
 
-**Cache entry**:
-The core logical cache object combining one complete blob key, one cache blob, and its cache
-priority. A hit returns the complete entry as independently owned shared immutable buffers whose
-handles can be cloned without copying key or blob bytes. It is not a physical index, owner, or
-allocation record. Its key alone defines identity; a later accepted entry with the same key
-publishes blob and priority through one index location. The best-effort API does not promise which
-complete version a concurrent read observes.
-_Avoid_: Index entry, owner entry, disk entry
+**Blob**:
+The immutable, non-empty, bounded variable-length byte value carried by an Entry. “Blob” names only
+the value, never the key-plus-value object or a physical allocation.
+_Avoid_: Entry, stored entry, cache extent
 
-**Allocation slot**:
-The fixed-size physical allocation quantum used to store a cache blob; one cache blob may occupy
-multiple contiguous slots.
-_Avoid_: Extent, chunk
+**Stored entry**:
+The complete encoded representation of one Entry in the disk tier, including its exact key so a
+digest collision can never produce a wrong hit.
+_Avoid_: Blob, index record, extent
 
-**Cache segment**:
-A fixed-size, physically contiguous group of allocation slots that shares one reuse generation and
-is reclaimed as a unit. A cache blob is wholly contained in one cache segment, while one segment
-may contain many blobs.
-_Avoid_: Cache blob, object range, shard
-
-**SegmentEngine**:
-The internal disk tier that indexes, places, recovers, and reclaims cache entries in cache
-segments. It is not the public hybrid-cache API.
-_Avoid_: Extent cache, memory cache, public engine
+### Foyer integration
 
 **Foyer disk engine**:
-Foyer's pluggable disk-tier contract beneath HybridCache. BlockEngine and ExtentEngine are peer
-implementations that may use different physical I/O infrastructure.
-_Avoid_: Device, I/O backend, hybrid cache
+Foyer's pluggable disk-tier contract beneath `HybridCache`; BlockEngine and ExtentEngine are peer
+implementations.
+_Avoid_: Cache, store, device, I/O backend
 
-**ExtentEngine**:
-The Foyer disk-engine integration backed by SegmentEngine and FixedRecordLSM. It replaces Foyer's
-BlockEngine, not Foyer's memory cache or hybrid-cache coordination. Its bounded flush queue is the
-single disk-engine submission queue required by Foyer's non-blocking `Engine::enqueue` contract;
-it is not a second public writer.
-_Avoid_: Extent cache, Foyer replacement, BlockEngine fork
+**ExtentEngine** (`ExtentEngineConfig`, internal `ExtentEngine`):
+The Foyer disk-engine adapter. It owns Foyer-facing submission, load, delete, wait, close, recovery
+policy, and metrics, and delegates disk state to ExtentStore.
+_Avoid_: Cache, ExtentStore, Foyer replacement
 
-**Foyer engine comparison**:
-An engine-level experiment in which BlockEngine and ExtentEngine are installed beneath the same
-Foyer HybridCache type, policy, memory configuration, key/value model, workload, and concurrency.
-ScopeDB is not part of this comparison; engine-specific physical I/O configuration is reported as
-an explicit variable.
-_Avoid_: ScopeDB benchmark, end-to-end query benchmark, facade comparison
+**ExtentEngineHandle**:
+A read-only runtime observation surface for an attached ExtentEngine. It does not acknowledge
+best-effort puts or provide a second control plane.
+_Avoid_: Store handle, admin API, write receipt
+
+### Logical disk store
+
+**ExtentStore**:
+The internal disk-side key-to-Entry core. It owns ordered publication, EntryIndex coordination,
+checkpoint frontiers, and reclaim orchestration over one ExtentPool.
+_Avoid_: Engine, Cache, ExtentPool
+
+**EntryIndex**:
+The internal mapping from an entry-key digest to one EntryLocation. It must verify the complete key
+from the Stored Entry before returning a hit.
+_Avoid_: Public KV interface, blob-key map, payload store
+
+**Reclaimer**:
+The ExtentStore component that resolves allocation pressure by choosing a cache extent, fencing
+generation reuse, evicting entries, and optionally promoting a bounded hot subset.
+_Avoid_: LSM compactor, generic garbage collector, background eviction service
+
+### Physical storage
+
+**ExtentPool**:
+The bounded physical collection that owns cache extents, allocation slots, payload/owner files, and
+their lifecycle state.
+_Avoid_: ExtentStore, engine, device
+
+**Cache extent**:
+A fixed-size append-oriented group of allocation slots with one active priority and one generation.
+It contains many Stored Entries and is sealed, reclaimed, and reused as one unit.
+_Avoid_: Segment, entry extent, priority partition
+
+**Allocation slot**:
+The fixed-size physical allocation quantum. One Stored Entry may occupy multiple contiguous slots
+inside exactly one cache extent.
+_Avoid_: Block, chunk, extent
+
+**Entry allocation**:
+The contiguous allocation-slot span occupied by one Stored Entry. It is not independently reclaimed.
+_Avoid_: Extent allocation, block chain, reclaim unit
+
+**Entry location** (`EntryLocation`):
+The physical reference to one Stored Entry: first slot, encoded length, checksum, priority, and
+extent generation.
+_Avoid_: Extent location, blob address, index entry
+
+**Slot owner** (`SlotOwner`):
+The fixed record repeated for each occupied allocation slot so reclaim can identify candidate
+entries without rebuilding variable-length metadata.
+_Avoid_: Entry, index record, ownership service
+
+**Extent generation**:
+The reuse epoch of one cache extent. It fences EntryLocations left behind by an older physical
+incarnation.
+_Avoid_: Service generation, cache incarnation, entry version
+
+### Policy and durability
 
 **Cache priority**:
-A caller-assigned protection class expressing a cache blob's relative business importance.
+A caller-assigned protection class expressing an Entry's relative business importance.
 _Avoid_: Temperature, hotness
 
 **Cache temperature**:
-A runtime estimate of a cache blob's observed reuse, independent of its cache priority.
+A volatile estimate of observed Entry reuse, independent of cache priority.
 _Avoid_: Priority
 
 **Priority capacity floor**:
-The minimum cache-segment capacity protected for one cache priority while unused capacity remains
-borrowable by more active priorities. It is a lower bound, not a physical partition or upper quota.
+The minimum cache-extent capacity protected for one priority while unused capacity remains
+borrowable by more active priorities.
 _Avoid_: Priority partition, pinned capacity, priority limit
 
 **Admission**:
-The internal classification of how Extent handled an offered cache entry. Queue pressure and
-engine work may be observed in aggregate, but admission is never returned as a per-put result.
-_Avoid_: Public put result, inserted, updated, write error
+The internal classification of how Extent handled an offered Entry. It is never returned as a
+per-put result.
+_Avoid_: Public put result, committed write, write receipt
 
 **Publication**:
-The internal point at which one complete cache entry becomes visible to later cache reads. It is
-not a foreground acknowledgement or a promise that the entry belongs to the recovery frontier.
+The internal point at which one complete Entry becomes visible to later reads. It is not a
+foreground acknowledgement or durability promise.
 _Avoid_: Commit, durable put, successful write
 
 **Recovery frontier**:
 The newest internally published cache state that Extent can reconstruct after process or machine
-failure. It may lag publication because recent best-effort cache mutations are disposable; the
-mutation threshold and periodic checkpoint request bound that lag during a healthy engine lifetime.
+failure.
 _Avoid_: Transaction commit, consistency point
 
-**Segment index**:
-The internal mapping from a blob-key digest to one physical cache-segment location. It is not the
-public blob cache and must never turn a digest collision into a wrong cache hit.
-_Avoid_: KV store, public index, blob-key map
-
-**Reclaimer**:
-The internal SegmentEngine component that resolves allocation pressure by selecting a cache
-segment, fencing its generation reuse against the recovery frontier, evicting entries, and
-optionally promoting a bounded hot subset. It is not a background compactor or a selectable
-eviction policy.
-_Avoid_: LSM compactor, garbage collector, eviction backend
-
 **Best-effort cache operation**:
-An operation that preserves entry integrity but may shed work, expose an older complete entry, or
-have no lasting effect. Foreground put never waits for admission, queue capacity, I/O, or
-checkpoint completion. It is not a durability, invalidation, or total-order consistency boundary.
-_Avoid_: Transaction, committed write, invalidation barrier
+An operation that preserves Entry integrity but may shed work, expose an older complete Entry, or
+have no lasting effect.
+_Avoid_: Transaction, acknowledged mutation, invalidation barrier

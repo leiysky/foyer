@@ -13,7 +13,7 @@ pub enum Error {
     InvalidSuperblock(String),
     Index(String),
     CheckpointFailed(String),
-    ValueTooLarge {
+    StoredEntryTooLarge {
         len: usize,
         maximum: usize,
     },
@@ -41,24 +41,24 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptyKey => f.write_str("blob key must not be empty"),
+            Self::EmptyKey => f.write_str("entry key must not be empty"),
             Self::KeyTooLarge { len, maximum } => {
-                write!(f, "blob key is too large: len={len}, maximum={maximum}")
+                write!(f, "entry key is too large: len={len}, maximum={maximum}")
             }
-            Self::InvalidConfig(message) => write!(f, "invalid extent engine config: {message}"),
+            Self::InvalidConfig(message) => write!(f, "invalid Extent config: {message}"),
             Self::InvalidSuperblock(message) => {
-                write!(f, "invalid extent engine superblock: {message}")
+                write!(f, "invalid ExtentStore superblock: {message}")
             }
-            Self::Index(message) => write!(f, "extent index error: {message}"),
+            Self::Index(message) => write!(f, "EntryIndex error: {message}"),
             Self::CheckpointFailed(message) => {
-                write!(f, "extent engine checkpoint failed: {message}")
+                write!(f, "ExtentStore checkpoint failed: {message}")
             }
-            Self::ValueTooLarge { len, maximum } => {
-                write!(f, "cache blob is too large: len={len}, maximum={maximum}")
+            Self::StoredEntryTooLarge { len, maximum } => {
+                write!(f, "stored entry is too large: len={len}, maximum={maximum}")
             }
-            Self::EmptyValue => f.write_str("cache blob must not be empty"),
+            Self::EmptyValue => f.write_str("entry value must not be empty"),
             Self::Io { context, source } => {
-                write!(f, "extent engine I/O error ({context}): {source}")
+                write!(f, "Extent I/O error ({context}): {source}")
             }
             Self::Foyer { context, source } => {
                 write!(f, "extent cache error ({context}): {source}")
@@ -78,7 +78,7 @@ impl std::error::Error for Error {
             | Self::InvalidSuperblock(_)
             | Self::Index(_)
             | Self::CheckpointFailed(_)
-            | Self::ValueTooLarge { .. }
+            | Self::StoredEntryTooLarge { .. }
             | Self::EmptyValue => None,
         }
     }

@@ -13,8 +13,10 @@ date: 2023-05-12T11:02:09+08:00
 
 ### Changes
 
-- Add the vendored `foyer-extent` segment-based SSD engine and its specialized
+- Add the vendored `foyer-extent` cache-extent-based SSD engine and its specialized
   `foyer-fixed-lsm` durable index as separate workspace packages.
+- Reserve `Engine` for Foyer's SPI, name the disk core `ExtentStore`, the physical owner
+  `ExtentPool`, and the append/seal/reclaim unit a cache extent without changing the V3 format.
 - Pass complete owned keys through Foyer's disk-engine load/delete boundary so engines with an
   exact key index do not have to use Foyer's routing hash as identity.
 - Decouple the generic disk-engine contract from `Device` and `IoEngine`; engines now report
@@ -25,10 +27,10 @@ date: 2023-05-12T11:02:09+08:00
 - Align Extent's default queue and batch sizes with the validated 256 MiB / 128 MiB configuration
   and expose asynchronous write and checkpoint-frontier snapshots through `ExtentEngineHandle`.
 - Give Extent high and normal data borrowable priority-capacity floors, prevent either class from
-  starving the other's protected working set, and expose per-priority segment occupancy.
+  starving the other's protected working set, and expose per-priority extent occupancy.
 - Add formal async-write, queue, checkpoint, and health metrics; contain injected no-space,
   short-write, sync, and worker-panic failures behind a sticky circuit breaker.
-- Freeze and reopen a complete V3 SegmentEngine image in CI, add a compile-time fork engine-API
+- Freeze and reopen a complete V3 ExtentStore image in CI, add a compile-time fork engine-API
   version guard, and make Extent storage-usage snapshots O(1).
 - Raise the fork MSRV from Rust 1.85 to Rust 1.91.
 

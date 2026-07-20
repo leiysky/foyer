@@ -20,11 +20,11 @@ use futures_core::future::BoxFuture;
 use tokio::sync::Notify;
 
 use crate::{
-    CheckpointStats, EngineValue, Error, IndexReadStats, IndexStats, IoSchedulerStats, MAX_BLOB_KEY_SIZE,
-    PhysicalWriteStats, PriorityOccupancy, ReclaimStats,
-    format::BLOB_HEADER_SIZE,
-    model::BlobKey,
-    segment::{SegmentEngine, SegmentEngineConfig},
+    CheckpointStats, EngineValue, EntryIndexReadStats, EntryIndexStats, Error, ExtentOccupancy, IoSchedulerStats,
+    MAX_KEY_SIZE, PhysicalWriteStats, ReclaimStats,
+    format::STORED_ENTRY_HEADER_SIZE,
+    model::EntryKey,
+    store::{ExtentStore, ExtentStoreConfig},
 };
 
 mod queue;
@@ -37,9 +37,9 @@ pub use self::stats::{EngineReadStats, EngineWriteStats};
 use self::{
     queue::{QueueReservation, SubmissionQueue},
     read::ReadLimiter,
-    recovery::{RecoveryOutcome, open_segment},
+    recovery::{RecoveryOutcome, open_store},
     stats::EngineStats,
-    writer::{BackgroundError, Command, WriteWorker, sync_segment},
+    writer::{BackgroundError, Command, WriteWorker, sync_store},
 };
 
 const DEFAULT_QUEUE_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
@@ -55,13 +55,13 @@ type ExtentPiece = PieceRef<Bytes, EngineValue, HybridCacheProperties>;
 
 /// Configuration for installing Extent as a Foyer disk engine.
 ///
-/// Capacity is the only production static input. The format owns its slot and segment sizes and
+/// Capacity is the only production static input. The format owns its slot and extent sizes and
 /// validates the effective layout when reopening. Queue, batching, I/O, checkpoint, frequency, and
 /// index-cache settings are runtime tuning knobs and may change across reopens.
 #[derive(Debug)]
 pub struct ExtentEngineConfig {
     path: PathBuf,
-    segment: SegmentEngineConfig,
+    store: ExtentStoreConfig,
     queue_capacity_bytes: usize,
     queue_capacity_entries: usize,
     write_batch_bytes: usize,
@@ -74,11 +74,11 @@ pub struct ExtentEngineConfig {
 }
 
 impl ExtentEngineConfig {
-    /// Create an Extent disk-engine configuration with balanced static defaults.
+    /// Create an ExtentEngine configuration with balanced static defaults.
     pub fn new(path: impl Into<PathBuf>, capacity_bytes: u64) -> Self {
         Self {
             path: path.into(),
-            segment: SegmentEngineConfig::new(capacity_bytes),
+            store: ExtentStoreConfig::new(capacity_bytes),
             queue_capacity_bytes: DEFAULT_QUEUE_CAPACITY_BYTES,
             queue_capacity_entries: DEFAULT_QUEUE_CAPACITY_ENTRIES,
             write_batch_bytes: DEFAULT_WRITE_BATCH_BYTES,
@@ -96,51 +96,51 @@ impl ExtentEngineConfig {
     ///
     /// Production integrations must use the balanced layout selected by [`Self::new`].
     #[doc(hidden)]
-    pub fn with_test_layout(mut self, slot_size: usize, segment_size: usize) -> Self {
-        self.segment.slot_size = slot_size;
-        self.segment.options.segment_size = segment_size;
+    pub fn with_test_layout(mut self, slot_size: usize, extent_size: usize) -> Self {
+        self.store.slot_size = slot_size;
+        self.store.options.extent_size = extent_size;
         self
     }
 
     /// Set the number of concurrent data-file write runs.
     pub fn with_write_concurrency(mut self, concurrency: usize) -> Self {
-        self.segment.options.write_concurrency = concurrency;
+        self.store.options.write_concurrency = concurrency;
         self
     }
 
     /// Set how long physical writes yield to continuously active payload reads.
     pub fn with_io_read_priority_duration(mut self, duration: Duration) -> Self {
-        self.segment.options.io_read_priority_duration = duration;
+        self.store.options.io_read_priority_duration = duration;
         self
     }
 
     /// Bound one coalesced data read.
     pub fn with_read_run_size(mut self, bytes: usize) -> Self {
-        self.segment.options.read_run_size = bytes;
+        self.store.options.read_run_size = bytes;
         self
     }
 
     /// Bound one coalesced data write.
     pub fn with_write_run_size(mut self, bytes: usize) -> Self {
-        self.segment.options.write_run_size = bytes;
+        self.store.options.write_run_size = bytes;
         self
     }
 
     /// Set the FixedRecordLSM mutable write-buffer budget.
     pub fn with_index_write_buffer_size(mut self, bytes: usize) -> Self {
-        self.segment.options.index_write_buffer_size = bytes;
+        self.store.options.index_write_buffer_size = bytes;
         self
     }
 
     /// Set the FixedRecordLSM index page-cache budget.
     pub fn with_index_cache_size(mut self, bytes: usize) -> Self {
-        self.segment.options.index_cache_size = bytes;
+        self.store.options.index_cache_size = bytes;
         self
     }
 
     /// Set the number of index mutations between background checkpoint requests.
     pub fn with_checkpoint_changes(mut self, changes: usize) -> Self {
-        self.segment.options.checkpoint_changes = changes;
+        self.store.options.checkpoint_changes = changes;
         self
     }
 
@@ -152,29 +152,29 @@ impl ExtentEngineConfig {
 
     /// Set the reuse frequency required to promote normal/high-priority entries.
     pub fn with_hot_frequency(mut self, frequency: u8) -> Self {
-        self.segment.options.hot_frequency = frequency;
+        self.store.options.hot_frequency = frequency;
         self
     }
 
     /// Set the reuse frequency required to promote low-priority entries.
     pub fn with_low_hot_frequency(mut self, frequency: u8) -> Self {
-        self.segment.options.low_hot_frequency = frequency;
+        self.store.options.low_hot_frequency = frequency;
         self
     }
 
-    /// Set the minimum usable-segment percentages protected for high and normal priority data.
+    /// Set the minimum usable-extent percentages protected for high and normal priority data.
     ///
-    /// The percentages may sum to at most 100 and are rounded up to whole segments. Unoccupied
+    /// The percentages may sum to at most 100 and are rounded up to whole extents. Unoccupied
     /// protection remains shared capacity; low-priority data has no protected floor.
     pub fn with_priority_capacity_floors(mut self, high_percent: u8, normal_percent: u8) -> Self {
-        self.segment.options.priority_capacity_floors =
-            crate::segment::PriorityCapacityFloors::new(high_percent, normal_percent);
+        self.store.options.priority_capacity_floors =
+            crate::store::PriorityCapacityFloors::new(high_percent, normal_percent);
         self
     }
 
     /// Select direct data-file I/O on supported Linux filesystems.
     pub fn with_direct_io(mut self, direct_io: bool) -> Self {
-        self.segment.options.direct_io = direct_io;
+        self.store.options.direct_io = direct_io;
         self
     }
 
@@ -283,35 +283,35 @@ impl ExtentEngineHandle {
     }
 
     pub fn file_size(&self) -> Option<u64> {
-        self.upgrade().map(|inner| inner.segment.file_size())
+        self.upgrade().map(|inner| inner.store.file_size())
     }
 
     pub fn allocated_size(&self) -> Option<u64> {
-        self.upgrade()?.segment.allocated_size().ok()
+        self.upgrade()?.store.allocated_size().ok()
     }
 
     pub fn physical_write_stats(&self) -> Option<PhysicalWriteStats> {
-        self.upgrade().map(|inner| inner.segment.physical_write_stats())
+        self.upgrade().map(|inner| inner.store.physical_write_stats())
     }
 
     pub fn io_scheduler_stats(&self) -> Option<IoSchedulerStats> {
-        self.upgrade().map(|inner| inner.segment.io_scheduler_stats())
+        self.upgrade().map(|inner| inner.store.io_scheduler_stats())
     }
 
-    pub fn index_stats(&self) -> Option<IndexStats> {
-        self.upgrade().map(|inner| inner.segment.index_stats())
+    pub fn entry_index_stats(&self) -> Option<EntryIndexStats> {
+        self.upgrade().map(|inner| inner.store.entry_index_stats())
     }
 
-    pub fn index_read_stats(&self) -> Option<IndexReadStats> {
-        self.upgrade().map(|inner| inner.segment.index_read_stats())
+    pub fn entry_index_read_stats(&self) -> Option<EntryIndexReadStats> {
+        self.upgrade().map(|inner| inner.store.entry_index_read_stats())
     }
 
     pub fn reclaim_stats(&self) -> Option<ReclaimStats> {
         self.upgrade().map(|inner| inner.stats.reclaim())
     }
 
-    pub fn priority_occupancy(&self) -> Option<PriorityOccupancy> {
-        self.upgrade().map(|inner| inner.segment.priority_occupancy())
+    pub fn extent_occupancy(&self) -> Option<ExtentOccupancy> {
+        self.upgrade().map(|inner| inner.store.extent_occupancy())
     }
 
     pub fn read_stats(&self) -> Option<EngineReadStats> {
@@ -323,7 +323,7 @@ impl ExtentEngineHandle {
     }
 
     pub fn checkpoint_stats(&self) -> Option<CheckpointStats> {
-        self.upgrade().map(|inner| inner.segment.checkpoint_stats())
+        self.upgrade().map(|inner| inner.store.checkpoint_stats())
     }
 
     pub fn background_error(&self) -> Option<String> {
@@ -359,17 +359,17 @@ impl ExtentEngineHandle {
     }
 
     #[cfg(test)]
-    fn inject_segment_fault(&self, fault: crate::segment::InjectedFault) {
+    fn inject_store_fault(&self, fault: crate::store::InjectedFault) {
         self.upgrade()
-            .expect("Extent engine handle must be attached")
-            .segment
+            .expect("ExtentEngine handle must be attached")
+            .store
             .inject_fault(fault);
     }
 
     #[cfg(test)]
     fn panic_next_write(&self) {
         self.upgrade()
-            .expect("Extent engine handle must be attached")
+            .expect("ExtentEngine handle must be attached")
             .panic_next
             .store(true, Ordering::Release);
     }
@@ -382,19 +382,19 @@ impl EngineConfig<Bytes, EngineValue, HybridCacheProperties> for ExtentEngineCon
     ) -> BoxFuture<'static, foyer::Result<Arc<dyn Engine<Bytes, EngineValue, HybridCacheProperties>>>> {
         Box::pin(async move {
             self.validate()?;
-            let capacity = usize::try_from(self.segment.capacity_bytes)
+            let capacity = usize::try_from(self.store.capacity_bytes)
                 .map_err(|_| config_error("extent capacity does not fit usize"))?;
             let io_control = IoControl::new(self.throttle.clone());
             let path = self.path.clone();
             let recovery_path = path.clone();
-            let segment_config = self.segment;
+            let store_config = self.store;
             let recover_mode = ctx.recover_mode;
             let recovery_started = Instant::now();
             let open = ctx
                 .spawner
-                .spawn_blocking(move || open_segment(&recovery_path, segment_config, recover_mode))
+                .spawn_blocking(move || open_store(&recovery_path, store_config, recover_mode))
                 .await?;
-            let open = open.map_err(|error| extent_error("open Extent engine", error))?;
+            let open = open.map_err(|error| extent_error("open ExtentEngine", error))?;
             ctx.metrics
                 .storage_engine_recovery_duration
                 .record(recovery_started.elapsed().as_secs_f64());
@@ -406,9 +406,9 @@ impl EngineConfig<Bytes, EngineValue, HybridCacheProperties> for ExtentEngineCon
                     tracing::warn!(path = %path.display(), %reason, "recreated Extent cache after recovery failure");
                 }
             }
-            let segment = Arc::new(open.engine);
+            let store = Arc::new(open.store);
             let handle = self.handle.clone();
-            let engine = ExtentEngine::start(segment, *self, capacity, io_control, ctx.spawner, ctx.metrics)?;
+            let engine = ExtentEngine::start(store, *self, capacity, io_control, ctx.spawner, ctx.metrics)?;
             handle.attach(&engine.inner);
             Ok(Arc::new(engine) as Arc<dyn Engine<Bytes, EngineValue, HybridCacheProperties>>)
         })
@@ -433,9 +433,9 @@ impl fmt::Debug for ExtentEngine {
 
 struct Inner {
     path: PathBuf,
-    segment: Arc<SegmentEngine>,
+    store: Arc<ExtentStore>,
     capacity: usize,
-    segment_size: usize,
+    extent_size: usize,
     sender: Mutex<Option<SyncSender<Command>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     queue: Arc<SubmissionQueue>,
@@ -454,7 +454,7 @@ struct Inner {
 
 impl ExtentEngine {
     fn start(
-        segment: Arc<SegmentEngine>,
+        store: Arc<ExtentStore>,
         config: ExtentEngineConfig,
         capacity: usize,
         io_control: IoControl,
@@ -470,15 +470,15 @@ impl ExtentEngine {
         let background_error = Arc::new(BackgroundError::new(metrics.clone()));
         metrics.storage_engine_healthy.absolute(1);
         let stats = Arc::new(EngineStats::new(metrics.clone()));
-        stats.record_remaining_index_reads(io_control.statistics(), segment.index_read_stats());
-        stats.record_priority_occupancy(segment.priority_occupancy());
+        stats.record_remaining_index_reads(io_control.statistics(), store.entry_index_read_stats());
+        stats.record_extent_occupancy(store.extent_occupancy());
         let read_limiter = ReadLimiter::new(config.read_concurrency, metrics.clone());
         let shutdown = Arc::new(AtomicBool::new(false));
-        stats.record_checkpoint(segment.checkpoint_stats());
+        stats.record_checkpoint(store.checkpoint_stats());
         #[cfg(test)]
         let panic_next = Arc::new(AtomicBool::new(false));
         let worker = WriteWorker::new(
-            segment.clone(),
+            store.clone(),
             io_control.statistics().clone(),
             config.write_batch_entries,
             config.write_batch_bytes,
@@ -498,8 +498,8 @@ impl ExtentEngine {
             inner: Arc::new(Inner {
                 path: config.path,
                 capacity,
-                segment_size: config.segment.options.segment_size,
-                segment,
+                extent_size: config.store.options.extent_size,
+                store,
                 sender: Mutex::new(Some(sender)),
                 worker: Mutex::new(Some(worker)),
                 queue,
@@ -523,7 +523,7 @@ impl Engine<Bytes, EngineValue, HybridCacheProperties> for ExtentEngine {
     fn storage_usage(&self) -> StorageUsage {
         let allocated = self
             .inner
-            .segment
+            .store
             .allocated_size()
             .ok()
             .and_then(|bytes| usize::try_from(bytes).ok())
@@ -557,12 +557,12 @@ impl Engine<Bytes, EngineValue, HybridCacheProperties> for ExtentEngine {
         let key = piece.key();
         let value = piece.value().value();
         if key.is_empty()
-            || key.len() > MAX_BLOB_KEY_SIZE
+            || key.len() > MAX_KEY_SIZE
             || value.is_empty()
-            || BLOB_HEADER_SIZE
+            || STORED_ENTRY_HEADER_SIZE
                 .checked_add(key.len())
                 .and_then(|size| size.checked_add(value.len()))
-                .is_none_or(|size| size > self.inner.segment_size || u32::try_from(size).is_err())
+                .is_none_or(|size| size > self.inner.extent_size || u32::try_from(size).is_err())
         {
             self.inner.stats.record_dropped_command();
             return;
@@ -582,31 +582,31 @@ impl Engine<Bytes, EngineValue, HybridCacheProperties> for ExtentEngine {
             if inner.close_state.load(Ordering::Acquire) != OPEN {
                 return Err(FoyerError::new(
                     FoyerErrorKind::Closed,
-                    "load from a closed Extent engine",
+                    "load from a closed ExtentEngine",
                 ));
             }
             let delay = inner.io_control.statistics().read_throttle();
             if delay != Duration::ZERO {
                 return Ok(Load::Throttled);
             }
-            let blob_key = match BlobKey::new(&key) {
+            let entry_key = match EntryKey::new(&key) {
                 Ok(key) => key,
                 Err(_) => return Ok(Load::Miss),
             };
             let Some(read_permit) = inner.read_limiter.try_acquire() else {
                 return Ok(Load::Throttled);
             };
-            let segment = inner.segment.clone();
+            let store = inner.store.clone();
             let loaded = inner
                 .spawner
                 .spawn_blocking(move || {
                     let _read_permit = read_permit;
-                    segment.get_with_stats(&blob_key)
+                    store.get_with_stats(&entry_key)
                 })
                 .await;
             inner
                 .stats
-                .record_remaining_index_reads(inner.io_control.statistics(), inner.segment.index_read_stats());
+                .record_remaining_index_reads(inner.io_control.statistics(), inner.store.entry_index_read_stats());
             let loaded = loaded?.map_err(|error| extent_error("load Extent entry", error))?;
             inner
                 .stats
@@ -629,7 +629,7 @@ impl Engine<Bytes, EngineValue, HybridCacheProperties> for ExtentEngine {
     }
 
     fn delete(&self, key: Bytes, _hash: u64) {
-        if key.is_empty() || key.len() > MAX_BLOB_KEY_SIZE {
+        if key.is_empty() || key.len() > MAX_KEY_SIZE {
             return;
         }
         let charge = key.len();
@@ -658,23 +658,23 @@ impl Engine<Bytes, EngineValue, HybridCacheProperties> for ExtentEngine {
         let inner = self.inner.clone();
         Box::pin(async move {
             inner.queue.wait().await;
-            let segment = inner.segment.clone();
+            let store = inner.store.clone();
             let statistics = inner.io_control.statistics().clone();
             let stats = inner.stats.clone();
             match inner
                 .spawner
-                .spawn_blocking(move || sync_segment(&segment, statistics.as_ref(), &stats))
+                .spawn_blocking(move || sync_store(&store, statistics.as_ref(), &stats))
                 .await
             {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    inner.background_error.record(format!("sync Extent engine: {error}"));
+                    inner.background_error.record(format!("sync ExtentEngine: {error}"));
                 }
                 Err(error) => {
                     inner.background_error.record(format!("join Extent sync task: {error}"));
                 }
             }
-            inner.stats.record_checkpoint(inner.segment.checkpoint_stats());
+            inner.stats.record_checkpoint(inner.store.checkpoint_stats());
         })
     }
 
@@ -762,7 +762,7 @@ impl Inner {
                 self.metrics
                     .storage_engine_shutdown_duration
                     .record(started.elapsed().as_secs_f64());
-                self.stats.record_checkpoint(self.segment.checkpoint_stats());
+                self.stats.record_checkpoint(self.store.checkpoint_stats());
                 self.close_notify.notify_waiters();
             }
             Err(CLOSING) => {
@@ -809,7 +809,7 @@ mod tests {
     use foyer::{HybridCache, HybridCachePolicy, RecoverMode};
 
     use super::*;
-    use crate::segment::InjectedFault;
+    use crate::store::InjectedFault;
 
     type TestCache = HybridCache<Bytes, EngineValue>;
 
@@ -847,7 +847,7 @@ mod tests {
     async fn assert_insert_fault(fault: InjectedFault, expected: &str) {
         let directory = tempfile::tempdir().unwrap();
         let (cache, handle) = cache(directory.path()).await;
-        handle.inject_segment_fault(fault);
+        handle.inject_store_fault(fault);
         insert(&cache, 1);
         cache.storage().wait().await;
         let error = cache.close().await.unwrap_err().to_string();
@@ -871,7 +871,7 @@ mod tests {
     async fn sync_failure_is_reported_by_wait_and_close() {
         let directory = tempfile::tempdir().unwrap();
         let (cache, handle) = cache(directory.path()).await;
-        handle.inject_segment_fault(InjectedFault::Sync);
+        handle.inject_store_fault(InjectedFault::Sync);
         insert(&cache, 1);
         cache.storage().wait().await;
         let error = cache.close().await.unwrap_err().to_string();
@@ -908,7 +908,7 @@ mod tests {
             .with_write_batch_bytes(8 * 1024)
             .with_write_batch_entries(1)
             .with_throttle(Throttle::new().with_write_throughput(1));
-        let segment_config = config.segment;
+        let store_config = config.store;
         let handle = config.handle();
         let cache = HybridCache::builder()
             .with_name("extent-bounded-close")
@@ -939,11 +939,11 @@ mod tests {
         assert_eq!(handle.queue_pending_entries(), Some(0));
         drop(cache);
 
-        let reopened = open_segment(directory.path(), segment_config, RecoverMode::Strict).unwrap();
+        let reopened = open_store(directory.path(), store_config, RecoverMode::Strict).unwrap();
         let mut hits = 0;
         for suffix in 0..128u8 {
-            let key = BlobKey::new([b'k', suffix]).unwrap();
-            if let Some(value) = reopened.engine.get(&key).unwrap() {
+            let key = EntryKey::new([b'k', suffix]).unwrap();
+            if let Some(value) = reopened.store.get(&key).unwrap() {
                 assert_eq!(value, vec![suffix; 4096]);
                 hits += 1;
             }

@@ -12,15 +12,15 @@ use std::{
 
 use crate::{
     error::{Error, Result},
-    segment::{
-        index::{IndexCheckpoint, SegmentIndex},
-        store::{AllocatorCheckpoint, SegmentStore},
+    store::{
+        index::{EntryIndex, IndexCheckpoint},
+        pool::{ExtentPool, ExtentPoolCheckpoint},
     },
 };
 
 /// Coordinates one total publication order with an independently advancing durability frontier.
 ///
-/// The engine mutation mutex is held only while an immutable allocator/index epoch is detached.
+/// The store mutation mutex is held only while an immutable allocator/index epoch is detached.
 /// Payload synchronization and metadata persistence happen after that mutex is released. Reclaim
 /// uses `checkpoint_inline_locked` before generation reuse, so it cannot overlap durable metadata
 /// I/O or invalidate locations referenced by an in-flight epoch.
@@ -30,8 +30,8 @@ pub struct CheckpointCoordinator {
 }
 
 struct CheckpointShared {
-    index: Arc<SegmentIndex>,
-    store: Arc<SegmentStore>,
+    index: Arc<EntryIndex>,
+    pool: Arc<ExtentPool>,
     mutations: Arc<Mutex<()>>,
     dirty_changes: Arc<AtomicUsize>,
     published_epoch: AtomicU64,
@@ -69,7 +69,7 @@ struct CheckpointState {
 
 struct CheckpointEpoch {
     epoch: u64,
-    allocator: AllocatorCheckpoint,
+    allocator: ExtentPoolCheckpoint,
     index: Option<IndexCheckpoint>,
 }
 
@@ -82,14 +82,14 @@ struct CheckpointTestState {
 
 impl CheckpointCoordinator {
     pub fn new(
-        index: Arc<SegmentIndex>,
-        store: Arc<SegmentStore>,
+        index: Arc<EntryIndex>,
+        pool: Arc<ExtentPool>,
         mutations: Arc<Mutex<()>>,
         dirty_changes: Arc<AtomicUsize>,
     ) -> Result<Self> {
         let shared = Arc::new(CheckpointShared {
             index,
-            store,
+            pool,
             mutations,
             dirty_changes,
             published_epoch: AtomicU64::new(0),
@@ -108,14 +108,14 @@ impl CheckpointCoordinator {
         let worker = thread::Builder::new()
             .name("extent-durable".to_string())
             .spawn(move || checkpoint_worker(worker_shared))
-            .map_err(|error| Error::io("spawn segment checkpoint coordinator", error))?;
+            .map_err(|error| Error::io("spawn extent checkpoint coordinator", error))?;
         Ok(Self {
             shared,
             worker: Some(worker),
         })
     }
 
-    /// Records one externally visible logical mutation. The caller holds the engine mutation lock.
+    /// Records one externally visible logical mutation. The caller holds the store mutation lock.
     pub fn record_publication(&self, changes: usize) -> Result<u64> {
         self.ensure_healthy()?;
         if changes == 0 {
@@ -260,7 +260,7 @@ impl Drop for CheckpointCoordinator {
 
 impl CheckpointShared {
     fn prepare_epoch(&self, epoch: u64) -> Result<CheckpointEpoch> {
-        let allocator = self.store.prepare_checkpoint_state()?;
+        let allocator = self.pool.prepare_checkpoint_state()?;
         let index = self.index.prepare_checkpoint()?;
         Ok(CheckpointEpoch {
             epoch,
@@ -270,7 +270,7 @@ impl CheckpointShared {
     }
 
     fn persist_epoch(&self, mut checkpoint: CheckpointEpoch) -> Result<()> {
-        let allocator_result = self.store.persist_checkpoint_state(&checkpoint.allocator);
+        let allocator_result = self.pool.persist_checkpoint_state(&checkpoint.allocator);
         if let Err(error) = allocator_result {
             if let Some(index) = checkpoint.index.take() {
                 self.index.abort_checkpoint(index);
@@ -278,12 +278,12 @@ impl CheckpointShared {
             return Err(error);
         }
         #[cfg(test)]
-        crate::segment::crash_if_requested("segment_after_allocator_state");
+        crate::store::crash_if_requested("extent_after_allocator_state");
         if let Some(index) = checkpoint.index.take() {
             self.index.persist_checkpoint(index)?;
         }
         #[cfg(test)]
-        crate::segment::crash_if_requested("segment_after_index_checkpoint");
+        crate::store::crash_if_requested("extent_after_index_checkpoint");
         debug_assert!(self.published_epoch.load(Ordering::Acquire) >= checkpoint.epoch);
         Ok(())
     }

@@ -4,13 +4,13 @@ use foyer::RecoverMode;
 
 use crate::{
     Error,
-    segment::{SegmentEngine, SegmentEngineConfig, SegmentLayout},
+    store::{ExtentStore, ExtentStoreConfig, StoreLayout},
 };
 
 const STATE_FILE: &str = "state";
 
-pub struct SegmentOpen {
-    pub engine: SegmentEngine,
+pub struct StoreOpen {
+    pub store: ExtentStore,
     pub outcome: RecoveryOutcome,
 }
 
@@ -20,45 +20,45 @@ pub enum RecoveryOutcome {
     Recreated(String),
 }
 
-/// Applies Foyer's recovery policy without leaking it into SegmentEngine.
-pub fn open_segment(path: &Path, config: SegmentEngineConfig, recover_mode: RecoverMode) -> crate::Result<SegmentOpen> {
+/// Applies Foyer's recovery policy without leaking it into ExtentStore.
+pub fn open_store(path: &Path, config: ExtentStoreConfig, recover_mode: RecoverMode) -> crate::Result<StoreOpen> {
     match recover_mode {
-        RecoverMode::None => recreate_segment(path, config).map(|engine| SegmentOpen {
-            engine,
+        RecoverMode::None => recreate_store(path, config).map(|store| StoreOpen {
+            store,
             outcome: RecoveryOutcome::Created,
         }),
         RecoverMode::Quiet => {
             if path.join(STATE_FILE).exists() {
-                match SegmentEngine::open_with_options(path, config.options)
-                    .and_then(|engine| verify_layout(engine, config))
+                match ExtentStore::open_with_options(path, config.options)
+                    .and_then(|store| verify_layout(store, config))
                 {
-                    Ok(engine) => Ok(SegmentOpen {
-                        engine,
+                    Ok(store) => Ok(StoreOpen {
+                        store,
                         outcome: RecoveryOutcome::Recovered,
                     }),
-                    Err(error) => recreate_segment(path, config).map(|engine| SegmentOpen {
-                        engine,
+                    Err(error) => recreate_store(path, config).map(|store| StoreOpen {
+                        store,
                         outcome: RecoveryOutcome::Recreated(error.to_string()),
                     }),
                 }
             } else {
                 let reason = (!directory_is_empty(path)?).then(|| "state file is missing".to_string());
-                recreate_segment(path, config).map(|engine| SegmentOpen {
-                    engine,
+                recreate_store(path, config).map(|store| StoreOpen {
+                    store,
                     outcome: reason.map_or(RecoveryOutcome::Created, RecoveryOutcome::Recreated),
                 })
             }
         }
         RecoverMode::Strict => {
             if path.join(STATE_FILE).exists() {
-                let engine = SegmentEngine::open_with_options(path, config.options)?;
-                verify_layout(engine, config).map(|engine| SegmentOpen {
-                    engine,
+                let store = ExtentStore::open_with_options(path, config.options)?;
+                verify_layout(store, config).map(|store| StoreOpen {
+                    store,
                     outcome: RecoveryOutcome::Recovered,
                 })
             } else if directory_is_empty(path)? {
-                SegmentEngine::create(path, config).map(|engine| SegmentOpen {
-                    engine,
+                ExtentStore::create(path, config).map(|store| StoreOpen {
+                    store,
                     outcome: RecoveryOutcome::Created,
                 })
             } else {
@@ -70,18 +70,18 @@ pub fn open_segment(path: &Path, config: SegmentEngineConfig, recover_mode: Reco
     }
 }
 
-fn recreate_segment(path: &Path, config: SegmentEngineConfig) -> crate::Result<SegmentEngine> {
-    SegmentEngine::recreate(path, config)
+fn recreate_store(path: &Path, config: ExtentStoreConfig) -> crate::Result<ExtentStore> {
+    ExtentStore::recreate(path, config)
 }
 
-fn verify_layout(engine: SegmentEngine, config: SegmentEngineConfig) -> crate::Result<SegmentEngine> {
-    let expected = SegmentLayout::create(config)?;
-    if engine.slot_size() != expected.slot_size || engine.file_size() != expected.total_file_size {
+fn verify_layout(store: ExtentStore, config: ExtentStoreConfig) -> crate::Result<ExtentStore> {
+    let expected = StoreLayout::create(config)?;
+    if store.slot_size() != expected.slot_size || store.file_size() != expected.total_file_size {
         return Err(Error::InvalidSuperblock(
             "recovered Extent layout does not match static configuration".to_string(),
         ));
     }
-    Ok(engine)
+    Ok(store)
 }
 
 fn directory_is_empty(path: &Path) -> crate::Result<bool> {
@@ -95,14 +95,14 @@ fn directory_is_empty(path: &Path) -> crate::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{format::PAGE_SIZE, segment::SegmentEngineOptions};
+    use crate::{format::PAGE_SIZE, store::ExtentStoreOptions};
 
-    fn config() -> SegmentEngineConfig {
-        SegmentEngineConfig::new(4 * 1024 * 1024)
+    fn config() -> ExtentStoreConfig {
+        ExtentStoreConfig::new(4 * 1024 * 1024)
             .with_slot_size(PAGE_SIZE)
             .with_options(
-                SegmentEngineOptions::default()
-                    .with_segment_size(PAGE_SIZE * 8)
+                ExtentStoreOptions::default()
+                    .with_extent_size(PAGE_SIZE * 8)
                     .with_index_write_buffer_size(PAGE_SIZE * 4)
                     .with_index_cache_size(1024 * 1024),
             )
@@ -116,12 +116,12 @@ mod tests {
         let sentinel = root.join("owned-by-caller");
         fs::write(&sentinel, b"keep").unwrap();
 
-        let open = open_segment(&root, config(), RecoverMode::None).unwrap();
-        open.engine.sync().unwrap();
-        drop(open.engine);
-        let open = open_segment(&root, config(), RecoverMode::None).unwrap();
-        open.engine.sync().unwrap();
-        drop(open.engine);
+        let open = open_store(&root, config(), RecoverMode::None).unwrap();
+        open.store.sync().unwrap();
+        drop(open.store);
+        let open = open_store(&root, config(), RecoverMode::None).unwrap();
+        open.store.sync().unwrap();
+        drop(open.store);
 
         assert_eq!(fs::read(sentinel).unwrap(), b"keep");
     }

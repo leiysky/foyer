@@ -44,7 +44,7 @@ impl IoSchedulerStats {
 /// Reads use a lock-free accounting path and never wait behind writes. A write waits for a
 /// read-quiescent point, but may proceed after the bounded read-priority interval so sustained read
 /// traffic cannot starve cache publication or reclaim forever.
-pub struct SegmentIoScheduler {
+pub struct PayloadIoScheduler {
     state: Mutex<State>,
     changed: Condvar,
     write_concurrency: usize,
@@ -58,10 +58,10 @@ pub struct SegmentIoScheduler {
     maximum_write_wait_ns: AtomicU64,
 }
 
-impl fmt::Debug for SegmentIoScheduler {
+impl fmt::Debug for PayloadIoScheduler {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state = mutex_lock(&self.state);
-        f.debug_struct("SegmentIoScheduler")
+        f.debug_struct("PayloadIoScheduler")
             .field("write_concurrency", &self.write_concurrency)
             .field("read_priority_duration", &self.read_priority_duration)
             .field("waiting_writes", &self.waiting_writes.load(Ordering::Relaxed))
@@ -71,7 +71,7 @@ impl fmt::Debug for SegmentIoScheduler {
     }
 }
 
-impl SegmentIoScheduler {
+impl PayloadIoScheduler {
     pub fn new(write_concurrency: usize, read_priority_duration: Duration) -> io::Result<Self> {
         if write_concurrency == 0 {
             return Err(io::Error::new(
@@ -185,7 +185,7 @@ impl SegmentIoScheduler {
 }
 
 struct IoPermit<'a> {
-    scheduler: &'a SegmentIoScheduler,
+    scheduler: &'a PayloadIoScheduler,
     class: IoClass,
 }
 
@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn read_does_not_wait_for_an_active_write() {
-        let scheduler = Arc::new(SegmentIoScheduler::new(1, Duration::from_secs(1)).unwrap());
+        let scheduler = Arc::new(PayloadIoScheduler::new(1, Duration::from_secs(1)).unwrap());
         let (write_started, write_started_rx) = mpsc::channel();
         let (release_write, release_write_rx) = mpsc::channel();
         let writer = {
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn write_waits_for_read_quiescence_but_cannot_starve() {
         let priority = Duration::from_millis(20);
-        let scheduler = Arc::new(SegmentIoScheduler::new(1, priority).unwrap());
+        let scheduler = Arc::new(PayloadIoScheduler::new(1, priority).unwrap());
         let read = scheduler.acquire_read();
         let (elapsed, elapsed_rx) = mpsc::channel();
         let writer = {
@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn write_proceeds_when_reads_become_quiescent() {
         let priority = Duration::from_secs(5);
-        let scheduler = Arc::new(SegmentIoScheduler::new(1, priority).unwrap());
+        let scheduler = Arc::new(PayloadIoScheduler::new(1, priority).unwrap());
         let read = scheduler.acquire_read();
         let (started, started_rx) = mpsc::channel();
         let (completed, completed_rx) = mpsc::channel();
@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn zero_read_priority_bypasses_admission() {
-        let scheduler = SegmentIoScheduler::new(1, Duration::ZERO).unwrap();
+        let scheduler = PayloadIoScheduler::new(1, Duration::ZERO).unwrap();
         scheduler
             .read(|| {
                 assert_eq!(scheduler.stats().active_reads, 0);
@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn write_concurrency_is_bounded() {
-        let scheduler = Arc::new(SegmentIoScheduler::new(1, Duration::from_secs(1)).unwrap());
+        let scheduler = Arc::new(PayloadIoScheduler::new(1, Duration::from_secs(1)).unwrap());
         let (first_started, first_started_rx) = mpsc::channel();
         let (release_first, release_first_rx) = mpsc::channel();
         let first = {

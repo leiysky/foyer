@@ -1,6 +1,6 @@
 use crate::{
-    model::{BlobKey, CachePriority},
-    segment::stats::ReclaimStats,
+    model::{CachePriority, EntryKey},
+    store::stats::ReclaimStats,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,14 +20,14 @@ pub struct GetResult {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct BlobInsert<'a> {
-    pub key: &'a BlobKey,
+pub struct EntryInsert<'a> {
+    pub key: &'a EntryKey,
     pub value: &'a [u8],
     pub priority: CachePriority,
 }
 
-impl<'a> BlobInsert<'a> {
-    pub const fn new(key: &'a BlobKey, value: &'a [u8], priority: CachePriority) -> Self {
+impl<'a> EntryInsert<'a> {
+    pub const fn new(key: &'a EntryKey, value: &'a [u8], priority: CachePriority) -> Self {
         Self { key, value, priority }
     }
 }

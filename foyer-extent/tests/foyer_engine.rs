@@ -158,14 +158,14 @@ async fn public_cache_recovers_complete_entries() {
         recovered.statistics().disk_read_ios() as u64,
         recovered.statistics().disk_read_bytes() as u64,
     );
-    let index_reads_before = handle.index_read_stats().unwrap();
+    let index_reads_before = handle.entry_index_read_stats().unwrap();
     let payload_reads_before = handle.read_stats().unwrap();
     let entry = recovered.get(&key).await.unwrap();
     assert_eq!(entry.key(), &key);
     assert_eq!(entry.value(), &value);
     assert_eq!(entry.priority(), CachePriority::High);
     assert_eq!(recovered.estimated_entry_count(), 1);
-    let index_reads_after = handle.index_read_stats().unwrap();
+    let index_reads_after = handle.entry_index_read_stats().unwrap();
     let payload_reads_after = handle.read_stats().unwrap();
     assert_eq!(
         recovered.statistics().disk_read_ios() as u64 - disk_reads_before.0,

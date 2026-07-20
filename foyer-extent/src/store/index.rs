@@ -13,8 +13,8 @@ use crate::{
     error::{Error, Result},
     frequency::FrequencySketch,
     model::{CachePriority, KeyDigest},
-    segment::{
-        format::SegmentLocation,
+    store::{
+        format::EntryLocation,
         operation::{BatchInsertResult, InsertOutcome},
         stats::PhysicalWriteStats,
     },
@@ -27,7 +27,7 @@ const MIN_FREQUENCY_COUNTERS: usize = 4 * 1024;
 const MAX_FREQUENCY_COUNTERS: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct IndexStats {
+pub struct EntryIndexStats {
     pub manifest_generation: u64,
     pub last_sequence: u64,
     pub live_entries: u64,
@@ -45,7 +45,7 @@ pub struct IndexStats {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct IndexReadStats {
+pub struct EntryIndexReadStats {
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub read_operations: u64,
@@ -58,11 +58,11 @@ pub struct IndexReadStats {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Mutation {
-    location: Option<SegmentLocation>,
+    location: Option<EntryLocation>,
 }
 
 impl Mutation {
-    const fn insert(location: SegmentLocation) -> Self {
+    const fn insert(location: EntryLocation) -> Self {
         Self {
             location: Some(location),
         }
@@ -88,7 +88,7 @@ pub struct IndexCheckpoint {
 }
 
 #[derive(Debug)]
-pub struct SegmentIndex {
+pub struct EntryIndex {
     database: FixedLsm,
     live_capacity: u64,
     capacity_bytes: u64,
@@ -97,7 +97,7 @@ pub struct SegmentIndex {
     frequency: FrequencySketch,
 }
 
-impl SegmentIndex {
+impl EntryIndex {
     pub fn create(
         root: &Path,
         live_capacity: u64,
@@ -137,7 +137,7 @@ impl SegmentIndex {
         .map_err(fixed_open_error)?;
         if database.user_state() > live_capacity {
             return Err(Error::InvalidSuperblock(format!(
-                "segment index live count {} exceeds capacity {live_capacity}",
+                "EntryIndex live count {} exceeds capacity {live_capacity}",
                 database.user_state()
             )));
         }
@@ -181,9 +181,9 @@ impl SegmentIndex {
         }
     }
 
-    pub fn read_stats(&self) -> IndexReadStats {
+    pub fn read_stats(&self) -> EntryIndexReadStats {
         let stats = self.database.stats();
-        IndexReadStats {
+        EntryIndexReadStats {
             cache_hits: stats.cache_hits,
             cache_misses: stats.cache_misses,
             read_operations: stats.table_read_operations,
@@ -195,7 +195,7 @@ impl SegmentIndex {
         }
     }
 
-    pub fn stats(&self) -> IndexStats {
+    pub fn stats(&self) -> EntryIndexStats {
         let database = self.database.stats();
         let state = read_lock(&self.state);
         let pending_changes = state
@@ -203,7 +203,7 @@ impl SegmentIndex {
             .len()
             .saturating_add(state.frozen.as_ref().map_or(0, |frozen| frozen.len()))
             as u64;
-        IndexStats {
+        EntryIndexStats {
             manifest_generation: database.manifest_generation,
             last_sequence: database.next_sequence.saturating_sub(1),
             live_entries: state.live_count,
@@ -233,16 +233,16 @@ impl SegmentIndex {
             .map_err(|error| fixed_error("wait for maintenance", error))
     }
 
-    pub fn get(&self, key: KeyDigest) -> Result<Option<SegmentLocation>> {
+    pub fn get(&self, key: KeyDigest) -> Result<Option<EntryLocation>> {
         self.frequency.record(key_hash(key));
         self.lookup(key)
     }
 
-    pub fn peek(&self, key: KeyDigest) -> Result<Option<SegmentLocation>> {
+    pub fn peek(&self, key: KeyDigest) -> Result<Option<EntryLocation>> {
         self.lookup(key)
     }
 
-    pub fn probe(&self, key: KeyDigest, _priority: CachePriority) -> Result<(Option<SegmentLocation>, bool)> {
+    pub fn probe(&self, key: KeyDigest, _priority: CachePriority) -> Result<(Option<EntryLocation>, bool)> {
         self.frequency.record(key_hash(key));
         Ok((self.lookup(key)?, true))
     }
@@ -251,7 +251,7 @@ impl SegmentIndex {
         self.frequency.estimate(key_hash(key))
     }
 
-    fn lookup(&self, key: KeyDigest) -> Result<Option<SegmentLocation>> {
+    fn lookup(&self, key: KeyDigest) -> Result<Option<EntryLocation>> {
         self.lookup_with(key, || {
             self.database
                 .get(&encode_key(key))
@@ -263,7 +263,7 @@ impl SegmentIndex {
         &self,
         key: KeyDigest,
         mut durable_lookup: impl FnMut() -> Result<Option<[u8; fixed_lsm::VALUE_SIZE]>>,
-    ) -> Result<Option<SegmentLocation>> {
+    ) -> Result<Option<EntryLocation>> {
         loop {
             let base_revision = {
                 let state = read_lock(&self.state);
@@ -280,8 +280,8 @@ impl SegmentIndex {
             if state.base_revision == base_revision {
                 return value
                     .map(|value| {
-                        SegmentLocation::decode(&value).ok_or_else(|| {
-                            Error::InvalidSuperblock("segment index contains an invalid segment location".to_string())
+                        EntryLocation::decode(&value).ok_or_else(|| {
+                            Error::InvalidSuperblock("EntryIndex contains an invalid EntryLocation".to_string())
                         })
                     })
                     .transpose();
@@ -289,7 +289,7 @@ impl SegmentIndex {
         }
     }
 
-    pub fn insert_batch(&self, inserts: &[(KeyDigest, SegmentLocation)]) -> Result<BatchInsertResult> {
+    pub fn insert_batch(&self, inserts: &[(KeyDigest, EntryLocation)]) -> Result<BatchInsertResult> {
         let _mutation = mutex_lock(&self.mutations);
         let mut outcomes = Vec::with_capacity(inserts.len());
         for (key, location) in inserts.iter().copied() {
@@ -301,7 +301,7 @@ impl SegmentIndex {
             let mut state = write_lock(&self.state);
             if existing.is_none() && state.live_count >= self.live_capacity {
                 return Err(Error::InvalidSuperblock(
-                    "segment index reached data capacity before allocation reclaimed a slot".to_string(),
+                    "EntryIndex reached data capacity before allocation reclaimed a slot".to_string(),
                 ));
             }
             state.active.insert(key, Mutation::insert(location));
@@ -380,7 +380,7 @@ impl SegmentIndex {
             return Err(fixed_error("persist checkpoint", error));
         }
         #[cfg(test)]
-        crate::segment::crash_if_requested("segment_index_after_wal_sync");
+        crate::store::crash_if_requested("entry_index_after_wal_sync");
 
         let mut state = write_lock(&self.state);
         let current = state
@@ -432,7 +432,7 @@ fn advance_base_revision(state: &mut RuntimeState) {
     state.base_revision = state
         .base_revision
         .checked_add(1)
-        .expect("segment index base revision is exhausted");
+        .expect("EntryIndex base revision is exhausted");
 }
 
 fn encode_key(key: KeyDigest) -> [u8; 24] {
@@ -499,18 +499,18 @@ mod tests {
         KeyDigest::new(bytes)
     }
 
-    fn location(index: u64) -> SegmentLocation {
-        SegmentLocation {
-            physical_slot: index,
-            segment_generation: 1,
+    fn location(index: u64) -> EntryLocation {
+        EntryLocation {
+            first_slot: index,
+            extent_generation: 1,
             stored_len: PAGE_SIZE as u32,
             checksum: index as u32,
             priority: CachePriority::Normal,
         }
     }
 
-    fn create(root: &Path) -> SegmentIndex {
-        SegmentIndex::create(root, 128, 1024 * 1024, 64 * 16, 1024 * 1024).unwrap()
+    fn create(root: &Path) -> EntryIndex {
+        EntryIndex::create(root, 128, 1024 * 1024, 64 * 16, 1024 * 1024).unwrap()
     }
 
     #[test]
@@ -523,7 +523,7 @@ mod tests {
         assert_eq!(index.stats().live_entries, 32);
         drop(index);
 
-        let index = SegmentIndex::open(directory.path(), 128, 1024 * 1024, 64 * 16, 1024 * 1024).unwrap();
+        let index = EntryIndex::open(directory.path(), 128, 1024 * 1024, 64 * 16, 1024 * 1024).unwrap();
         assert_eq!(index.stats().live_entries, 32);
         for entry in 0..32 {
             assert_eq!(index.peek(key(entry)).unwrap(), Some(location(entry)));
@@ -536,8 +536,8 @@ mod tests {
         let index = create(directory.path());
         index.insert_batch(&[(key(1), location(1))]).unwrap();
         let checkpoint = index.prepare_checkpoint().unwrap().unwrap();
-        let newer = SegmentLocation {
-            segment_generation: 2,
+        let newer = EntryLocation {
+            extent_generation: 2,
             ..location(1)
         };
         index.insert_batch(&[(key(1), newer)]).unwrap();
@@ -546,7 +546,7 @@ mod tests {
         index.checkpoint().unwrap();
         drop(index);
 
-        let index = SegmentIndex::open(directory.path(), 128, 1024 * 1024, 64 * 16, 1024 * 1024).unwrap();
+        let index = EntryIndex::open(directory.path(), 128, 1024 * 1024, 64 * 16, 1024 * 1024).unwrap();
         assert_eq!(index.peek(key(1)).unwrap(), Some(newer));
     }
 
@@ -581,8 +581,8 @@ mod tests {
         let index = create(directory.path());
         index.insert_batch(&[(key(1), location(1))]).unwrap();
         let checkpoint = index.prepare_checkpoint().unwrap().unwrap();
-        let newer = SegmentLocation {
-            segment_generation: 2,
+        let newer = EntryLocation {
+            extent_generation: 2,
             ..location(1)
         };
         index.insert_batch(&[(key(1), newer)]).unwrap();

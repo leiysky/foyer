@@ -5,8 +5,8 @@ status: accepted
 # Admit payload I/O cooperatively
 
 Extent schedules synchronous payload I/O with caller-executed admission rather than an internal
-executor. A foreground blob read acquires a lock-free permit across all of its positional reads and
-never waits behind writes. Data/owner write runs and payload syncs wait for a read-quiescent point
+executor. A foreground Entry-payload read acquires a lock-free permit across all of its positional reads and
+never waits behind writes. Data/slot-owner write runs and payload syncs wait for a read-quiescent point
 for at most 2 ms by default, then proceed even while reads remain active. Existing write concurrency
 is still the hard write cap. A zero duration bypasses the scheduler and its accounting.
 
@@ -14,16 +14,16 @@ is still the hard write cap. A zero duration bypasses the scheduler and its acco
 
 Foyer puts are fire-and-forget and may be shed, while a cache miss must return quickly enough for
 the caller to fall back to source storage. Queue admission and smaller read-busy batches limit work
-above the segment engine, but cannot control when already admitted physical writes compete with a
-payload read. The segment layer is the lowest point that still knows whether an operation is a
-foreground blob read or cache-publication write.
+above ExtentPool, but cannot control when already admitted physical writes compete with a payload
+read. ExtentPool is the lowest point that still knows whether an operation is a foreground Entry
+read or cache-publication write.
 
 The scheduler owns only admission. The calling thread retains its buffer and executes the syscall,
 so positional I/O remains compatible with buffered I/O and Linux direct I/O. There is no additional
 buffer copy, worker hop, async runtime dependency, on-disk change, or io_uring-shaped public API.
 This leaves a future native async backend possible without treating synchronous calls as fake SQEs.
 
-One permit covers a logical blob read rather than one `pread`. Large entries span many bounded
+One permit covers a logical Entry read rather than one `pread`. Large entries span many bounded
 physical runs; syscall-level permits would create avoidable atomic traffic and let writes enter
 between adjacent runs of the same foreground request.
 

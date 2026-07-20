@@ -2,7 +2,7 @@
 status: rejected
 ---
 
-# Use a paged base and bounded delta for the segment cache index
+# Use a paged base and bounded delta for the extent cache index
 
 This rejected design is retained only as historical evidence. Its implementation and benchmark
 backend were removed after ADR 0007 selected FixedRecordLSM.
@@ -126,9 +126,9 @@ checkpoint tail latency remain canary signals; adding more LSM levels is justifi
 interference exceeds the accepted bound.
 
 An 8 GiB buffered ScopeDB adapter comparison used 31,356 entries spanning 4 KiB through 1 MiB and
-four clients on the same host. Segment sustained 421.7 MiB/s versus Foyer's 397.6 MiB/s, reopened in
+four clients on the same host. Extent sustained 421.7 MiB/s versus Foyer's 397.6 MiB/s, reopened in
 3.84 ms versus 57.93 ms, and had recovered-read p50/p99 of 0.047/0.343 ms versus
-0.115/1.124 ms. Segment's write-admission p99 was 43.1 ms versus Foyer's 20.6 ms, while its p99.9
+0.115/1.124 ms. Extent's write-admission p99 was 43.1 ms versus Foyer's 20.6 ms, while its p99.9
 was 43.5 ms versus Foyer's 335.8 ms. The paged index therefore removes the recovery bottleneck and
 does not regress the tested read path, but it does not claim universal latency dominance.
 

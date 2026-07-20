@@ -8,7 +8,7 @@ Extent will integrate as a sibling of Foyer's BlockEngine behind Foyer's `Engine
 `Engine` boundary. Foyer remains responsible for the memory cache, in-flight lookup coalescing,
 pending-write keeper, foreground-asynchronous submission, shared metrics, and hybrid-cache
 lifecycle. ExtentEngine remains responsible for the bounded disk flush queue, batching,
-SegmentStore, FixedRecordLSM, recovery, placement, checkpointing, I/O throttling at the engine
+ExtentPool, FixedRecordLSM, recovery, placement, checkpointing, I/O throttling at the engine
 boundary, and priority-aware reclaim.
 
 ## Why
@@ -27,7 +27,7 @@ attributed to the disk engine selected by the same builder.
 Foyer 0.22.3 exposes engine injection through its hybrid builder, but an external implementation is
 not yet usable without a small compatibility patch: `PieceRef` appears in the public `Engine`
 trait but is not exported, and `load`/`delete` receive only a 64-bit hash. Extent needs the complete
-key to derive its segment-index digest and verify precise identity.
+key to derive its extent-index digest and verify precise identity.
 
 The compatibility patch will preserve dynamic engine dispatch:
 
@@ -43,7 +43,7 @@ external engine implementation as missing capabilities but changes the engine to
 
 ## Boundary
 
-The independent `extent` project owns ExtentEngine, SegmentEngine, SegmentStore, and
+The independent `extent` project owns ExtentEngine, ExtentStore, ExtentPool, and
 FixedRecordLSM. It may expose a small Entry-oriented facade over the configured Foyer HybridCache,
 but it will not implement another memory cache, externally visible writer, or read coalescer.
 ExtentEngine has exactly one internal, byte-bounded flush queue because Foyer's `Engine::enqueue`

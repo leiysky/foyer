@@ -2,23 +2,23 @@
 status: accepted
 ---
 
-# Use FixedRecordLSM for the segment index
+# Use FixedRecordLSM for the EntryIndex
 
-ScopeDB will use its Rust-native FixedRecordLSM as the sole durable `BlobKey -> SegmentLocation`
-index in SegmentEngine. The choice keeps recovery proportional to manifest/SST metadata plus a
+ScopeDB will use its Rust-native FixedRecordLSM as the sole durable `EntryKey -> EntryLocation`
+index in ExtentStore. The choice keeps recovery proportional to manifest/SST metadata plus a
 bounded WAL tail, supports the cache's high-churn point workload, and avoids carrying a
 general-purpose C++ database in normal ScopeDB builds.
 
 ## Boundary
 
-SegmentStore remains an ordinary variable-length blob store. FixedRecordLSM sees only fixed 24-byte
-keys, fixed 32-byte locations, atomic put/delete batches, point lookups, and one opaque `u64`
-application state. It has no range or payload-layout knowledge.
+ExtentStore remains the key-to-Entry owner, while ExtentPool owns only physical placement.
+FixedRecordLSM sees fixed 24-byte keys, fixed 32-byte locations, atomic put/delete batches, point
+lookups, and one opaque `u64` application state. It has no range or payload-layout knowledge.
 
 There is no runtime index selector. The former journal, PagedIndex, redb, Fjall, and chunk-hash
 implementations are removed rather than retained as permanent comparison groups. RocksDB remains
 behind the `rocksdb-benchmark` feature as the industrial reference. Foyer remains the production
-cache control and rollback engine outside SegmentEngine.
+cache control and rollback engine outside ExtentStore.
 
 ## Why this implementation
 
@@ -28,7 +28,7 @@ LSM structure removes those surfaces while preserving the required pieces: check
 immutable SSTs, Bloom filters, a bounded block cache, partitioned leveled compaction, and
 alternating checksummed manifests.
 
-The SegmentEngine adapter maintains active and frozen overlays. Checkpoint capture is short and
+The ExtentStore adapter maintains active and frozen overlays. Checkpoint capture is short and
 serialized; payload and allocator durability precede the synced LSM batch. The live-entry count is
 stored as application state, so recovery never scans all keys. A base revision plus post-I/O
 overlay recheck closes the concurrent lookup/checkpoint miss race.
@@ -54,7 +54,7 @@ index-only bytes per replacement, and about twice the churn RSS. These are accep
 the integrated cache is payload-I/O dominated and the ScopeDB-level results remain within their
 gates.
 
-The integrated 300 GiB run stored and fully revalidated 7,602,593 blobs spanning 4-128 KiB. It
+The integrated 300 GiB run stored and fully revalidated 7,602,593 Entries spanning 4-128 KiB. It
 sustained 359.5 MiB/s payload submission, reopened in 60.7 ms warm and 71.6 ms after dropping the
 page cache, and produced 2.532/2.977 ms recovered-read p99/p99.9. Peak RSS was 1.19 GiB.
 

@@ -15,8 +15,8 @@ use foyer::{Metrics, Statistics};
 use crate::{
     ReclaimStats,
     foyer_engine::{ExtentPiece, mutex_lock, queue::QueueReservation, read::ReadLimiter, stats::EngineStats},
-    model::BlobKey,
-    segment::{BatchInsertResult, BlobInsert, InsertOutcome, SegmentEngine},
+    model::EntryKey,
+    store::{BatchInsertResult, EntryInsert, ExtentStore, InsertOutcome},
 };
 
 /// Preserves the first asynchronous failure so close reports the causal error.
@@ -98,9 +98,9 @@ impl Command {
     }
 }
 
-/// Owns the single ordered publication stream from Foyer into SegmentEngine.
+/// Owns the single ordered publication stream from Foyer into ExtentStore.
 pub struct WriteWorker {
-    segment: Arc<SegmentEngine>,
+    store: Arc<ExtentStore>,
     statistics: Arc<Statistics>,
     batch_entries: usize,
     batch_bytes: usize,
@@ -116,7 +116,7 @@ pub struct WriteWorker {
 
 impl WriteWorker {
     pub fn new(
-        segment: Arc<SegmentEngine>,
+        store: Arc<ExtentStore>,
         statistics: Arc<Statistics>,
         batch_entries: usize,
         batch_bytes: usize,
@@ -129,7 +129,7 @@ impl WriteWorker {
         #[cfg(test)] panic_next: Arc<AtomicBool>,
     ) -> Self {
         Self {
-            segment,
+            store,
             statistics,
             batch_entries,
             batch_bytes,
@@ -158,10 +158,10 @@ impl WriteWorker {
             self.background_error.record("Extent flush worker panicked".to_string());
             self.stats.record_abandoned(drain_abandoned(receiver));
         }
-        if let Err(error) = sync_segment(&self.segment, self.statistics.as_ref(), &self.stats) {
-            self.background_error.record(format!("sync Extent engine: {error}"));
+        if let Err(error) = sync_store(&self.store, self.statistics.as_ref(), &self.stats) {
+            self.background_error.record(format!("sync ExtentEngine: {error}"));
         }
-        self.stats.record_checkpoint(self.segment.checkpoint_stats());
+        self.stats.record_checkpoint(self.store.checkpoint_stats());
     }
 
     fn write_loop(&self, receiver: &Receiver<Command>) {
@@ -173,12 +173,12 @@ impl WriteWorker {
             let first = match receiver.recv_timeout(timeout) {
                 Ok(first) => first,
                 Err(RecvTimeoutError::Timeout) => {
-                    if let Err(error) = self.segment.request_checkpoint() {
+                    if let Err(error) = self.store.request_checkpoint() {
                         self.background_error
                             .record(format!("request periodic Extent checkpoint: {error}"));
                         return;
                     }
-                    self.stats.record_checkpoint(self.segment.checkpoint_stats());
+                    self.stats.record_checkpoint(self.store.checkpoint_stats());
                     checkpoint_requested_at = Instant::now();
                     continue;
                 }
@@ -218,7 +218,7 @@ impl WriteWorker {
             }
 
             let started = Instant::now();
-            match process_commands(&self.segment, &commands) {
+            match process_commands(&self.store, &commands) {
                 Ok(result) => {
                     self.stats.merge_reclaim(result.reclaim);
                     self.stats
@@ -228,7 +228,7 @@ impl WriteWorker {
                         result.write_runs,
                         result.written_bytes,
                     );
-                    self.stats.record_priority_occupancy(self.segment.priority_occupancy());
+                    self.stats.record_extent_occupancy(self.store.extent_occupancy());
                 }
                 Err(error) => {
                     self.stats.record_failed_batch();
@@ -238,7 +238,7 @@ impl WriteWorker {
                 }
             }
             self.stats
-                .record_remaining_index_reads(self.statistics.as_ref(), self.segment.index_read_stats());
+                .record_remaining_index_reads(self.statistics.as_ref(), self.store.entry_index_read_stats());
             let completed = Instant::now();
             self.stats.record_write_batch(completed.duration_since(started));
             self.stats.record_write_publications(
@@ -246,19 +246,19 @@ impl WriteWorker {
                     .iter()
                     .map(|command| completed.duration_since(command.queued_at())),
             );
-            self.stats.record_checkpoint(self.segment.checkpoint_stats());
+            self.stats.record_checkpoint(self.store.checkpoint_stats());
 
             // Dropping pieces removes them from Foyer's pending-write keeper before their queue
             // reservations are released, so `wait` cannot observe a stale pending piece.
             drop(commands);
 
             if checkpoint_requested_at.elapsed() >= self.checkpoint_interval {
-                if let Err(error) = self.segment.request_checkpoint() {
+                if let Err(error) = self.store.request_checkpoint() {
                     self.background_error
                         .record(format!("request periodic Extent checkpoint: {error}"));
                     return;
                 }
-                self.stats.record_checkpoint(self.segment.checkpoint_stats());
+                self.stats.record_checkpoint(self.store.checkpoint_stats());
                 checkpoint_requested_at = Instant::now();
             }
         }
@@ -279,15 +279,15 @@ impl WriteWorker {
     }
 }
 
-pub fn sync_segment(segment: &SegmentEngine, statistics: &Statistics, stats: &EngineStats) -> crate::Result<()> {
-    let result = segment.sync();
-    stats.record_remaining_index_reads(statistics, segment.index_read_stats());
-    let physical = segment.physical_write_stats();
+pub fn sync_store(store: &ExtentStore, statistics: &Statistics, stats: &EngineStats) -> crate::Result<()> {
+    let result = store.sync();
+    stats.record_remaining_index_reads(statistics, store.entry_index_read_stats());
+    let physical = store.physical_write_stats();
     stats.record_remaining_writes(statistics, physical.total_runs(), physical.total_bytes());
     result
 }
 
-fn process_commands(segment: &SegmentEngine, commands: &[Command]) -> crate::Result<ProcessResult> {
+fn process_commands(store: &ExtentStore, commands: &[Command]) -> crate::Result<ProcessResult> {
     let mut result = ProcessResult::default();
     let mut position = 0;
     while position < commands.len() {
@@ -297,11 +297,11 @@ fn process_commands(segment: &SegmentEngine, commands: &[Command]) -> crate::Res
                 while position < commands.len() && matches!(&commands[position], Command::Put { .. }) {
                     position += 1;
                 }
-                result.merge(persist_puts(segment, &commands[start..position])?);
+                result.merge(persist_puts(store, &commands[start..position])?);
             }
             Command::Delete { key, .. } => {
-                let key = BlobKey::new(key)?;
-                segment.remove(&key)?;
+                let key = EntryKey::new(key)?;
+                store.remove(&key)?;
                 position += 1;
             }
         }
@@ -309,11 +309,11 @@ fn process_commands(segment: &SegmentEngine, commands: &[Command]) -> crate::Res
     Ok(result)
 }
 
-fn persist_puts(segment: &SegmentEngine, commands: &[Command]) -> crate::Result<BatchInsertResult> {
+fn persist_puts(store: &ExtentStore, commands: &[Command]) -> crate::Result<BatchInsertResult> {
     let keys = commands
         .iter()
         .map(|command| match command {
-            Command::Put { piece, .. } => BlobKey::new(piece.key()),
+            Command::Put { piece, .. } => EntryKey::new(piece.key()),
             Command::Delete { .. } => unreachable!("put run must contain only puts"),
         })
         .collect::<crate::Result<Vec<_>>>()?;
@@ -321,11 +321,11 @@ fn persist_puts(segment: &SegmentEngine, commands: &[Command]) -> crate::Result<
         .iter()
         .zip(&keys)
         .map(|(command, key)| match command {
-            Command::Put { piece, .. } => BlobInsert::new(key, piece.value().value(), piece.value().priority()),
+            Command::Put { piece, .. } => EntryInsert::new(key, piece.value().value(), piece.value().priority()),
             Command::Delete { .. } => unreachable!("put run must contain only puts"),
         })
         .collect::<Vec<_>>();
-    segment.insert_batch_with_stats(&inserts)
+    store.insert_batch_with_stats(&inserts)
 }
 
 #[derive(Debug, Default)]

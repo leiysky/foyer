@@ -7,7 +7,7 @@ status: accepted
 ## Context
 
 The original buffered path synchronized payload, allocator state, journal pages, and the journal
-superblock while holding the engine mutation lock. At 300 GiB this left background-batch p99 at
+superblock while holding the ExtentStore mutation lock. At 300 GiB this left background-batch p99 at
 766 milliseconds and enqueue-to-publication p99 at 1.02 seconds. Raising the metadata threshold
 only converted frequent 0.8-second pauses into 4.1-second pauses.
 
@@ -18,13 +18,13 @@ also bounded.
 
 ## Decision
 
-Keep one shared segment pool and one total mutation order, but separate payload durability from
+Keep one shared extent pool and one total mutation order, but separate payload durability from
 allocator/index durability:
 
-1. Each aggregated engine batch writes its payload and owner records and completes one payload
+1. Each aggregated ExtentStore batch writes its payload and slot-owner records and completes one payload
    durability fence before returning from publication. This is write-on-insert at the 128 MiB
    logical batch boundary, not one sync per cache entry.
-2. After the payload fence, the engine advances its published epoch and returns to the Foyer flush
+2. After the payload fence, ExtentStore advances its published epoch and returns to the Foyer flush
    worker. There is no per-insert strict mode; only `sync` and close wait for the corresponding
    durable metadata epoch.
 3. The threshold and periodic triggers feed one coalescing coordinator. Under the mutation lock it
@@ -33,8 +33,8 @@ allocator/index durability:
 4. The coordinator persists the immutable allocator image and index delta outside the mutation
    lock. It never synchronizes the still-mutable payload file. A journal-generation rollover captures
    a full exact-map image; ordinary checkpoints copy only the detached delta.
-5. Reclaim waits for an in-flight epoch before reusing a segment generation. It retains the existing
-   synchronous reclaim transaction and fences any earlier pieces of the current engine batch before
+5. Reclaim waits for an in-flight epoch before reusing an extent generation. It retains the existing
+   synchronous reclaim transaction and fences any earlier pieces of the current ExtentStore batch before
    persisting eviction or promotion.
 6. `sync`, close, and graceful shutdown wait for the latest published epoch. A coordinator failure is
    retained, detached changes are merged behind any newer per-key update, and later mutations and
@@ -51,14 +51,14 @@ protocol. No epoch-specific configuration was added.
 - A durable index may reference only payload/owner bytes that completed their publication fence and
   an allocator image committed no later than that index generation.
 - Recovery may omit a non-durable tail, but it must never return bytes for another key, range, or
-  segment generation.
+  extent generation.
 - A detached delta is immutable. Later writes use a fresh delta, and abort merge keeps the record with
   the greater per-key sequence.
 - A checkpoint request cannot be lost: a newer requested epoch remains pending after the current
   epoch completes.
 - Reclaim cannot reuse a generation while an older epoch may reference it.
 - Close succeeds only after its target epoch is durable. A background failure is permanent for the
-  current engine instance: existing reads remain available, later mutations fail internally, and
+  current cache instance: existing reads remain available, later mutations fail internally, and
   close returns the retained error.
 
 ## Evaluation
@@ -77,7 +77,7 @@ payload, 240 GiB of capacity, 4,593 mixed read groups, and a complete 1,175,843-
 | Reopen | 323.67 ms | 317.17 ms | -2.0% |
 | Full validated scan | 480.43 s | 480.81 s | +0.1% |
 | High / normal / low byte retention | 100% / 100% / 55.1% | 100% / 100% / 55.0% | Flat |
-| Reclaimed segments | 1,533 | 1,533 | Flat |
+| Reclaimed extents | 1,533 | 1,533 | Flat |
 | Total engine writes | 341,488 MiB | 341,469 MiB | Flat |
 | Peak RSS | 509,996 KiB | 520,548 KiB | +2.1% |
 | Incorrect hits / index rejection | 0 / 0 | 0 / 0 | Pass |
@@ -91,7 +91,7 @@ the runtime batch and queue controls remain available without adding another mod
 
 A later 8 MiB-service 50 GiB sweep doubled access concurrency from four (`core x 2`) to eight
 clients without changing storage settings. Throughput remained 355.7-357.2 MiB/s, batch p99 stayed
-395.5-395.6 ms, publication p99 stayed 771.2-771.5 ms, reclaim remained 302 segments, and total
+395.5-395.6 ms, publication p99 stayed 771.2-771.5 ms, reclaim remained 302 extents, and total
 engine writes remained 57,094.6 MiB. Mixed-group p99 improved from 195.2 to 57.6 ms; point-read p99
 rose from 7.46 to 14.64 ms with doubled I/O occupancy. Foreground put p99 moved from 37 microseconds
 to 291 milliseconds while p95 stayed below 2 microseconds, identifying bounded write-queue
@@ -195,7 +195,7 @@ reclaim would trade cache value and latency for only 2.3% raw ingress.
 
 A 600 GiB/240 GiB follow-up kept the then-accepted 8 MiB run and four-client (`core x 2`) access
 while running 1.5 complete turnovers after capacity was reached. It sustained 352.2 MiB/s,
-reclaimed 6,629 segments, wrote 1.086 physical bytes per logical payload byte, and completed an
+reclaimed 6,629 extents, wrote 1.086 physical bytes per logical payload byte, and completed an
 independent full recovery scan without an incorrect hit. Recovered hit p99 was 8.87 ms; mixed-write
 hit p99 was 25.12 ms. High/normal/low byte retention was 100%/88.4%/0% because high plus normal input
 alone equaled raw cache capacity before slot-tail overhead. This confirms stable priority ordering
@@ -244,7 +244,7 @@ physical host power-loss test remains an explicit canary gate.
   matched 2 GiB pilot from 385.6 to 431.2 MiB/s and reduced batch p50 from 350 to 44 ms, but reclaim
   then waited behind the in-flight epoch: batch p99 rose from 458 ms to 1.42 s, publication p99 from
   807 ms to 1.78 s, and mixed-hit p99 from 6.11 to 7.07 ms. Avoiding that wait requires quarantined
-  generations plus spare-segment headroom. That added GC state is rejected until a production trace
+  generations plus spare-extent headroom. That added GC state is rejected until a production trace
   demonstrates enough end-to-end value to justify its correctness and capacity cost.
 - Reading each range-native logical entry in one large buffered syscall reduced physical read calls
   by 78% and improved recovered-hit p99 by 11% in the 50 GiB workload. It was rejected after the

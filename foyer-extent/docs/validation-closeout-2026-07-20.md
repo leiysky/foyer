@@ -122,8 +122,8 @@ Primary evidence: the six `recovery-10m-20260720-*-cold-*.log` files.
 The final fresh image offered 12 GiB into a 3 GiB Extent cache using 4/16/64/256/1,024 KiB values,
 32/96/256/1,024-byte keys, and the ScopeDB priority mix: 10% high, 30% normal, and 60% low. All
 46,127 asynchronous puts were accepted and completed; 19,006 entries remained after reclaim. The
-physical occupancy was five high segments at the five-segment floor, 37 normal segments at a
-33-segment floor plus four borrowed segments, and four low segments. This verifies that floors are
+physical occupancy was five high extents at the five-extent floor, 37 normal extents at a
+33-extent floor plus four borrowed extents, and four low extents. This verifies that floors are
 minimum protection rather than fixed partitions.
 
 Two independent strict reopens and complete four-client storage scans returned exactly the same
@@ -156,17 +156,17 @@ Primary evidence:
 The final code audit found the measured behavior aligned with the following implementation
 invariants:
 
-- percentage floors are rounded up to whole reclaim segments, and open rejects both percentages
-  that sum above 100% and rounded floors that exceed usable segment capacity;
-- a low insert may reclaim only low segments; normal and high first reclaim low, then capacity
-  borrowed above the opposite protected floor, then their own oldest segment;
+- percentage floors are rounded up to whole reclaim extents, and open rejects both percentages
+  that sum above 100% and rounded floors that exceed usable extent capacity;
+- a low insert may reclaim only low extents; normal and high first reclaim low, then capacity
+  borrowed above the opposite protected floor, then their own oldest extent;
 - priority is checksummed in both the durable index location and owner record, while exact key bytes
-  remain in the checksummed stored blob;
+  remain in the checksummed Stored Entry;
 - a read validates location bounds and generation before I/O, then checksum and generation again
   after I/O, so a reclaimed location cannot become a stale hit;
 - reclaim persists source/target roles, publishes index removals or promotions, and checkpoints
   before generation reuse; failpoint tests cover interruption before and after those transitions;
-- same-priority hot promotion is capped at one eighth of a source segment, while cross-priority
+- same-priority hot promotion is capped at one eighth of a source extent, while cross-priority
   reclaim performs no promotion that could prevent borrowed capacity from being repaid.
 
 ## Crash and durability boundary

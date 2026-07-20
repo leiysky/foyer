@@ -2,7 +2,7 @@
 status: superseded by ADR 0007
 ---
 
-# Use RocksDB for the durable segment index
+# Use RocksDB for the durable EntryIndex
 
 FixedRecordLSM passed the narrower fixed-record evaluation, so ADR 0007 supersedes this proposal.
 RocksDB remains the industrial benchmark and fallback design; it is not a selectable production
@@ -10,7 +10,7 @@ backend.
 
 ## Context
 
-ScopeDB still needs its own segment data plane. Priority-aware admission, immutable blob payloads,
+ScopeDB still needs its own cache-extent data plane. Priority-aware admission, immutable blob payloads,
 generation-fenced reclamation, bounded disk space, and large sequential payload writes are not a
 general KV engine's job. The open question is narrower: whether ScopeDB should also maintain the
 durable 24-byte-key to 32-byte-location index.
@@ -29,7 +29,7 @@ justify a private durable engine by itself.
 
 ## Decision
 
-Keep the custom `SegmentStore` and replace only its durable index with RocksDB, subject to the
+Keep the custom `ExtentStore` and `ExtentPool`, and replace only `EntryIndex` with RocksDB, subject to the
 300 GiB integrated acceptance run. The integration uses the existing engine-facing key/location
 interface; RocksDB does not own payload placement, cache priority, reclamation, or range assembly.
 

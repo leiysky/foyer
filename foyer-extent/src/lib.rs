@@ -6,7 +6,7 @@ mod format;
 mod foyer_engine;
 mod frequency;
 mod model;
-mod segment;
+mod store;
 
 const _: () = assert!(foyer::DISK_ENGINE_API_VERSION == 1);
 
@@ -16,10 +16,10 @@ pub use self::{
     error::{Error, Result},
     format::DEFAULT_SLOT_SIZE,
     foyer_engine::{EngineReadStats, EngineWriteStats, ExtentEngineConfig, ExtentEngineHandle},
-    model::{CachePriority, MAX_BLOB_KEY_SIZE},
-    segment::{
-        CheckpointStats, DEFAULT_HIGH_PRIORITY_CAPACITY_PERCENT, DEFAULT_NORMAL_PRIORITY_CAPACITY_PERCENT,
-        DEFAULT_SEGMENT_SIZE, EXTENT_FORMAT_VERSION, IndexReadStats, IndexStats, IoSchedulerStats, PhysicalWriteStats,
-        PriorityOccupancy, ReclaimStats,
+    model::{CachePriority, MAX_KEY_SIZE},
+    store::{
+        CheckpointStats, DEFAULT_EXTENT_SIZE, DEFAULT_HIGH_PRIORITY_CAPACITY_PERCENT,
+        DEFAULT_NORMAL_PRIORITY_CAPACITY_PERCENT, EXTENT_FORMAT_VERSION, EntryIndexReadStats, EntryIndexStats,
+        ExtentOccupancy, IoSchedulerStats, PhysicalWriteStats, ReclaimStats,
     },
 };

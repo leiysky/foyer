@@ -9,7 +9,7 @@ use std::{
 use foyer::{Metrics, Statistics};
 
 use crate::{
-    CachePriority, CheckpointStats, IndexReadStats, PriorityOccupancy, ReclaimStats, foyer_engine::mutex_lock,
+    CachePriority, CheckpointStats, EntryIndexReadStats, ExtentOccupancy, ReclaimStats, foyer_engine::mutex_lock,
 };
 
 const LATENCY_SAMPLE_CAPACITY: usize = 16_384;
@@ -38,17 +38,17 @@ pub struct EngineWriteStats {
     pub shed_normal_commands: u64,
     /// High-priority commands shed at the hard queue bound.
     pub shed_high_commands: u64,
-    /// Accepted commands fully processed by SegmentEngine.
+    /// Accepted commands fully processed by ExtentStore.
     pub completed_commands: u64,
-    /// Put commands processed but rejected by SegmentEngine under allocation pressure.
+    /// Put commands processed but rejected by ExtentStore under allocation pressure.
     pub storage_rejected_puts: u64,
-    /// Batches fully processed by SegmentEngine.
+    /// Batches fully processed by ExtentStore.
     pub completed_batches: u64,
     /// Batches that encountered a storage failure before publication completed.
     pub failed_batches: u64,
 }
 
-/// Engine-level observations that bridge SegmentEngine work to Foyer statistics.
+/// Engine-level observations that bridge ExtentStore work to Foyer statistics.
 pub struct EngineStats {
     metrics: Arc<Metrics>,
     reclaim: Mutex<ReclaimStats>,
@@ -180,13 +180,13 @@ impl EngineStats {
             .absolute(checkpoint.dirty_changes as u64);
     }
 
-    pub fn record_priority_occupancy(&self, occupancy: PriorityOccupancy) {
+    pub fn record_extent_occupancy(&self, occupancy: ExtentOccupancy) {
         for priority in [CachePriority::Low, CachePriority::Normal, CachePriority::High] {
             let index = priority as usize;
-            self.metrics.storage_engine_priority_segments[index]
-                .absolute(u64::from(occupancy.occupied_segments(priority)));
-            self.metrics.storage_engine_priority_floor_segments[index]
-                .absolute(u64::from(occupancy.capacity_floor_segments(priority)));
+            self.metrics.storage_engine_priority_extents[index]
+                .absolute(u64::from(occupancy.occupied_extents(priority)));
+            self.metrics.storage_engine_priority_floor_extents[index]
+                .absolute(u64::from(occupancy.capacity_floor_extents(priority)));
             self.metrics.storage_engine_priority_allocated_bytes[index].absolute(occupancy.used_bytes(priority));
         }
     }
@@ -221,7 +221,7 @@ impl EngineStats {
         });
     }
 
-    pub fn record_remaining_index_reads(&self, statistics: &Statistics, total: IndexReadStats) {
+    pub fn record_remaining_index_reads(&self, statistics: &Statistics, total: EntryIndexReadStats) {
         let mut recorded = mutex_lock(&self.recorded_index_reads);
         let runs = usize::try_from(total.read_operations.saturating_sub(recorded.runs)).unwrap_or(usize::MAX);
         let bytes = usize::try_from(total.read_bytes.saturating_sub(recorded.bytes)).unwrap_or(usize::MAX);
@@ -383,7 +383,7 @@ mod tests {
         let statistics = Statistics::new(Throttle::default());
         stats.record_remaining_index_reads(
             &statistics,
-            IndexReadStats {
+            EntryIndexReadStats {
                 read_operations: 3,
                 read_bytes: 10,
                 ..Default::default()
@@ -394,7 +394,7 @@ mod tests {
 
         stats.record_remaining_index_reads(
             &statistics,
-            IndexReadStats {
+            EntryIndexReadStats {
                 read_operations: 3,
                 read_bytes: 10,
                 ..Default::default()
@@ -405,7 +405,7 @@ mod tests {
 
         stats.record_remaining_index_reads(
             &statistics,
-            IndexReadStats {
+            EntryIndexReadStats {
                 read_operations: 5,
                 read_bytes: 16,
                 ..Default::default()

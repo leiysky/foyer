@@ -2,13 +2,13 @@
 status: superseded
 ---
 
-# Use a dual-generation journal for the segment cache index
+# Use a dual-generation journal for the extent cache index
 
 This persistence baseline was superseded by ADR 0005 after the 100-million-entry replay limit was
 measured. Its exactness, sequential mutation pages, and dual-generation commit protocol remain part
 of the paged base-and-delta design.
 
-The segment cache will keep an exact in-memory index and persist index mutations as checksummed,
+The extent cache will keep an exact in-memory index and persist index mutations as checksummed,
 sequential journal pages. When a generation exhausts its fixed slack, the live index is compacted
 sequentially into the inactive half of the preallocated index file and committed by its
 superblock. This replaces candidate-bucket capacity loss and random 4 KiB COW publication while

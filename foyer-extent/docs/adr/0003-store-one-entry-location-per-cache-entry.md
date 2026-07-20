@@ -2,52 +2,52 @@
 status: accepted
 ---
 
-# Store one segment location per cache blob
+# Store one EntryLocation per cache Entry
 
 ## Context
 
-The former ScopeDB segment adapter split every logical cache range into fixed-size physical keys. In
+The former ScopeDB extent adapter split every logical cache range into fixed-size physical keys. In
 the 4/16/64/256/1,024 KiB acceptance schedule, one logical entry became
 4.6 physical index records and owner identities on average. The sequential index journal removes the
 random COW publication cost, but it still replays, locks, mutates, and looks up every part. Reads also
-issue one physical blob read per part. This is now the largest known representation mismatch
-between ScopeDB and the segment layout.
+issue one physical Stored Entry read per part. This is now the largest known representation mismatch
+between ScopeDB and the extent layout.
 
 Naively sharding the current engine is not the next step. The two-core i8g workload is I/O-waiting,
 not CPU-saturated, and fixed per-shard capacity would strand disk space under skew. A shared free
-segment pool would avoid that loss but adds allocator and reclaim coordination before contention has
+extent pool would avoid that loss but adds allocator and reclaim coordination before contention has
 been demonstrated.
 
 ## Decision
 
-Map one immutable ScopeDB byte range to one cache blob and make that blob the native segment record:
+Map one immutable ScopeDB byte range to one cache Entry and make that Entry the native ExtentStore record:
 
-- Keep object-range parsing in the ScopeDB adapter and pass an opaque `BlobKey` to the engine. For
-  the segment layout, one index
+- Keep object-range parsing in the ScopeDB adapter and pass an opaque `EntryKey` to ExtentStore. For
+  the extent layout, one index
   location names the first of a contiguous run of 64 KiB physical slots and records the full logical
   length and checksum. The expected range length remains part of lookup validation, so a different
   length at the same object offset replaces the old cache value just as it does today.
-- Allocate the complete range inside one segment. If the current segment lacks enough consecutive
-  slots, seal it and move to another segment; do not introduce cross-segment descriptors. With the
-  1 MiB ScopeDB entry limit and 64 MiB default segments, the maximum boundary waste is 15 slots.
+- Allocate the complete range inside one extent. If the current extent lacks enough consecutive
+  slots, seal it and move to another extent; do not introduce cross-extent descriptors. With the
+  1 MiB ScopeDB entry limit and 64 MiB default extents, the maximum boundary waste is 15 slots.
 - Persist an owner record for every occupied slot using the same range identity. This deliberately
   keeps current-tail recovery linear and self-describing. Reclaim treats only the owner whose
   physical slot matches the index location as live, so eviction and promotion count the range once.
 - Bound same-priority promotion by occupied slots rather than entry count. A promoted range is never
-  split, and total promoted slots remain at most one eighth of the target segment.
+  split, and total promoted slots remain at most one eighth of the target extent.
 - Reuse `read_run_size`, `write_run_size`, batching, checkpoint, and priority settings. Keep the
-  balanced 64 KiB slot and 64 MiB segment defaults and add no range-specific tuning knob.
-- Treat segment generation as an optimistic read fence. Single-blob reads validate generation,
+  balanced 64 KiB slot and 64 MiB extent defaults and add no range-specific tuning knob.
+- Treat extent generation as an optimistic read fence. Single-Entry reads validate generation,
   verify the payload checksum and complete stored key, and recheck generation after I/O without an
   owner-file read. Foyer's engine contract loads one key at a time, so Extent keeps no parallel
   batch-read path. A reclaim that reuses a physical slot during the read therefore produces a miss
   even if the replacement payload has the same CRC32 checksum.
-- Change the persistent segment incarnation and replace the part-based production path if the
+- Change the persistent extent incarnation and replace the part-based production path if the
   experiment passes. Use the saved part-based benchmark binary for A/B rather than retaining two
   production modes.
 
-The durability order remains `blob payload + owners -> allocator state -> index journal`. A
-published blob is therefore either entirely addressable at its committed segment generation or a
+The durability order remains `Stored Entry payload + slot owners -> allocator state -> EntryIndex`. A
+published Entry is therefore either entirely addressable at its committed extent generation or a
 miss. The design does not attempt size classes or tail packing, so it removes per-part metadata and
 I/O overhead but does not claim to recover the existing final-slot padding.
 
@@ -66,7 +66,7 @@ full-scan, and recovery measurements. Otherwise delete the prototype.
 ## Evaluation
 
 The core-times-two acceptance run used four access clients on the two-core `i8g.large`, buffered
-I/O, a 64 KiB slot, a 64 MiB segment, a one-second checkpoint interval, and the same
+I/O, a 64 KiB slot, a 64 MiB extent, a one-second checkpoint interval, and the same
 4/16/64/256/1,024 KiB deterministic schedule for both binaries. It inserted 300 GiB into 240 GiB,
 performed 4,593 mixed read groups while writes were active, issued 65,536 recovered point reads,
 and then content-validated all 1,175,843 logical entries.
@@ -81,7 +81,7 @@ and then content-validated all 1,175,843 logical entries.
 | Enqueue-to-publication p99 | 1,144.59 ms | 1,024.94 ms | Pass, but still about one second |
 | Full validated scan | 475.55 s | 480.43 s | Pass; +1.0% while retaining more bytes |
 | High / normal / low byte retention | 100% / 100% / 53.5% | 100% / 100% / 55.1% | Pass |
-| Reclaimed segments | 1,496 | 1,533 | Acceptable trade-off; +2.5% |
+| Reclaimed extents | 1,496 | 1,533 | Acceptable trade-off; +2.5% |
 | Total engine writes | 342,353 MiB | 341,488 MiB | Pass; -0.3% |
 | Index writes | 1,169.5 MiB | 109.8 MiB | Pass; -90.6% |
 | Peak RSS | 980,668 KiB | 509,996 KiB | Pass; -48.0% |
