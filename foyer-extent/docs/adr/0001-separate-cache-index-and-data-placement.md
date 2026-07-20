@@ -134,6 +134,31 @@ Foyer, reflecting the explicit priority-for-padding tradeoff. Complete scans too
 483.099 seconds and found no corrupt hit. This verifies service-process crash recovery; it does not
 simulate loss of the Linux page cache during a host power failure.
 
+The borrowable priority-floor policy was independently retested with a 24 GiB historical-high
+schedule against a 6 GiB Extent cache. The process received `SIGKILL` at 78,720 of 92,253 offered
+entries (85.3%), after normal demand had begun reclaiming historical high occupancy. After the
+kernel flushed remaining dirty pages and the Linux page cache was dropped, strict recovery took
+33 ms. A sequential pass over all 92,253 candidate keys found 18,103 complete hits with zero read
+errors or invalid key, value, or priority observations. The recovered cache then accepted and
+durably checkpointed a 480-entry write wave. A second cold strict recovery took 32 ms and scanned
+the original plus appended range: all 18,242 index live entries were returned exactly once among
+92,733 candidates, again with zero errors or invalid hits. Logs are retained on the i8g development
+host under `/work/extent-engine-results/kill-priority-20260720-*.log`. This verifies process-abort
+recovery through priority reclaim and subsequent mutation; the post-kill kernel flush means it is
+still not a power-loss test.
+
+The same campaign was repeated with direct payload I/O. This process received `SIGKILL` at 69,600
+entries (75.4%), again after cross-priority reclaim had started. Cold strict recovery took 28 ms;
+the complete 92,253-key scan produced 18,234 valid hits with zero errors or invalid observations.
+The recovered engine completed and checkpointed all 480 appended writes, ending with 18,385 live
+index entries and 10 high / 84 normal segments. A second cold recovery took 27 ms and returned
+exactly those 18,385 live entries while scanning the 92,733-key combined range, again without an
+error or invalid hit. Direct I/O therefore did not expose a crash-consistency dependency on the
+payload page cache. It is not a better balanced default: the repeated hot scan remained 11.6
+seconds with direct I/O, while the equivalent buffered scan benefited from the page cache and took
+1.13 seconds. Direct and buffered kill points differed, so their retained entry counts are not a
+replacement-policy comparison.
+
 Mixed reads revealed a separate reclaim failure mode: promoting every hot slot can copy almost a
 whole segment to free one slot. In an 8 GiB pilot the old implementation had written 132.5 GB by
 90% completion. Reclaim now promotes at most the hottest one eighth of a same-priority segment,

@@ -34,6 +34,14 @@ Best-effort priority shedding is reported as an observed pipeline outcome, not t
 corruption. The run still fails if any accepted command is unfinished, a storage write or batch
 fails, or the durable checkpoint trails the published recovery frontier.
 
+Crash-recovery validation can set `EXTENT_BENCH_READ_PATTERN=sequential` and
+`EXTENT_BENCH_READS` equal to the offered entry count to visit every candidate key exactly once.
+Larger sequential read counts continue into the deterministic new-key range, which can validate a
+write wave appended after recovery.
+Set `EXTENT_BENCH_RECOVER_WRITE_WAVE=1` on a recover-only run to append and drain one write wave
+after strict recovery, concurrently validate reads, and close with a new durable checkpoint. Both
+switches are disabled by default and do not affect normal comparison runs.
+
 `EXTENT_BENCH_PRIORITY_WORKLOAD=scopedb` is the default mixed workload. The
 `historical-high` validation mode writes high-priority entries in the first half and normal entries
 in the second half. It directly checks that historical high occupancy above its floor is returned

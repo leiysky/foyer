@@ -38,6 +38,21 @@ enum PriorityWorkload {
     HistoricalHigh,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadPattern {
+    Random,
+    Sequential,
+}
+
+impl ReadPattern {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Random => "random",
+            Self::Sequential => "sequential",
+        }
+    }
+}
+
 impl PriorityWorkload {
     const fn label(self) -> &'static str {
         match self {
@@ -77,8 +92,10 @@ struct Config {
     shards: usize,
     write_concurrency: usize,
     reads: u64,
+    read_pattern: ReadPattern,
     direct_io: bool,
     recover_only: bool,
+    recover_write_wave: bool,
     reset: bool,
 }
 
@@ -155,8 +172,10 @@ impl Config {
             shards: env_usize("EXTENT_BENCH_SHARDS", cores.next_power_of_two())?,
             write_concurrency: env_usize("EXTENT_BENCH_EXTENT_WRITE_CONCURRENCY", (cores / 2).clamp(1, 8))?,
             reads: env_u64("EXTENT_BENCH_READS", workload.entries.saturating_mul(2))?,
+            read_pattern: parse_read_pattern()?,
             direct_io,
             recover_only,
+            recover_write_wave: env_bool("EXTENT_BENCH_RECOVER_WRITE_WAVE", false)?,
             reset: env_bool("EXTENT_BENCH_RESET", !recover_only)?,
         })
     }
@@ -310,7 +329,7 @@ async fn main() -> AnyResult<()> {
     fs::create_dir_all(&config.root)?;
 
     println!(
-        "foyer-engine benchmark: path={}, engines={}, entries={}, payload_mib={:.1}, capacity_mib={}, memory_mib={}, entry_kib={}, key_bytes={}, priority_workload={}, concurrency={} (>=2x cores), io={}, extent_read_priority_us={}, extent_priority_floors={}/{}, recover_only={}",
+        "foyer-engine benchmark: path={}, engines={}, entries={}, payload_mib={:.1}, capacity_mib={}, memory_mib={}, entry_kib={}, key_bytes={}, priority_workload={}, read_pattern={}, concurrency={} (>=2x cores), io={}, extent_read_priority_us={}, extent_priority_floors={}/{}, recover_only={}, recover_write_wave={}",
         config.root.display(),
         config
             .engines
@@ -325,12 +344,14 @@ async fn main() -> AnyResult<()> {
         join_sizes(&workload.entry_sizes, KIB),
         join_sizes(&workload.key_sizes, 1),
         workload.priority.label(),
+        config.read_pattern.label(),
         config.concurrency,
         if config.direct_io { "direct" } else { "buffered" },
         config.extent_io_read_priority.as_micros(),
         config.extent_high_capacity_percent,
         config.extent_normal_capacity_percent,
         config.recover_only,
+        config.recover_write_wave,
     );
 
     for engine in config.engines.iter().copied() {
@@ -411,7 +432,14 @@ async fn recover_and_read(engine: DiskEngine, config: &Config, workload: Arc<Wor
             .unwrap_or_else(|| "n/a".to_string()),
     );
 
-    let reads = run_reads(&recovered.cache, workload.clone(), config.reads, config.concurrency).await?;
+    let reads = run_reads(
+        &recovered.cache,
+        workload.clone(),
+        config.reads,
+        config.concurrency,
+        config.read_pattern,
+    )
+    .await?;
     let io = io_measurements(&recovered.cache, &recovered.extent);
     println!(
         "engine={} phase=read operations={} hits={} misses={} errors={} invalid={} hit_ratio={:.3} seconds={:.3} ops_s={:.0} hit_mib_s={:.1} disk_read_mib={:.1} disk_read_ios={}",
@@ -444,8 +472,15 @@ async fn recover_and_read(engine: DiskEngine, config: &Config, workload: Arc<Wor
     print_latencies(engine, "get_miss", &reads.miss_latencies);
     print_extent_read_stats(engine, &recovered.extent);
 
-    if !config.recover_only {
-        let before_burst = run_reads(&recovered.cache, workload.clone(), config.reads, config.concurrency).await?;
+    if !config.recover_only || config.recover_write_wave {
+        let before_burst = run_reads(
+            &recovered.cache,
+            workload.clone(),
+            config.reads,
+            config.concurrency,
+            config.read_pattern,
+        )
+        .await?;
         println!(
             "engine={} phase=read_before_write_burst operations={} hits={} misses={} errors={} invalid={} seconds={:.3} ops_s={:.0}",
             engine.label(),
@@ -643,6 +678,7 @@ async fn run_reads(
     workload: Arc<Workload>,
     reads: u64,
     concurrency: usize,
+    pattern: ReadPattern,
 ) -> AnyResult<ReadMeasurements> {
     let sample_stride = (reads / LATENCY_SAMPLE_TARGET).max(1);
     let started = Instant::now();
@@ -655,7 +691,10 @@ async fn run_reads(
             let mut result = ReadMeasurements::default();
             let mut operation = worker as u64;
             while operation < reads {
-                let index = mix64(operation ^ 0x9e37_79b9_7f4a_7c15) % workload.entries;
+                let index = match pattern {
+                    ReadPattern::Random => mix64(operation ^ 0x9e37_79b9_7f4a_7c15) % workload.entries,
+                    ReadPattern::Sequential => operation,
+                };
                 let priority = workload.priority(index);
                 result.requests_by_priority[priority.to_byte() as usize] += 1;
                 let key = make_key(index, workload.key_size(index));
@@ -752,7 +791,7 @@ async fn run_read_under_write_burst(
     });
 
     started.notified().await;
-    let reads = run_reads(cache, workload, config.reads, config.concurrency).await?;
+    let reads = run_reads(cache, workload, config.reads, config.concurrency, config.read_pattern).await?;
     let mut writes = writer.await?;
     let drain = Instant::now();
     cache.storage().wait().await;
@@ -1084,6 +1123,16 @@ fn parse_priority_workload() -> AnyResult<PriorityWorkload> {
         Ok(value) if value == "historical-high" => Ok(PriorityWorkload::HistoricalHigh),
         Ok(_) => Err(invalid("EXTENT_BENCH_PRIORITY_WORKLOAD accepts scopedb and historical-high").into()),
         Err(env::VarError::NotPresent) => Ok(PriorityWorkload::ScopeDb),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn parse_read_pattern() -> AnyResult<ReadPattern> {
+    match env::var("EXTENT_BENCH_READ_PATTERN") {
+        Ok(value) if value == "random" => Ok(ReadPattern::Random),
+        Ok(value) if value == "sequential" => Ok(ReadPattern::Sequential),
+        Ok(_) => Err(invalid("EXTENT_BENCH_READ_PATTERN accepts random and sequential").into()),
+        Err(env::VarError::NotPresent) => Ok(ReadPattern::Random),
         Err(error) => Err(error.into()),
     }
 }
