@@ -49,7 +49,7 @@ impl Manifest {
         }
     }
 
-    pub fn load(directory: &Path, level_count: usize) -> Result<Self> {
+    pub fn load_candidates(directory: &Path, level_count: usize) -> Result<Vec<Self>> {
         let mut valid = Vec::new();
         let mut failures = Vec::new();
         for slot in 0..2 {
@@ -63,15 +63,14 @@ impl Manifest {
                 Err(error) => return Err(Error::io("read manifest", error)),
             }
         }
-        valid
-            .into_iter()
-            .max_by_key(|manifest| manifest.generation)
-            .ok_or_else(|| {
-                failures
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| Error::MissingDatabase(directory.to_path_buf()))
-            })
+        valid.sort_unstable_by_key(|manifest| std::cmp::Reverse(manifest.generation));
+        if valid.is_empty() {
+            return Err(failures
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| Error::MissingDatabase(directory.to_path_buf())));
+        }
+        Ok(valid)
     }
 
     pub fn persist(&self, directory: &Path, level_count: usize) -> Result<()> {
@@ -256,9 +255,12 @@ mod tests {
             tables: vec![ManifestTable { file_id: 1, level: 0 }],
         };
         next.persist(directory.path(), 7).unwrap();
-        assert_eq!(Manifest::load(directory.path(), 7).unwrap(), next);
+        assert_eq!(
+            Manifest::load_candidates(directory.path(), 7).unwrap(),
+            vec![next.clone(), initial.clone()]
+        );
 
         std::fs::write(directory.path().join("MANIFEST-0"), b"torn").unwrap();
-        assert_eq!(Manifest::load(directory.path(), 7).unwrap(), initial);
+        assert_eq!(Manifest::load_candidates(directory.path(), 7).unwrap(), vec![initial]);
     }
 }

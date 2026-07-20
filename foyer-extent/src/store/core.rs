@@ -268,7 +268,7 @@ impl ExtentStore {
         let mut input_index = 0usize;
 
         while input_index < inserts.len() {
-            let mut known = HashMap::new();
+            let mut known: HashMap<KeyDigest, KnownInsert<'_>> = HashMap::new();
             let mut pending = Vec::new();
             let mut protected_extents = HashSet::new();
 
@@ -278,20 +278,34 @@ impl ExtentStore {
                 let stored_len =
                     stored_entry_len(insert.key, insert.value).expect("validated stored entry length must fit usize");
                 let checksum = stored_entry_checksum(insert.key, insert.value);
-                let (current, would_admit) = if let Some(location) = known.get(&key_digest) {
-                    (Some(*location), true)
+                let (would_admit, exact_match) = if let Some(known) = known.get(&key_digest) {
+                    (
+                        true,
+                        known.location.stored_len as usize == stored_len
+                            && known.location.checksum == checksum
+                            && insert.priority == known.location.priority
+                            && insert.key == known.key
+                            && insert.value == known.value,
+                    )
                 } else {
-                    self.index.probe(key_digest, insert.priority)?
-                };
-                if let Some(current) = current {
-                    if current.stored_len as usize == stored_len
+                    let (current, would_admit) = self.index.probe(key_digest, insert.priority)?;
+                    let exact_match = if let Some(current) = current
+                        && current.stored_len as usize == stored_len
                         && current.checksum == checksum
                         && insert.priority == current.priority
                     {
-                        outcomes[input_index] = Some(InsertOutcome::Updated);
-                        input_index += 1;
-                        continue;
-                    }
+                        self.pool.read_stored_entry(current)?.is_some_and(|(key, value)| {
+                            key.as_bytes() == insert.key.as_bytes() && value.as_slice() == insert.value
+                        })
+                    } else {
+                        false
+                    };
+                    (would_admit, exact_match)
+                };
+                if exact_match {
+                    outcomes[input_index] = Some(InsertOutcome::Updated);
+                    input_index += 1;
+                    continue;
                 } else if !would_admit {
                     outcomes[input_index] = Some(InsertOutcome::Rejected);
                     input_index += 1;
@@ -325,7 +339,14 @@ impl ExtentStore {
                     checksum,
                     priority: stored_priority,
                 };
-                known.insert(key_digest, location);
+                known.insert(
+                    key_digest,
+                    KnownInsert {
+                        location,
+                        key: insert.key,
+                        value: insert.value,
+                    },
+                );
                 protected_extents.insert(allocation.extent);
                 pending.push(PendingInsert {
                     input_index,
@@ -535,6 +556,13 @@ struct PendingInsert<'a> {
     checksum: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct KnownInsert<'a> {
+    location: EntryLocation,
+    key: &'a EntryKey,
+    value: &'a [u8],
+}
+
 fn validate_options(options: ExtentStoreOptions) -> Result<()> {
     if !(1..=64).contains(&options.write_concurrency) {
         return Err(Error::InvalidConfig(
@@ -698,6 +726,43 @@ mod tests {
         assert_eq!(reopened.pool.layout(), layout);
         assert_eq!(reopened.get(&key(1)).unwrap(), Some(vec![2; 200]));
         assert!(reopened.get(&key(2)).unwrap().is_none());
+    }
+
+    #[test]
+    fn crc_collision_does_not_suppress_a_value_update() {
+        let dir = tempdir().unwrap();
+        let store = store(dir.path(), 4 * 1024 * 1024);
+        let first_key = key(1);
+        let batched_key = key(2);
+        let old = vec![0x11; 512];
+        let mut replacement = vec![0x22; 512];
+        replacement[508..].copy_from_slice(&[0xce, 0xe0, 0x15, 0xb2]);
+        assert_ne!(old, replacement);
+        assert_eq!(
+            stored_entry_checksum(&first_key, &old),
+            stored_entry_checksum(&first_key, &replacement)
+        );
+        assert_eq!(
+            stored_entry_checksum(&batched_key, &old),
+            stored_entry_checksum(&batched_key, &replacement)
+        );
+
+        store.insert(&first_key, &old, CachePriority::Normal).unwrap();
+        store.insert(&first_key, &replacement, CachePriority::Normal).unwrap();
+        store
+            .insert_batch(&[
+                EntryInsert::new(&batched_key, &old, CachePriority::Normal),
+                EntryInsert::new(&batched_key, &replacement, CachePriority::Normal),
+            ])
+            .unwrap();
+        assert_eq!(store.get(&first_key).unwrap(), Some(replacement.clone()));
+        assert_eq!(store.get(&batched_key).unwrap(), Some(replacement.clone()));
+        store.sync().unwrap();
+        drop(store);
+
+        let reopened = ExtentStore::open_with_options(dir.path(), options()).unwrap();
+        assert_eq!(reopened.get(&first_key).unwrap(), Some(replacement.clone()));
+        assert_eq!(reopened.get(&batched_key).unwrap(), Some(replacement));
     }
 
     #[test]

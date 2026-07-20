@@ -323,6 +323,10 @@ where
             let bytes = memory.usage();
             tracing::info!(bytes, "[hybrid]: flush all in-memory cached entries to disk on close");
             memory.flush().await;
+            // `memory.flush` only waits for work that preceded the flush before enqueueing the
+            // memory entries. Drain those newly enqueued entries before an engine with bounded
+            // shutdown semantics is allowed to discard its unstarted queue tail.
+            storage.wait().await;
         }
         storage.close().await?;
 

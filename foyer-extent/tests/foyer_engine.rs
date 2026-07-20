@@ -36,6 +36,19 @@ fn engine_config(path: &std::path::Path) -> ExtentEngineConfig {
         .with_write_batch_entries(32)
 }
 
+fn close_flush_engine_config(path: &Path) -> ExtentEngineConfig {
+    ExtentEngineConfig::new(path, 32 * 1024 * 1024)
+        .with_test_layout(PAGE_SIZE, PAGE_SIZE * 8)
+        .with_read_run_size(PAGE_SIZE)
+        .with_write_run_size(PAGE_SIZE * 8)
+        .with_index_write_buffer_size(PAGE_SIZE * 16)
+        .with_index_cache_size(1024 * 1024)
+        .with_queue_capacity_bytes(8 * 1024 * 1024)
+        .with_queue_capacity_entries(256)
+        .with_write_batch_bytes(PAGE_SIZE)
+        .with_write_batch_entries(1)
+}
+
 fn block_engine_config(path: &Path) -> Box<dyn EngineConfig<Bytes, EngineValue, HybridCacheProperties>> {
     let device = FsDeviceBuilder::new(path).with_capacity(DISK_CAPACITY).build().unwrap();
     Box::new(
@@ -123,6 +136,54 @@ async fn block_and_extent_match_the_entry_lifecycle_contract() {
     let directory = tempfile::tempdir().unwrap();
     verify_foyer_engine_contract(&directory.path().join("block-case"), DiskEngine::Block).await;
     verify_foyer_engine_contract(&directory.path().join("extent-case"), DiskEngine::Extent).await;
+}
+
+#[tokio::test]
+async fn default_flush_on_close_drains_every_memory_entry_before_extent_shutdown() {
+    const ENTRIES: u8 = 128;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("flush-on-close");
+    let cache: FoyerCache = HybridCache::builder()
+        .with_name("extent-flush-on-close")
+        .memory(8 * 1024 * 1024)
+        .with_shards(2)
+        .with_weighter(|key: &Bytes, value: &EngineValue| key.len() + value.value().len() + 64)
+        .storage()
+        .with_engine_config(Box::new(close_flush_engine_config(&path))
+            as Box<dyn EngineConfig<Bytes, EngineValue, HybridCacheProperties>>)
+        .with_recover_mode(RecoverMode::None)
+        .build()
+        .await
+        .unwrap();
+    for index in 0..ENTRIES {
+        cache.insert(
+            Bytes::from(vec![b'k', index]),
+            EngineValue::new(Bytes::from(vec![index; 16 * 1024]), CachePriority::High).unwrap(),
+        );
+    }
+    cache.close().await.unwrap();
+    drop(cache);
+
+    let recovered: FoyerCache = HybridCache::builder()
+        .with_name("extent-flush-on-close-recovery")
+        .with_flush_on_close(false)
+        .memory(8 * 1024 * 1024)
+        .with_shards(2)
+        .with_weighter(|key: &Bytes, value: &EngineValue| key.len() + value.value().len() + 64)
+        .storage()
+        .with_engine_config(Box::new(close_flush_engine_config(&path))
+            as Box<dyn EngineConfig<Bytes, EngineValue, HybridCacheProperties>>)
+        .with_recover_mode(RecoverMode::Strict)
+        .build()
+        .await
+        .unwrap();
+    for index in 0..ENTRIES {
+        let key = Bytes::from(vec![b'k', index]);
+        let entry = recovered.get(&key).await.unwrap().unwrap();
+        assert_eq!(entry.value().value(), &Bytes::from(vec![index; 16 * 1024]));
+    }
+    recovered.close().await.unwrap();
 }
 
 #[tokio::test]

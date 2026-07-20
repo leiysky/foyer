@@ -549,20 +549,39 @@ impl FixedLsm {
             return Err(Error::MissingDatabase(directory.to_path_buf()));
         }
         let lock = lock_database(directory)?;
-        let manifest = Manifest::load(directory, LEVEL_COUNT)?;
+        let manifests = Manifest::load_candidates(directory, LEVEL_COUNT)?;
         let cache = Arc::new(BlockCache::new(options.cache_capacity));
         let io = Arc::new(TableIoCounters::default());
-        let mut tables = Vec::with_capacity(manifest.tables.len());
-        for table in &manifest.tables {
-            tables.push(Table::open(
-                directory,
-                table.file_id,
-                table.level,
-                cache.clone(),
-                io.clone(),
-            )?);
+        let mut selected = None;
+        let mut newest_error = None;
+        for manifest in manifests {
+            let opened = (|| -> Result<Arc<Version>> {
+                let mut tables = Vec::with_capacity(manifest.tables.len());
+                for table in &manifest.tables {
+                    tables.push(Table::open(
+                        directory,
+                        table.file_id,
+                        table.level,
+                        cache.clone(),
+                        io.clone(),
+                    )?);
+                }
+                Ok(Arc::new(Version::from_tables(tables)?))
+            })();
+            match opened {
+                Ok(version) => {
+                    selected = Some((manifest, version));
+                    break;
+                }
+                Err(error) => {
+                    if newest_error.is_none() {
+                        newest_error = Some(error);
+                    }
+                }
+            }
         }
-        let version = Arc::new(Version::from_tables(tables)?);
+        let (manifest, version) =
+            selected.ok_or_else(|| newest_error.unwrap_or_else(|| Error::MissingDatabase(directory.to_path_buf())))?;
         let recovered = replay_all(directory, manifest.flushed_sequence)?;
         let mut mutable = MemTableData::default();
         for record in &recovered.records {
@@ -1338,16 +1357,17 @@ fn compaction_output_fences(version: &Version, target_level: usize) -> Vec<Key> 
 fn compaction_plan(version: &Version, options: FixedLsmOptions, force_l0: bool) -> Option<CompactionPlan> {
     let (base_level, targets) = dynamic_level_targets(version, options);
     if version.levels[0].len() >= L0_COMPACTION_TRIGGER || force_l0 && !version.levels[0].is_empty() {
-        if let Some(source) = version.levels[0]
-            .iter()
-            .rev()
-            .find(|source| {
-                version.levels[base_level]
-                    .iter()
-                    .all(|table| !overlaps(table, source.meta().smallest, source.meta().largest))
-            })
-            .cloned()
-        {
+        if let Some(source) = version.levels[0].iter().enumerate().rev().find_map(|(index, source)| {
+            let target_is_disjoint = version.levels[base_level]
+                .iter()
+                .all(|table| !overlaps(table, source.meta().smallest, source.meta().largest));
+            // L0 is read newest-first. Moving a table below an older overlapping L0 table
+            // would invert their read precedence and could make the older value authoritative.
+            let older_l0_is_disjoint = version.levels[0][index + 1..]
+                .iter()
+                .all(|table| !overlaps(table, source.meta().smallest, source.meta().largest));
+            (target_is_disjoint && older_l0_is_disjoint).then(|| source.clone())
+        }) {
             let drop_tombstones = base_level + 1 == LEVEL_COUNT;
             let trivial_move = !drop_tombstones || source.meta().tombstone_count == 0;
             return Some(CompactionPlan {
@@ -1642,7 +1662,7 @@ fn crash_if_requested(point: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::{cmp::Ordering, process::Command, sync::Arc};
+    use std::{cmp::Ordering, fs, process::Command, sync::Arc};
 
     use crate::{
         db::{
@@ -1651,12 +1671,20 @@ mod tests {
         },
         error::Error,
         format::DATA_BLOCK_SIZE,
+        table::table_path,
         wal::wal_path,
     };
 
     fn key(index: u64) -> [u8; 24] {
         let mut key = [0; 24];
         key[..8].copy_from_slice(&index.to_be_bytes());
+        key
+    }
+
+    fn prefixed_key(prefix: u8, index: u64) -> [u8; 24] {
+        let mut key = [0; 24];
+        key[0] = prefix;
+        key[1..9].copy_from_slice(&index.to_be_bytes());
         key
     }
 
@@ -1724,6 +1752,32 @@ mod tests {
         assert!(wal_path(directory.path(), 1).is_file());
         assert!(!wal_path(directory.path(), 2).exists());
         assert!(wal_path(directory.path(), 3).is_file());
+    }
+
+    #[test]
+    fn open_falls_back_when_the_newest_manifest_references_a_missing_table() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = FixedLsm::create(directory.path(), test_options()).unwrap();
+        db.put(key(1), value(1, 1), WriteOptions::buffered()).unwrap();
+        db.flush().unwrap();
+        let older = mutex_lock(&db.inner.writer).manifest.clone();
+
+        db.put(key(2), value(2, 1), WriteOptions::buffered()).unwrap();
+        db.flush().unwrap();
+        let newest = mutex_lock(&db.inner.writer).manifest.clone();
+        let newest_only = newest
+            .tables
+            .iter()
+            .find(|table| !older.tables.iter().any(|candidate| candidate.file_id == table.file_id))
+            .unwrap()
+            .file_id;
+        drop(db);
+
+        fs::remove_file(table_path(directory.path(), newest_only)).unwrap();
+        let reopened = FixedLsm::open(directory.path(), test_options()).unwrap();
+        assert_eq!(reopened.stats().manifest_generation, older.generation);
+        assert_eq!(reopened.get(&key(1)).unwrap(), Some(value(1, 1)));
+        assert_eq!(reopened.get(&key(2)).unwrap(), None);
     }
 
     #[test]
@@ -2037,6 +2091,45 @@ mod tests {
         reader.join().unwrap();
         assert_eq!(db.get(&key(3)).unwrap(), Some(value(3, 6)));
         assert!(db.stats().level_files[0] < 4);
+    }
+
+    #[test]
+    fn l0_trivial_move_never_inverts_overlapping_table_precedence() {
+        let directory = tempfile::tempdir().unwrap();
+        let options = FixedLsmOptions {
+            write_buffer_capacity: 64 * 1024,
+            cache_capacity: 1024 * 1024,
+            ..FixedLsmOptions::default()
+        };
+        let db = FixedLsm::create(directory.path(), options).unwrap();
+
+        let mut oldest = WriteBatch::with_capacity(16_000);
+        for index in 0..16_000 {
+            oldest.put(prefixed_key(0, index), value(index, 1));
+        }
+        db.write(&oldest, WriteOptions::buffered()).unwrap();
+        db.flush().unwrap();
+
+        for entries in [
+            &[(0, 1), (2, 1)][..],
+            &[(1, 1), (3, 1), (4, 1)][..],
+            &[(3, 2)][..],
+            &[(5, 1)][..],
+            &[(6, 1)][..],
+        ] {
+            let mut batch = WriteBatch::with_capacity(entries.len());
+            for &(prefix, generation) in entries {
+                batch.put(prefixed_key(prefix, 0), value(0, generation));
+            }
+            db.write(&batch, WriteOptions::buffered()).unwrap();
+            db.flush().unwrap();
+        }
+
+        assert_eq!(db.get(&prefixed_key(3, 0)).unwrap(), Some(value(0, 2)));
+        drop(db);
+
+        let reopened = FixedLsm::open(directory.path(), options).unwrap();
+        assert_eq!(reopened.get(&prefixed_key(3, 0)).unwrap(), Some(value(0, 2)));
     }
 
     #[test]
