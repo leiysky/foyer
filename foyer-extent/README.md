@@ -50,6 +50,12 @@ The physical hierarchy is allocation slots grouped into cache segments. A blob o
 slots within exactly one segment, and a segment is reused as one generation. Object ranges,
 application-specific key encoding, and remote-storage behavior belong outside the project.
 
+Capacity is the only production static input. The Extent format owns the balanced 64 KiB slot and
+64 MiB segment layout; changing either, the layout derivation, record encoding, or an incompatible
+embedded-index format requires an `EXTENT_FORMAT_VERSION` bump. Layout overrides remain available
+only as a test and benchmark escape hatch. Runtime I/O, queue, batching, checkpoint, frequency, and
+index-memory settings can change across reopens.
+
 The durable exact index is the workspace-private `foyer-fixed-lsm` crate. RocksDB support is gated
 behind the `rocksdb-benchmark` feature and exists only as an industrial comparison point.
 

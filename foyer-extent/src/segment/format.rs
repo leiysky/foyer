@@ -15,6 +15,10 @@ const STATE_CHECKSUM_SIZE: usize = size_of::<u32>();
 const STATE_MAGIC: [u8; 8] = *b"SCSEGST1";
 const OWNER_MAGIC: [u8; 4] = *b"SCOW";
 const LOCATION_MAGIC: [u8; 4] = *b"SCLO";
+/// Compatibility identity for every persisted Extent layout and encoding choice.
+///
+/// Bump this when changing the balanced slot or segment size, layout derivation, record encoding,
+/// or an incompatible format in the embedded fixed-record index.
 pub const EXTENT_FORMAT_VERSION: u32 = 3;
 const NO_SEGMENT: u32 = u32::MAX;
 const FIXED_LSM_INDEX_BYTES_PER_ENTRY: u64 = 76;

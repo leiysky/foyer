@@ -635,8 +635,7 @@ async fn build_cache(
         DiskEngine::Extent => {
             let queue_entries = (config.queue_bytes / (4 * KIB)).max(1);
             let extent = ExtentEngineConfig::new(path.join("extent-engine"), config.capacity_bytes as u64)
-                .with_slot_size(config.extent_slot_size)
-                .with_segment_size(config.extent_segment_size)
+                .with_test_layout(config.extent_slot_size, config.extent_segment_size)
                 .with_write_concurrency(config.write_concurrency)
                 .with_io_read_priority_duration(config.extent_io_read_priority)
                 .with_index_cache_size(config.extent_index_cache_bytes)

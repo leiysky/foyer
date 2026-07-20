@@ -24,8 +24,7 @@ enum DiskEngine {
 
 fn engine_config(path: &std::path::Path) -> ExtentEngineConfig {
     ExtentEngineConfig::new(path, DISK_CAPACITY as u64)
-        .with_slot_size(PAGE_SIZE)
-        .with_segment_size(PAGE_SIZE * 8)
+        .with_test_layout(PAGE_SIZE, PAGE_SIZE * 8)
         .with_read_run_size(PAGE_SIZE)
         .with_write_run_size(PAGE_SIZE * 8)
         .with_index_write_buffer_size(PAGE_SIZE * 16)

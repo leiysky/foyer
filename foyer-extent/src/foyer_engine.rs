@@ -55,9 +55,9 @@ type ExtentPiece = PieceRef<Bytes, EngineValue, HybridCacheProperties>;
 
 /// Configuration for installing Extent as a Foyer disk engine.
 ///
-/// Capacity, slot size, and segment size define the on-disk layout and must match when reopening in
-/// strict recovery mode. Queue, batching, I/O, checkpoint, frequency, and index-cache settings are
-/// runtime tuning knobs and may change across reopens.
+/// Capacity is the only production static input. The format owns its slot and segment sizes and
+/// validates the effective layout when reopening. Queue, batching, I/O, checkpoint, frequency, and
+/// index-cache settings are runtime tuning knobs and may change across reopens.
 #[derive(Debug)]
 pub struct ExtentEngineConfig {
     path: PathBuf,
@@ -92,15 +92,13 @@ impl ExtentEngineConfig {
         }
     }
 
-    /// Set the physical allocation quantum. This is a static on-disk layout choice.
-    pub fn with_slot_size(mut self, bytes: usize) -> Self {
-        self.segment.slot_size = bytes;
-        self
-    }
-
-    /// Set the physical reclaim unit. This is a static on-disk layout choice.
-    pub fn with_segment_size(mut self, bytes: usize) -> Self {
-        self.segment.options.segment_size = bytes;
+    /// Override the format-owned layout for tests and benchmarks.
+    ///
+    /// Production integrations must use the balanced layout selected by [`Self::new`].
+    #[doc(hidden)]
+    pub fn with_test_layout(mut self, slot_size: usize, segment_size: usize) -> Self {
+        self.segment.slot_size = slot_size;
+        self.segment.options.segment_size = segment_size;
         self
     }
 
@@ -817,8 +815,7 @@ mod tests {
 
     async fn cache(path: &std::path::Path) -> (TestCache, ExtentEngineHandle) {
         let config = ExtentEngineConfig::new(path, 16 * 1024 * 1024)
-            .with_slot_size(4 * 1024)
-            .with_segment_size(32 * 1024)
+            .with_test_layout(4 * 1024, 32 * 1024)
             .with_index_write_buffer_size(64 * 1024)
             .with_index_cache_size(1024 * 1024)
             .with_queue_capacity_bytes(1024 * 1024)
@@ -903,8 +900,7 @@ mod tests {
     async fn close_discards_only_unstarted_commands_and_leaves_a_recoverable_prefix() {
         let directory = tempfile::tempdir().unwrap();
         let config = ExtentEngineConfig::new(directory.path(), 16 * 1024 * 1024)
-            .with_slot_size(4 * 1024)
-            .with_segment_size(32 * 1024)
+            .with_test_layout(4 * 1024, 32 * 1024)
             .with_index_write_buffer_size(64 * 1024)
             .with_index_cache_size(1024 * 1024)
             .with_queue_capacity_bytes(1024 * 1024)
