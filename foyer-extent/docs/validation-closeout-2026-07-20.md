@@ -7,6 +7,10 @@ Date: 2026-07-20
 > write-throughput, capacity-retention, read-tail, crash, and long-running reclaim gates before a
 > production canary.
 
+Current behavior is specified by the [architecture](architecture.md),
+[ExtentStore](extent-store.md), and [EntryIndex](entry-index.md) design documents. This report is
+dated evidence and does not override them.
+
 This closes the synthetic development-host performance phase. ExtentEngine has enough evidence to
 enter an opt-in ScopeDB production canary with BlockEngine as the rollback path. It is not yet
 evidence for making ExtentEngine the unconditional default: its structural recovery and priority

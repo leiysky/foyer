@@ -1,5 +1,23 @@
 # ExtentStore design
 
+## Scope
+
+`ExtentStore` is the ordered disk-side core beneath ExtentEngine. It owns Entry publication,
+checkpoint frontiers, EntryIndex coordination, and reclaim orchestration over one ExtentPool. It
+does not define the public best-effort API, own Foyer's memory tier, or interpret application keys.
+
+The logical integrity contract is defined in [Cache contract](cache-contract.md), the engine and
+queue boundary in [Foyer integration](foyer-integration.md), and the durable index in
+[EntryIndex design](entry-index.md).
+
+The store is designed around five constraints:
+
+- one complete Entry has one location and never crosses a cache-extent boundary;
+- allocation and publication are append-oriented, while reclaim operates on whole cache extents;
+- recovery reads bounded metadata rather than scanning payload or rebuilding every live key;
+- priority protection is borrowable and reclaim-unit aware rather than a fixed partition; and
+- a crash may lose a recent tail but cannot produce a wrong or torn hit.
+
 ## Model
 
 `ExtentStore` stores one complete Entry per variable-length `EntryKey`. Its physical hierarchy is:
@@ -23,7 +41,7 @@ The store directory contains:
 | Path | Role |
 | --- | --- |
 | `data` | Preallocated packed Stored Entry bytes |
-| `directory` | One fixed owner record per Entry allocation |
+| `directory` | One fixed directory record per Entry allocation |
 | `state` | Two alternating checksummed allocator-state copies |
 | `index-lsm/` | FixedRecordLSM WAL, manifests, and SSTs |
 
@@ -55,18 +73,19 @@ After a single-Entry index lookup, `ExtentPool` validates the extent generation,
 byte range in runs bounded by `read_run_size`, checksum-checks the Stored Entry, and rechecks the
 generation. Direct I/O expands the read to the covering 4 KiB frame span; buffered I/O reads only
 the logical bytes. This path does not read Entry-directory metadata, so a hot index lookup does not
-add a sidecar I/O. Directory records exist for reclaim and tail recovery, not foreground lookup. Any stale, torn, or
-mismatched location is a miss/error boundary, never an unverified hit. There is deliberately no
-second batch-read implementation beside Foyer's point-load interface.
+add a sidecar I/O. Directory records exist for reclaim and tail recovery, not foreground lookup.
+Any stale, torn, or mismatched location is a miss/error boundary, never an unverified hit. There is
+deliberately no second batch-read implementation beside Foyer's point-load interface.
 
 ## I/O admission
 
-`ExtentPool` owns a cooperative synchronous I/O scheduler for the payload data plane. One read
-permit spans all physical runs of an Entry payload; acquisition is an atomic lock-free fast path and never
-waits for a write. Data and Entry-directory write runs plus their publication syncs use write permits. A write
-first looks for a read-quiescent point, but the read-priority interval is bounded (2 ms by default),
-so continuously arriving reads cannot starve cache publication or reclaim. Existing write
-concurrency remains the hard cap. A zero interval bypasses admission and accounting entirely.
+`ExtentPool` owns the physical half of the cooperative synchronous I/O scheduler described in
+[Foyer integration](foyer-integration.md). One read permit spans all physical runs of an Entry
+payload; acquisition is an atomic lock-free fast path and never waits for a write. Data and
+Entry-directory write runs plus their publication syncs use write permits. A write first looks for
+a read-quiescent point, but the read-priority interval is bounded (2 ms by default), so continuously
+arriving reads cannot starve cache publication or reclaim. Existing write concurrency remains the
+hard cap. A zero interval bypasses admission and accounting entirely.
 
 The scheduler does not own buffers, spawn I/O workers, reorder durability steps, or alter the disk
 format. The admitted caller executes the positional syscall directly. Allocator-state persistence
@@ -106,6 +125,17 @@ state. Graceful `sync` and close wait for the latest epoch and already-scheduled
 maintenance, so a late flush or compaction failure cannot be hidden by an earlier WAL durability
 acknowledgement.
 
+The checkpoint protocol maintains these invariants:
+
+- a durable index location references only payload and allocator state from the same or an earlier
+  publication frontier;
+- a captured allocator/index image is immutable while it is persisted;
+- a newer requested epoch remains pending when an older checkpoint completes;
+- abort merge preserves the newest per-key overlay mutation;
+- reclaim cannot reuse a cache-extent generation while an older captured epoch may reference it;
+  and
+- close succeeds only after its target epoch and scheduled index maintenance are durable.
+
 ## Reclaim
 
 Allocation is append-oriented within the current extent. Under pressure, priority capacity floors
@@ -143,18 +173,13 @@ Priority and temperature remain distinct:
 - capacity floors protect minimum physical residency without persisting temperature;
 - promotion requires the configured threshold for the entry's priority.
 
-## FixedRecordLSM boundary
+## EntryIndex boundary
 
-The durable index supports exactly 24-byte keys and 32-byte locations, atomic put/delete batches,
-point lookup, WAL recovery, and an opaque `u64` application state. It has no range API, public
-iterator, transaction model, column family, compression selector, or pluggable compaction policy.
-
-Its fixed policy uses immutable SSTs, Bloom filters, a bounded block cache, partitioned leveled
-compaction, and alternating manifests. Open reads fence summaries and a bounded WAL tail; detailed
-metadata and data blocks are demand-loaded. One eighth of the runtime cache budget is reserved for
-lazy, table-local Bloom pages, which become lock-free after their first validated read. The
-remaining shared budget serves evictable data pages and any Bloom pages that cannot enter the
-pinned tier. ExtentStore supplies no range or payload-layout knowledge to the LSM.
+The durable index supports fixed 24-byte digests and 32-byte locations, atomic put/delete batches,
+point lookup, WAL recovery, and one opaque `u64` application state. ExtentStore supplies no range or
+payload-layout knowledge to it. Overlay concurrency, FixedRecordLSM policy, recovery, cache
+accounting, and rejected index implementations are specified in
+[EntryIndex design](entry-index.md).
 
 ## Failure model
 
@@ -166,10 +191,30 @@ pinned tier. ExtentStore supplies no range or payload-layout knowledge to the LS
 - The newest invalid allocator or manifest copy falls back to the older valid copy.
 - New SSTs are synced before a manifest can reference them.
 - Obsolete SST/WAL files are unlinked only after the new manifest is durable.
-- A crash before index publication may leak byte allocations or directory positions; a crash after it recovers only previously
-  durable payload/generation state.
+- A crash before index publication may leak byte allocations or directory positions; a crash after
+  it recovers only previously durable payload/generation state.
 - Since this is an expendable cache, an integrator may recreate an invalid top-level store; the
   store itself still reports the corruption precisely.
+
+## Design rationale and rejected alternatives
+
+- **Fixed allocation slots** simplified alignment but imposed severe tail padding on small Entries.
+  V4 packs exact byte ranges and uses page alignment only for physical I/O frames.
+- **Cross-extent Entry descriptors** would reduce boundary waste but make reads, reclaim, and crash
+  recovery span multiple generations. Extent seals the current cache extent instead.
+- **Payload scanning during reclaim or recovery** would remove the Entry directory at the cost of a
+  full payload read. The compact sidecar keeps these paths bounded without entering foreground
+  lookup.
+- **One directory record per page or slot** duplicates Entry identity and inflates index cardinality.
+  V4 stores one directory record and one EntryIndex location per complete Entry.
+- **Fixed priority partitions** strand capacity when one class is idle. Borrowable floors preserve
+  minimum residency while allowing repayment under later demand.
+- **An independent background reclaimer** would race the total mutation order and generation
+  checkpointing. Reclaim remains an ordered ExtentStore transition.
+- **A hard EntryIndex capacity limit** turns transient LSM amplification into a cache-health
+  failure. The layout target is soft while usage remains exactly accounted.
+- **Synchronizing mutable payload files in the background checkpoint** lets the sync chase later
+  writes. Each physical batch pays its bounded payload fence before immutable metadata capture.
 
 ## Deliberate non-goals
 

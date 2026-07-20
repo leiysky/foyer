@@ -3,6 +3,9 @@
 `foyer_engine_compare` compares BlockEngine and ExtentEngine below the same Foyer HybridCache. It
 does not depend on ScopeDB. Both sides use `Bytes` keys, `EngineValue`, S3FIFO, write-on-insertion,
 the same memory capacity and shards, the same seeded randomized workload, and the same concurrency.
+The production boundary being exercised is specified in
+[Foyer integration design](foyer-integration.md); this document defines validation procedure rather
+than engine behavior.
 
 The scenario generator is counter-based: a seed and operation number always produce the same
 request regardless of task scheduling. Entry size, key size, ScopeDB priority, key content, value

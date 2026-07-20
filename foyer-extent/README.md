@@ -86,7 +86,19 @@ can recreate the expendable cache without leaving its legacy owner file behind. 
 tail-recovery, and process-crash tests cover the current directory, allocator, checkpoint, and
 reclaim publication paths.
 
-See [`docs/architecture.md`](docs/architecture.md) for module boundaries,
-[`docs/extent-store.md`](docs/extent-store.md) for the on-disk and crash-safety design, and
-[`docs/foyer-engine-benchmark.md`](docs/foyer-engine-benchmark.md) for the
-BlockEngine comparison.
+Design documentation is organized by boundary:
+
+- [`docs/architecture.md`](docs/architecture.md) — system goals, layers, invariants, and document
+  map;
+- [`docs/cache-contract.md`](docs/cache-contract.md) — Entry identity, best-effort semantics, and
+  integrity;
+- [`docs/foyer-integration.md`](docs/foyer-integration.md) — Foyer engine adaptation, queues,
+  lifecycle, and observability;
+- [`docs/extent-store.md`](docs/extent-store.md) — V4 physical layout, checkpoint, reclaim, and
+  failure model; and
+- [`docs/entry-index.md`](docs/entry-index.md) — overlays, FixedRecordLSM, recovery, and index-space
+  accounting.
+
+[`docs/foyer-engine-benchmark.md`](docs/foyer-engine-benchmark.md) defines the BlockEngine
+comparison procedure. Dated measurements and production gates remain separate validation evidence,
+not design truth.
