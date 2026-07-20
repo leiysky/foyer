@@ -22,6 +22,9 @@ twox-hash = { workspace = true, features = ["xxhash3_64"] }
 [dev-dependencies]
 tempfile = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { workspace = true }
+
 [lints.rust]
 unsafe_code = "deny"
 unused_must_use = "deny"
