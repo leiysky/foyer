@@ -70,6 +70,11 @@ The internal mapping from an entry-key digest to one EntryLocation. It must veri
 from the Stored Entry before returning a hit.
 _Avoid_: Public KV interface, blob-key map, payload store
 
+**EntryIndex capacity target**:
+The physical-space planning allowance for EntryIndex inside a cache layout. Crossing it signals
+pressure but never by itself rejects a cache write or makes the cache unhealthy.
+_Avoid_: Hard index limit, index quota
+
 **Reclaimer**:
 The ExtentStore component that resolves allocation pressure by choosing a cache extent, fencing
 generation reuse, evicting entries, and optionally promoting a bounded hot subset.
@@ -78,33 +83,38 @@ _Avoid_: LSM compactor, generic garbage collector, background eviction service
 ### Physical storage
 
 **ExtentPool**:
-The bounded physical collection that owns cache extents, allocation slots, payload/owner files, and
-their lifecycle state.
+The bounded physical collection of cache extents and their lifecycle state.
 _Avoid_: ExtentStore, engine, device
 
 **Cache extent**:
-A fixed-size append-oriented group of allocation slots with one active priority and one generation.
-It contains many Stored Entries and is sealed, reclaimed, and reused as one unit.
+A fixed-size append-oriented byte region with one active priority and one generation. It contains
+many Stored Entries and is sealed, reclaimed, and reused as one unit.
 _Avoid_: Segment, entry extent, priority partition
 
-**Allocation slot**:
-The fixed-size physical allocation quantum. One Stored Entry may occupy multiple contiguous slots
-inside exactly one cache extent.
-_Avoid_: Block, chunk, extent
-
 **Entry allocation**:
-The contiguous allocation-slot span occupied by one Stored Entry. It is not independently reclaimed.
+The contiguous byte range occupied by one Stored Entry inside exactly one cache extent. It is not
+independently reclaimed.
 _Avoid_: Extent allocation, block chain, reclaim unit
 
 **Entry location** (`EntryLocation`):
-The physical reference to one Stored Entry: first slot, encoded length, checksum, priority, and
+The physical reference to one Stored Entry: byte offset, encoded length, checksum, priority, and
 extent generation.
 _Avoid_: Extent location, blob address, index entry
 
-**Slot owner** (`SlotOwner`):
-The fixed record repeated for each occupied allocation slot so reclaim can identify candidate
-entries without rebuilding variable-length metadata.
-_Avoid_: Entry, index record, ownership service
+**Entry directory**:
+The per-cache-extent sequence of fixed records identifying its Stored Entries for tail recovery and
+reclaim without reading payload bytes.
+_Avoid_: Slot owners, EntryIndex, public index
+
+**I/O frame**:
+The page-aligned transfer unit used to publish packed Entry allocations. It is not an allocation or
+reclaim unit, and multiple Stored Entries may share one frame.
+_Avoid_: Allocation slot, cache extent, block
+
+**Entry charge**:
+The minimum accounting weight of one Entry used to bound directory and EntryIndex cardinality. It
+does not round the Entry allocation or describe physical bytes written.
+_Avoid_: Slot size, Entry size, frame size
 
 **Extent generation**:
 The reuse epoch of one cache extent. It fences EntryLocations left behind by an older physical

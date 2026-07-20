@@ -29,7 +29,7 @@ fn engine_config(path: &std::path::Path) -> ExtentEngineConfig {
         .with_write_run_size(PAGE_SIZE * 8)
         .with_index_write_buffer_size(PAGE_SIZE * 16)
         .with_index_cache_size(1024 * 1024)
-        .with_checkpoint_changes(8)
+        .with_checkpoint_bytes(8)
         .with_queue_capacity_bytes(1024 * 1024)
         .with_queue_capacity_entries(128)
         .with_write_batch_bytes(128 * 1024)
@@ -241,7 +241,7 @@ async fn extent_reports_complete_physical_write_statistics_to_foyer() {
 async fn periodic_checkpoint_bounds_the_recovery_frontier() {
     let directory = tempfile::tempdir().unwrap();
     let config = engine_config(&directory.path().join("periodic-checkpoint"))
-        .with_checkpoint_changes(usize::MAX)
+        .with_checkpoint_bytes(usize::MAX)
         .with_checkpoint_interval(Duration::from_millis(20));
     let handle = config.handle();
     let cache = Cache::builder(MEMORY_CAPACITY, config)
@@ -267,7 +267,7 @@ async fn periodic_checkpoint_bounds_the_recovery_frontier() {
         assert!(Instant::now() < deadline, "periodic checkpoint did not advance");
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
-    assert_eq!(checkpoint.dirty_changes, 0);
+    assert_eq!(checkpoint.dirty_bytes, 0);
 
     let writes = handle.write_stats().unwrap();
     assert_eq!(writes.accepted_commands, 1);

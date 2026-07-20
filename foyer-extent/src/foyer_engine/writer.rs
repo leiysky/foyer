@@ -238,7 +238,7 @@ impl WriteWorker {
                 }
             }
             self.stats
-                .record_remaining_index_reads(self.statistics.as_ref(), self.store.entry_index_read_stats());
+                .record_remaining_index_reads(self.statistics.as_ref(), self.store.entry_index_io_read_stats());
             let completed = Instant::now();
             self.stats.record_write_batch(completed.duration_since(started));
             self.stats.record_write_publications(
@@ -281,7 +281,7 @@ impl WriteWorker {
 
 pub fn sync_store(store: &ExtentStore, statistics: &Statistics, stats: &EngineStats) -> crate::Result<()> {
     let result = store.sync();
-    stats.record_remaining_index_reads(statistics, store.entry_index_read_stats());
+    stats.record_remaining_index_reads(statistics, store.entry_index_io_read_stats());
     let physical = store.physical_write_stats();
     stats.record_remaining_writes(statistics, physical.total_runs(), physical.total_bytes());
     result

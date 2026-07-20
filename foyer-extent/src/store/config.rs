@@ -1,14 +1,15 @@
 use std::time::Duration;
 
-use crate::format::DEFAULT_SLOT_SIZE;
+use crate::format::DEFAULT_ENTRY_CHARGE;
 
 pub const DEFAULT_EXTENT_SIZE: usize = 64 * 1024 * 1024;
 pub const DEFAULT_HIGH_PRIORITY_CAPACITY_PERCENT: u8 = 10;
 pub const DEFAULT_NORMAL_PRIORITY_CAPACITY_PERCENT: u8 = 70;
-const DEFAULT_READ_RUN_SIZE: usize = DEFAULT_SLOT_SIZE;
+const DEFAULT_READ_RUN_SIZE: usize = 64 * 1024;
 const DEFAULT_WRITE_RUN_SIZE: usize = 1024 * 1024;
 const DEFAULT_INDEX_WRITE_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 const DEFAULT_INDEX_CACHE_SIZE: usize = 1024 * 1024 * 1024;
+const DEFAULT_CHECKPOINT_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_IO_READ_PRIORITY_DURATION: Duration = Duration::from_millis(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +67,7 @@ pub struct ExtentStoreOptions {
     pub write_run_size: usize,
     pub index_write_buffer_size: usize,
     pub index_cache_size: usize,
-    pub checkpoint_changes: usize,
+    pub checkpoint_bytes: usize,
     pub hot_frequency: u8,
     pub low_hot_frequency: u8,
     pub priority_capacity_floors: PriorityCapacityFloors,
@@ -83,7 +84,7 @@ impl Default for ExtentStoreOptions {
             write_run_size: DEFAULT_WRITE_RUN_SIZE,
             index_write_buffer_size: DEFAULT_INDEX_WRITE_BUFFER_SIZE,
             index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
-            checkpoint_changes: 4_096,
+            checkpoint_bytes: DEFAULT_CHECKPOINT_BYTES,
             hot_frequency: 2,
             low_hot_frequency: 2,
             priority_capacity_floors: PriorityCapacityFloors::default(),
@@ -114,8 +115,8 @@ impl ExtentStoreOptions {
         self
     }
 
-    pub fn with_checkpoint_changes(mut self, changes: usize) -> Self {
-        self.checkpoint_changes = changes;
+    pub fn with_checkpoint_bytes(mut self, bytes: usize) -> Self {
+        self.checkpoint_bytes = bytes;
         self
     }
 
@@ -144,7 +145,7 @@ impl ExtentStoreOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExtentStoreConfig {
     pub capacity_bytes: u64,
-    pub slot_size: usize,
+    pub entry_charge: usize,
     pub options: ExtentStoreOptions,
 }
 
@@ -152,14 +153,14 @@ impl ExtentStoreConfig {
     pub fn new(capacity_bytes: u64) -> Self {
         Self {
             capacity_bytes,
-            slot_size: DEFAULT_SLOT_SIZE,
+            entry_charge: DEFAULT_ENTRY_CHARGE,
             options: ExtentStoreOptions::default(),
         }
     }
 
     #[cfg(test)]
-    pub fn with_slot_size(mut self, slot_size: usize) -> Self {
-        self.slot_size = slot_size;
+    pub fn with_entry_charge(mut self, entry_charge: usize) -> Self {
+        self.entry_charge = entry_charge;
         self
     }
 

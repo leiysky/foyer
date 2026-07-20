@@ -2,7 +2,20 @@
 
 `foyer_engine_compare` compares BlockEngine and ExtentEngine below the same Foyer HybridCache. It
 does not depend on ScopeDB. Both sides use `Bytes` keys, `EngineValue`, S3FIFO, write-on-insertion,
-the same memory capacity and shards, the same deterministic workload, and the same concurrency.
+the same memory capacity and shards, the same seeded randomized workload, and the same concurrency.
+
+The scenario generator is counter-based: a seed and operation number always produce the same
+request regardless of task scheduling. Entry size, key size, ScopeDB priority, key content, value
+content, write order, and random read selection use independent streams. Writes use an
+allocation-free random permutation, so every offered key is visited exactly once rather than being
+sampled with replacement. The benchmark prints the decimal and hexadecimal seed on its first line.
+`EXTENT_BENCH_SEED` accepts a decimal or `0x`-prefixed `u64`; use at least three unrelated seeds for
+an acceptance result and retain every seed with its log. The default seed is fixed so a failure is
+reproducible without extra configuration.
+
+Every fresh image stores a scenario manifest next to the engine directory. Recover-only runs reject
+a missing or mismatched manifest, including a different seed, size list, priority workload, or
+scenario-generator version. Images created by an older benchmark must therefore be repopulated.
 
 The benchmark refuses to run without `EXTENT_BENCH_PATH`; point it at a real SSD directory, never a
 tmpfs. It deletes only the selected `block` and `extent` children when reset is enabled.
@@ -16,14 +29,33 @@ EXTENT_BENCH_PAYLOAD_MIB=600 \
 cargo bench -p foyer-extent --bench foyer_engine_compare
 ```
 
-The default entry sizes are 4, 16, 64, 256, and 1024 KiB. Default key sizes are 32, 96, 256, and
-1024 bytes. Access concurrency defaults to twice the detected CPU core count and values below that
-are rejected. Put concurrency uses the same value by default; `EXTENT_BENCH_PUT_CONCURRENCY` can
-override it for an explicit write-side control run without weakening concurrent read validation.
+For a three-seed comparison, use separate roots so every seed owns an independently populated
+image:
 
-After the cold-memory read phase, the benchmark repeats the read workload on the same cache to
-establish a warm steady-state control, then runs it again while a new-key write wave is being
-submitted. It reports
+```shell
+for seed in 0x243f6a8885a308d3 0x13198a2e03707344 0xa4093822299f31d0; do
+  EXTENT_BENCH_SEED="$seed" \
+  EXTENT_BENCH_PATH="/path/on/ssd/extent-${seed}" \
+  EXTENT_BENCH_CAPACITY_MIB=512 \
+  EXTENT_BENCH_PAYLOAD_MIB=600 \
+  cargo bench -p foyer-extent --bench foyer_engine_compare
+done
+```
+
+The default entry sizes are 4, 16, 64, 256, and 1024 KiB. Default key sizes are 32, 96, 256, and
+1024 bytes; custom key sizes must be at least eight bytes so the generated keys remain unique.
+Configured size choices are selected uniformly by independent seeded streams instead of cycling in
+a fixed order. Access concurrency defaults to twice the detected CPU core count and values below
+that are rejected. Put concurrency uses the same value by default; `EXTENT_BENCH_PUT_CONCURRENCY`
+can override it for an explicit write-side control run without weakening concurrent read
+validation.
+
+Storage-only reads default to one full hotset warmup. Warmup uses a randomized permutation without
+replacement, so every candidate is visited before measurement; `EXTENT_BENCH_READ_WARMUP` can
+override the operation count, including zero for an explicitly cold control. The primary measured
+read uses an independent random stream. The benchmark then uses one matched random stream for both
+the no-writer control and the read-under-write phase, eliminating request-mix noise from the p99
+inflation comparison. It reports
 separate hit and miss latency distributions and `hit_p99_inflation` relative to the no-writer phase,
 plus foreground and drain time for the burst. Keeping hits separate prevents intentionally fast
 misses after eviction from hiding storage-read contention. The read side alone uses the configured
@@ -36,9 +68,9 @@ corruption. The run still fails if any accepted command is unfinished, a storage
 fails, or the durable checkpoint trails the published recovery frontier.
 
 Crash-recovery validation can set `EXTENT_BENCH_READ_PATTERN=sequential` and
-`EXTENT_BENCH_READS` equal to the offered entry count to visit every candidate key exactly once.
-Larger sequential read counts continue into the deterministic new-key range, which can validate a
-write wave appended after recovery.
+`EXTENT_BENCH_READS` equal to `EXTENT_BENCH_READ_HOTSET` to visit every candidate key exactly once.
+Larger sequential read counts wrap within the hotset; they do not implicitly continue into a
+post-recovery write-wave range.
 `EXTENT_BENCH_STORAGE_READS=1` bypasses HybridCache memory lookup and exercises the storage engine
 directly. `EXTENT_BENCH_READ_HOTSET` bounds the repeated key range, while
 `EXTENT_BENCH_READ_WARMUP` performs a separate warmup before the measured read phase. Together
@@ -55,8 +87,9 @@ to normal demand instead of permanently starving it.
 
 Reported Extent read bytes and I/O operations include both payload reads recorded through Foyer's
 device statistics and FixedRecordLSM reads. The separate `extent_read` and `extent_index_read`
-records provide that total's decomposition. Extent write statistics include the final metadata
-checkpoint performed by `wait` or close.
+records provide that total's phase-local decomposition; warmup work is subtracted before the
+primary measured-read record. Extent write statistics include the final metadata checkpoint
+performed by `wait` or close.
 
 `EXTENT_BENCH_IO_READ_PRIORITY_US` controls Extent's cooperative payload-I/O policy and accepts
 zero as a complete bypass. The benchmark prints `extent_io_scheduler` records with the number and
@@ -77,7 +110,7 @@ EXTENT_BENCH_PAYLOAD_MIB=307200 \
 EXTENT_BENCH_MEMORY_MIB=2048 \
 EXTENT_BENCH_QUEUE_MIB=512 \
 EXTENT_BENCH_WAVE_MIB=128 \
-EXTENT_BENCH_SLOT_KIB=16 \
+EXTENT_BENCH_ENTRY_CHARGE_KIB=4 \
 EXTENT_BENCH_DIRECT=0 \
 cargo bench -p foyer-extent --bench foyer_engine_compare
 ```
@@ -112,10 +145,11 @@ cargo bench -p foyer-extent --bench foyer_engine_compare
 footprint without performing the normal reopen, reads, or write burst. It is mutually exclusive
 with `EXTENT_BENCH_RECOVER_ONLY` and leaves a clean image for repeated cold-recovery trials.
 
-Important tuning variables remain explicit: `EXTENT_BENCH_ENGINES`, `EXTENT_BENCH_CONCURRENCY`,
+Important tuning variables remain explicit: `EXTENT_BENCH_SEED`, `EXTENT_BENCH_ENGINES`,
+`EXTENT_BENCH_CONCURRENCY`,
 `EXTENT_BENCH_PUT_CONCURRENCY`, `EXTENT_BENCH_SHARDS`, `EXTENT_BENCH_BLOCK_MIB`,
 `EXTENT_BENCH_BLOCK_BUFFER_MIB`,
-`EXTENT_BENCH_EXTENT_MIB`, `EXTENT_BENCH_SLOT_KIB`, `EXTENT_BENCH_INDEX_CACHE_MIB`,
+`EXTENT_BENCH_EXTENT_MIB`, `EXTENT_BENCH_ENTRY_CHARGE_KIB`, `EXTENT_BENCH_INDEX_CACHE_MIB`,
 `EXTENT_BENCH_INDEX_WRITE_BUFFER_MIB`, `EXTENT_BENCH_EXTENT_WRITE_CONCURRENCY`, and
 `EXTENT_BENCH_IO_READ_PRIORITY_US`. Priority-isolation experiments may also override
 `EXTENT_BENCH_HIGH_CAPACITY_PERCENT` and `EXTENT_BENCH_NORMAL_CAPACITY_PERCENT`; their sum must not

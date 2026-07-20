@@ -13,7 +13,7 @@ use crate::{
         ExtentStore, ExtentStoreOptions,
         index::INDEX_DIRECTORY,
         operation::InsertOutcome,
-        pool::{DATA_FILE, SLOT_OWNER_FILE, STATE_FILE},
+        pool::{DATA_FILE, ENTRY_DIRECTORY_FILE, LEGACY_SLOT_OWNER_FILE, STATE_FILE},
     },
 };
 
@@ -22,7 +22,13 @@ fn options() -> ExtentStoreOptions {
         .with_extent_size(PAGE_SIZE * 8)
         .with_index_write_buffer_size(PAGE_SIZE * 4)
         .with_index_cache_size(1024 * 1024)
-        .with_checkpoint_changes(usize::MAX)
+        .with_checkpoint_bytes(usize::MAX)
+}
+
+fn config() -> crate::store::config::ExtentStoreConfig {
+    crate::store::config::ExtentStoreConfig::new(4 * 1024 * 1024)
+        .with_entry_charge(PAGE_SIZE)
+        .with_options(options())
 }
 
 fn key(index: u64) -> EntryKey {
@@ -116,7 +122,7 @@ fn install_v3_fixture(root: &Path) {
         DATA_OFFSET,
     )
     .unwrap();
-    let owners = File::create(root.join(SLOT_OWNER_FILE)).unwrap();
+    let owners = File::create(root.join(LEGACY_SLOT_OWNER_FILE)).unwrap();
     owners.set_len(OWNER_LEN).unwrap();
     write_all_at(
         &owners,
@@ -151,16 +157,13 @@ fn install_v3_fixture(root: &Path) {
 }
 
 #[test]
-fn opens_and_advances_the_frozen_v3_store_fixture() {
+fn rejects_and_recreates_the_frozen_v3_store_fixture() {
     let dir = tempdir().unwrap();
     install_v3_fixture(dir.path());
-    let fixture_key = EntryKey::new(b"compat-key-v3").unwrap();
-    let fixture_value = b"frozen extent value";
-
-    let store = ExtentStore::open_with_options(dir.path(), options()).unwrap();
-    let loaded = store.get_with_stats(&fixture_key).unwrap();
-    assert_eq!(loaded.value.as_deref(), Some(fixture_value.as_slice()));
-    assert_eq!(loaded.priority, Some(CachePriority::High));
+    assert!(ExtentStore::open_with_options(dir.path(), options()).is_err());
+    let store = ExtentStore::recreate(dir.path(), config()).unwrap();
+    assert!(!dir.path().join(LEGACY_SLOT_OWNER_FILE).exists());
+    assert!(dir.path().join(ENTRY_DIRECTORY_FILE).exists());
     let next_key = key(99);
     assert_eq!(
         store
@@ -172,10 +175,6 @@ fn opens_and_advances_the_frozen_v3_store_fixture() {
     drop(store);
 
     let reopened = ExtentStore::open_with_options(dir.path(), options()).unwrap();
-    assert_eq!(
-        reopened.get(&fixture_key).unwrap().as_deref(),
-        Some(fixture_value.as_slice())
-    );
     assert_eq!(
         reopened.get(&next_key).unwrap().as_deref(),
         Some(b"written by current store".as_slice())

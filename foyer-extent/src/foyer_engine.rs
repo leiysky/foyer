@@ -24,7 +24,7 @@ use crate::{
     MAX_KEY_SIZE, PhysicalWriteStats, ReclaimStats,
     format::STORED_ENTRY_HEADER_SIZE,
     model::EntryKey,
-    store::{ExtentStore, ExtentStoreConfig},
+    store::{ExtentStore, ExtentStoreConfig, PreparedGet},
 };
 
 mod queue;
@@ -55,7 +55,7 @@ type ExtentPiece = PieceRef<Bytes, EngineValue, HybridCacheProperties>;
 
 /// Configuration for installing Extent as a Foyer disk engine.
 ///
-/// Capacity is the only production static input. The format owns its slot and extent sizes and
+/// Capacity is the only production static input. The format owns its entry charge and extent size and
 /// validates the effective layout when reopening. Queue, batching, I/O, checkpoint, frequency, and
 /// index-cache settings are runtime tuning knobs and may change across reopens.
 #[derive(Debug)]
@@ -96,8 +96,8 @@ impl ExtentEngineConfig {
     ///
     /// Production integrations must use the balanced layout selected by [`Self::new`].
     #[doc(hidden)]
-    pub fn with_test_layout(mut self, slot_size: usize, extent_size: usize) -> Self {
-        self.store.slot_size = slot_size;
+    pub fn with_test_layout(mut self, entry_charge: usize, extent_size: usize) -> Self {
+        self.store.entry_charge = entry_charge;
         self.store.options.extent_size = extent_size;
         self
     }
@@ -138,9 +138,9 @@ impl ExtentEngineConfig {
         self
     }
 
-    /// Set the number of index mutations between background checkpoint requests.
-    pub fn with_checkpoint_changes(mut self, changes: usize) -> Self {
-        self.store.options.checkpoint_changes = changes;
+    /// Set the published Stored Entry byte budget between background checkpoint requests.
+    pub fn with_checkpoint_bytes(mut self, bytes: usize) -> Self {
+        self.store.options.checkpoint_bytes = bytes;
         self
     }
 
@@ -470,7 +470,7 @@ impl ExtentEngine {
         let background_error = Arc::new(BackgroundError::new(metrics.clone()));
         metrics.storage_engine_healthy.absolute(1);
         let stats = Arc::new(EngineStats::new(metrics.clone()));
-        stats.record_remaining_index_reads(io_control.statistics(), store.entry_index_read_stats());
+        stats.record_remaining_index_reads(io_control.statistics(), store.entry_index_io_read_stats());
         stats.record_extent_occupancy(store.extent_occupancy());
         let read_limiter = ReadLimiter::new(config.read_concurrency, metrics.clone());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -593,6 +593,13 @@ impl Engine<Bytes, EngineValue, HybridCacheProperties> for ExtentEngine {
                 Ok(key) => key,
                 Err(_) => return Ok(Load::Miss),
             };
+            let prepared = inner
+                .store
+                .prepare_get(&entry_key)
+                .map_err(|error| extent_error("prepare Extent entry lookup", error))?;
+            if prepared == PreparedGet::Miss {
+                return Ok(Load::Miss);
+            }
             let Some(read_permit) = inner.read_limiter.try_acquire() else {
                 return Ok(Load::Throttled);
             };
@@ -601,16 +608,16 @@ impl Engine<Bytes, EngineValue, HybridCacheProperties> for ExtentEngine {
                 .spawner
                 .spawn_blocking(move || {
                     let _read_permit = read_permit;
-                    store.get_with_stats(&entry_key)
+                    store.get_prepared(&entry_key, prepared)
                 })
                 .await;
             inner
                 .stats
-                .record_remaining_index_reads(inner.io_control.statistics(), inner.store.entry_index_read_stats());
+                .record_remaining_index_reads(inner.io_control.statistics(), inner.store.entry_index_io_read_stats());
             let loaded = loaded?.map_err(|error| extent_error("load Extent entry", error))?;
             inner
                 .stats
-                .record_read(loaded.data_slots, loaded.data_runs, loaded.data_bytes);
+                .record_read(loaded.data_frames, loaded.data_runs, loaded.data_bytes);
             inner
                 .stats
                 .record_disk_reads(inner.io_control.statistics(), loaded.data_bytes, loaded.data_runs);

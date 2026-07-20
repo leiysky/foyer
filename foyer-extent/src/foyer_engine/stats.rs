@@ -18,7 +18,7 @@ const LATENCY_SAMPLE_CAPACITY: usize = 16_384;
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EngineReadStats {
     pub calls: u64,
-    pub data_slots: u64,
+    pub data_frames: u64,
     pub data_runs: u64,
     pub data_bytes: u64,
 }
@@ -82,8 +82,8 @@ impl EngineStats {
         mutex_lock(&self.reclaim).merge(reclaim);
     }
 
-    pub fn record_read(&self, data_slots: usize, data_runs: usize, data_bytes: usize) {
-        self.reads.record(data_slots, data_runs, data_bytes);
+    pub fn record_read(&self, data_frames: usize, data_runs: usize, data_bytes: usize) {
+        self.reads.record(data_frames, data_runs, data_bytes);
     }
 
     pub fn reads(&self) -> EngineReadStats {
@@ -177,7 +177,7 @@ impl EngineStats {
             .absolute(checkpoint.in_flight_epoch.unwrap_or(0));
         self.metrics
             .storage_engine_checkpoint_dirty
-            .absolute(checkpoint.dirty_changes as u64);
+            .absolute(checkpoint.dirty_bytes as u64);
     }
 
     pub fn record_extent_occupancy(&self, occupancy: ExtentOccupancy) {
@@ -267,7 +267,7 @@ struct RecordedIo {
 #[derive(Default)]
 struct EngineReadCounters {
     calls: AtomicU64,
-    data_slots: AtomicU64,
+    data_frames: AtomicU64,
     data_runs: AtomicU64,
     data_bytes: AtomicU64,
 }
@@ -304,9 +304,9 @@ impl EngineWriteCounters {
 }
 
 impl EngineReadCounters {
-    fn record(&self, data_slots: usize, data_runs: usize, data_bytes: usize) {
+    fn record(&self, data_frames: usize, data_runs: usize, data_bytes: usize) {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        self.data_slots.fetch_add(data_slots as u64, Ordering::Relaxed);
+        self.data_frames.fetch_add(data_frames as u64, Ordering::Relaxed);
         self.data_runs.fetch_add(data_runs as u64, Ordering::Relaxed);
         self.data_bytes.fetch_add(data_bytes as u64, Ordering::Relaxed);
     }
@@ -314,7 +314,7 @@ impl EngineReadCounters {
     fn snapshot(&self) -> EngineReadStats {
         EngineReadStats {
             calls: self.calls.load(Ordering::Relaxed),
-            data_slots: self.data_slots.load(Ordering::Relaxed),
+            data_frames: self.data_frames.load(Ordering::Relaxed),
             data_runs: self.data_runs.load(Ordering::Relaxed),
             data_bytes: self.data_bytes.load(Ordering::Relaxed),
         }

@@ -3,7 +3,11 @@ use crc_fast::{CrcAlgorithm, Digest};
 use crate::model::{EntryKey, MAX_KEY_SIZE};
 
 pub const PAGE_SIZE: usize = 4 * 1024;
-pub const DEFAULT_SLOT_SIZE: usize = 64 * 1024;
+/// The minimum capacity charge used to bound entry-directory and index cardinality.
+///
+/// Stored Entries are packed by byte inside an extent. This charge is an accounting bound, not a
+/// physical allocation unit.
+pub const DEFAULT_ENTRY_CHARGE: usize = PAGE_SIZE;
 
 const STORED_ENTRY_MAGIC: [u8; 4] = *b"SCBL";
 const STORED_ENTRY_VERSION: u8 = 1;

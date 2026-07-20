@@ -40,7 +40,7 @@ const fn encode_key(key: [u8; KEY_SIZE]) -> [u8; KEY_SIZE] {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BenchmarkLocation {
-    physical_slot: u64,
+    data_offset: u64,
     extent_generation: u32,
     stored_len: u32,
     checksum: u32,
@@ -50,7 +50,7 @@ struct BenchmarkLocation {
 impl BenchmarkLocation {
     fn encode(self) -> [u8; VALUE_SIZE] {
         let mut output = [0; VALUE_SIZE];
-        output[..8].copy_from_slice(&self.physical_slot.to_le_bytes());
+        output[..8].copy_from_slice(&self.data_offset.to_le_bytes());
         output[8..12].copy_from_slice(&self.extent_generation.to_le_bytes());
         output[12..16].copy_from_slice(&self.stored_len.to_le_bytes());
         output[16..20].copy_from_slice(&self.checksum.to_le_bytes());
@@ -63,7 +63,7 @@ impl BenchmarkLocation {
             return None;
         }
         Some(Self {
-            physical_slot: u64::from_le_bytes(input[..8].try_into().ok()?),
+            data_offset: u64::from_le_bytes(input[..8].try_into().ok()?),
             extent_generation: u32::from_le_bytes(input[8..12].try_into().ok()?),
             stored_len: u32::from_le_bytes(input[12..16].try_into().ok()?),
             checksum: u32::from_le_bytes(input[16..20].try_into().ok()?),
@@ -74,7 +74,7 @@ impl BenchmarkLocation {
 
 fn scale_location(index: u64, generation: u32) -> BenchmarkLocation {
     BenchmarkLocation {
-        physical_slot: index,
+        data_offset: index,
         extent_generation: generation,
         stored_len: 16 * 1024,
         checksum: (index as u32).rotate_left(generation % 31),
@@ -445,7 +445,7 @@ fn concurrent_hot_lookups(
     let hot_keys = hot_keys.min(blobs as usize);
     assert!(hot_keys > 0);
     for index in 0..hot_keys as u64 {
-        assert_eq!(lookup(&database.db, index).physical_slot, index);
+        assert_eq!(lookup(&database.db, index).data_offset, index);
     }
     let statistics_before = statistics(&database.options);
     let read_before = process_field("/proc/self/io", "read_bytes:");
@@ -467,7 +467,7 @@ fn concurrent_hot_lookups(
                     let index = state % hot_keys as u64;
                     let sampled = operation.is_multiple_of(DEFAULT_SAMPLE_INTERVAL).then(Instant::now);
                     let location = lookup(&database.db, index);
-                    assert_eq!(location.physical_slot, index);
+                    assert_eq!(location.data_offset, index);
                     std::hint::black_box(location);
                     if let Some(started) = sampled {
                         samples.push(started.elapsed());
@@ -516,7 +516,7 @@ fn recover(path: &Path, blobs: u64, config: &BenchmarkConfig) {
         .zip(process_field("/proc/self/io", "read_bytes:"))
         .map(|(before, after)| after.saturating_sub(before));
     for index in [0, 1.min(blobs - 1), blobs / 2, blobs - 1] {
-        assert_eq!(lookup(&database.db, index).physical_slot, index);
+        assert_eq!(lookup(&database.db, index).data_offset, index);
     }
     let expected_updates = env_optional_u64("ROCKSDB_INDEX_BENCH_EXPECTED_UPDATES", 0);
     if expected_updates > 0 {
@@ -631,7 +631,7 @@ fn concurrent_mixed_access(
                     );
                     let sampled = operation.is_multiple_of(DEFAULT_SAMPLE_INTERVAL).then(Instant::now);
                     let location = lookup(&database.db, index);
-                    assert_eq!(location.physical_slot, index);
+                    assert_eq!(location.data_offset, index);
                     std::hint::black_box(location);
                     if let Some(started) = sampled {
                         samples.push(started.elapsed());

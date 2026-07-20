@@ -13,8 +13,8 @@ generation-reuse fencing, and priority-aware reclaim.
 
 The balanced engine defaults use a 256 MiB submission budget, 128 MiB idle write batches, an 8 MiB
 write batch while reads are active, and a one-second periodic checkpoint request in addition to
-the mutation-count trigger. High and normal priorities have borrowable 10% and 70% logical extent
-capacity floors; low priority uses unprotected capacity. Physical reads have a hard, non-waiting
+the 256 MiB published-byte trigger. High and normal priorities have borrowable 10% and 70% logical
+extent capacity floors; low priority uses unprotected capacity. Physical reads have a hard, non-waiting
 `2 * available_parallelism` admission limit. The synchronous payload I/O scheduler gives an active
 entry-payload read a bounded 2 ms head start over newly admitted writes; reads never wait behind writes, and
 writes proceed after the bound so sustained reads cannot starve publication. This is a cooperative
@@ -47,15 +47,18 @@ The shared physical-I/O counters include both payload and index reads, including
 as a validated cache miss, and all payload, checkpoint, and index writes. Cumulative FixedRecordLSM
 counters are reconciled exactly once so concurrent lookups cannot double-count index I/O.
 
-The physical hierarchy is allocation slots grouped into cache extents. A Stored Entry occupies
-contiguous slots within exactly one cache extent, and a cache extent is reused as one generation. Object ranges,
-application-specific key encoding, and remote-storage behavior belong outside the project.
+Stored Entries occupy contiguous byte ranges packed within cache extents. Adjacent allocations in
+one publication batch share page-aligned I/O frames; an I/O frame is not a capacity or reclaim unit.
+Each Stored Entry has one fixed directory record, and a cache extent is reused as one generation.
+Object ranges, application-specific key encoding, and remote-storage behavior belong outside the
+project.
 
-Capacity is the only production static input. The Extent format owns the balanced 64 KiB slot and
-64 MiB extent layout; changing either, the layout derivation, record encoding, or an incompatible
-embedded-index format requires an `EXTENT_FORMAT_VERSION` bump. Layout overrides remain available
-only as a test and benchmark escape hatch. Runtime I/O, queue, batching, checkpoint, frequency, and
-index-memory settings can change across reopens.
+Capacity is the only production static input. The V4 format owns a 64 MiB cache extent, a 4 KiB I/O
+frame, and a 4 KiB minimum Entry charge. The charge bounds directory and index cardinality but does
+not round physical Entry allocations. Changing these choices, layout derivation, record encoding,
+or an incompatible embedded-index format requires an `EXTENT_FORMAT_VERSION` bump. Layout
+overrides remain available only as a test and benchmark escape hatch. Runtime I/O, queue, batching,
+checkpoint, frequency, and index-memory settings can change across reopens.
 
 The durable exact index is the workspace-private `foyer-fixed-lsm` crate. RocksDB support is gated
 behind the `rocksdb-benchmark` feature and exists only as an industrial comparison point.
@@ -78,10 +81,10 @@ discards the unstarted queue tail, and publishes one final durable checkpoint. T
 is explicitly counted. This bounds shutdown by one batch plus checkpoint work without exposing a
 partially published entry; cache writes remain best effort and the source remains authoritative.
 
-Compatibility CI reconstructs a frozen complete V3 store image—including payload, owners,
-allocator pages, FixedRecordLSM manifest, and WAL—then opens it, reads it, advances it with the
-current writer, and reopens it. This prevents simultaneous encoder/decoder changes from hiding an
-on-disk incompatibility. Process-crash tests separately cover checkpoint and reclaim publication.
+Compatibility CI reconstructs a frozen complete V3 store image and verifies that V4 rejects it and
+can recreate the expendable cache without leaving its legacy owner file behind. V4 round-trip,
+tail-recovery, and process-crash tests cover the current directory, allocator, checkpoint, and
+reclaim publication paths.
 
 See [`docs/architecture.md`](docs/architecture.md) for module boundaries,
 [`docs/extent-store.md`](docs/extent-store.md) for the on-disk and crash-safety design, and

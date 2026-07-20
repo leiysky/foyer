@@ -14,7 +14,7 @@ pub enum InsertOutcome {
 pub struct GetResult {
     pub value: Option<Vec<u8>>,
     pub priority: Option<CachePriority>,
-    pub data_slots: usize,
+    pub data_frames: usize,
     pub data_runs: usize,
     pub data_bytes: usize,
 }
@@ -35,7 +35,7 @@ impl<'a> EntryInsert<'a> {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BatchInsertResult {
     pub outcomes: Vec<InsertOutcome>,
-    /// Number of physical write syscalls planned after adjacent slots were merged.
+    /// Number of physical write syscalls planned after adjacent byte ranges were merged.
     pub write_runs: usize,
     /// Full aligned allocation bytes submitted by the physical batch writer.
     pub written_bytes: usize,

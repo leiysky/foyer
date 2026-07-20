@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
-use fixed_lsm::{FixedLsm, FixedLsmOptions, WriteBatch, WriteOptions};
+use fixed_lsm::{FixedLsm, FixedLsmMemoryLookup, FixedLsmOptions, WriteBatch, WriteOptions};
 use twox_hash::XxHash3_64;
 
 #[cfg(test)]
@@ -54,6 +54,13 @@ pub struct EntryIndexReadStats {
     pub filter_positives: u64,
     pub false_positives: u64,
     pub data_reads: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EntryIndexMemoryLookup {
+    Location(EntryLocation),
+    Miss,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,7 +141,7 @@ impl EntryIndex {
                 max_disk_bytes: capacity_bytes,
             },
         )
-        .map_err(fixed_open_error)?;
+        .map_err(|error| fixed_error("open", error))?;
         if database.user_state() > live_capacity {
             return Err(Error::InvalidSuperblock(format!(
                 "EntryIndex live count {} exceeds capacity {live_capacity}",
@@ -195,6 +202,15 @@ impl EntryIndex {
         }
     }
 
+    pub fn io_read_stats(&self) -> EntryIndexReadStats {
+        let stats = self.database.read_stats();
+        EntryIndexReadStats {
+            read_operations: stats.read_operations,
+            read_bytes: stats.read_bytes,
+            ..EntryIndexReadStats::default()
+        }
+    }
+
     pub fn stats(&self) -> EntryIndexStats {
         let database = self.database.stats();
         let state = read_lock(&self.state);
@@ -233,9 +249,36 @@ impl EntryIndex {
             .map_err(|error| fixed_error("wait for maintenance", error))
     }
 
-    pub fn get(&self, key: KeyDigest) -> Result<Option<EntryLocation>> {
+    pub fn lookup_memory(&self, key: KeyDigest) -> Result<EntryIndexMemoryLookup> {
         self.frequency.record(key_hash(key));
-        self.lookup(key)
+        loop {
+            let base_revision = {
+                let state = read_lock(&self.state);
+                if let Some(mutation) = overlay_mutation(&state, key) {
+                    return Ok(mutation
+                        .location
+                        .map_or(EntryIndexMemoryLookup::Miss, EntryIndexMemoryLookup::Location));
+                }
+                state.base_revision
+            };
+            let lookup = self
+                .database
+                .probe_memory(&encode_key(key))
+                .map_err(|error| fixed_error("memory lookup", error))?;
+            let state = read_lock(&self.state);
+            if let Some(mutation) = overlay_mutation(&state, key) {
+                return Ok(mutation
+                    .location
+                    .map_or(EntryIndexMemoryLookup::Miss, EntryIndexMemoryLookup::Location));
+            }
+            if state.base_revision == base_revision {
+                return match lookup {
+                    FixedLsmMemoryLookup::Value(value) => decode_location(value).map(EntryIndexMemoryLookup::Location),
+                    FixedLsmMemoryLookup::Miss => Ok(EntryIndexMemoryLookup::Miss),
+                    FixedLsmMemoryLookup::Unknown => Ok(EntryIndexMemoryLookup::Unknown),
+                };
+            }
+        }
     }
 
     pub fn peek(&self, key: KeyDigest) -> Result<Option<EntryLocation>> {
@@ -278,13 +321,7 @@ impl EntryIndex {
                 return Ok(mutation.location);
             }
             if state.base_revision == base_revision {
-                return value
-                    .map(|value| {
-                        EntryLocation::decode(&value).ok_or_else(|| {
-                            Error::InvalidSuperblock("EntryIndex contains an invalid EntryLocation".to_string())
-                        })
-                    })
-                    .transpose();
+                return value.map(decode_location).transpose();
             }
         }
     }
@@ -301,7 +338,7 @@ impl EntryIndex {
             let mut state = write_lock(&self.state);
             if existing.is_none() && state.live_count >= self.live_capacity {
                 return Err(Error::InvalidSuperblock(
-                    "EntryIndex reached data capacity before allocation reclaimed a slot".to_string(),
+                    "EntryIndex reached data capacity before allocation reclaimed an extent".to_string(),
                 ));
             }
             state.active.insert(key, Mutation::insert(location));
@@ -420,6 +457,11 @@ impl EntryIndex {
     }
 }
 
+fn decode_location(value: [u8; fixed_lsm::VALUE_SIZE]) -> Result<EntryLocation> {
+    EntryLocation::decode(&value)
+        .ok_or_else(|| Error::InvalidSuperblock("EntryIndex contains an invalid EntryLocation".to_string()))
+}
+
 fn overlay_mutation(state: &RuntimeState, key: KeyDigest) -> Option<Mutation> {
     state
         .active
@@ -464,19 +506,6 @@ fn fixed_error(context: &'static str, error: fixed_lsm::Error) -> Error {
     }
 }
 
-fn fixed_open_error(error: fixed_lsm::Error) -> Error {
-    match error {
-        fixed_lsm::Error::CapacityExceeded {
-            capacity,
-            used,
-            requested,
-        } => Error::InvalidSuperblock(format!(
-            "fixed LSM open: disk usage {used} bytes + {requested} bytes exceeds the {capacity}-byte index reservation"
-        )),
-        error => fixed_error("open", error),
-    }
-}
-
 fn mutex_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -501,7 +530,7 @@ mod tests {
 
     fn location(index: u64) -> EntryLocation {
         EntryLocation {
-            first_slot: index,
+            data_offset: index,
             extent_generation: 1,
             stored_len: PAGE_SIZE as u32,
             checksum: index as u32,
@@ -528,6 +557,28 @@ mod tests {
         for entry in 0..32 {
             assert_eq!(index.peek(key(entry)).unwrap(), Some(location(entry)));
         }
+    }
+
+    #[test]
+    fn memory_lookup_returns_locations_misses_and_unknown_sst_ranges() {
+        let directory = tempfile::tempdir().unwrap();
+        let index = create(directory.path());
+        assert_eq!(index.lookup_memory(key(1)).unwrap(), EntryIndexMemoryLookup::Miss);
+
+        index.insert_batch(&[(key(1), location(1))]).unwrap();
+        assert_eq!(
+            index.lookup_memory(key(1)).unwrap(),
+            EntryIndexMemoryLookup::Location(location(1))
+        );
+        index.checkpoint().unwrap();
+        assert_eq!(
+            index.lookup_memory(key(1)).unwrap(),
+            EntryIndexMemoryLookup::Location(location(1))
+        );
+
+        index.database.flush().unwrap();
+        assert_eq!(index.lookup_memory(key(1)).unwrap(), EntryIndexMemoryLookup::Unknown);
+        assert_eq!(index.lookup_memory(key(127)).unwrap(), EntryIndexMemoryLookup::Miss);
     }
 
     #[test]

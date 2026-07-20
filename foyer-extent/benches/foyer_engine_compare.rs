@@ -14,14 +14,36 @@ use foyer::{
     HybridCacheProperties, Load, PsyncIoEngineConfig, RecoverMode, S3FifoConfig,
 };
 use foyer_extent::{
-    CachePriority, DEFAULT_HIGH_PRIORITY_CAPACITY_PERCENT, DEFAULT_NORMAL_PRIORITY_CAPACITY_PERCENT, EngineValue,
-    ExtentEngineConfig, ExtentEngineHandle, MAX_KEY_SIZE,
+    CachePriority, DEFAULT_HIGH_PRIORITY_CAPACITY_PERCENT, DEFAULT_NORMAL_PRIORITY_CAPACITY_PERCENT, EngineReadStats,
+    EngineValue, EntryIndexReadStats, ExtentEngineConfig, ExtentEngineHandle, MAX_KEY_SIZE,
 };
+
+#[path = "support/scenario.rs"]
+mod scenario;
+
+use scenario::{Permutation, mix64, random_below, random_word, should_sample};
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
 const LATENCY_SAMPLE_TARGET: u64 = 200_000;
 const ENTRY_OVERHEAD: usize = 64;
+const DEFAULT_SCENARIO_SEED: u64 = 0x6a09_e667_f3bc_c909;
+const SCENARIO_VERSION: u32 = 3;
+const SCENARIO_MANIFEST: &str = "foyer-engine-benchmark-scenario-v3.txt";
+
+const STREAM_ENTRY_SIZE: u64 = 0x01;
+const STREAM_KEY_SIZE: u64 = 0x02;
+const STREAM_PRIORITY: u64 = 0x03;
+const STREAM_WRITE_ORDER: u64 = 0x04;
+const STREAM_HISTORICAL_HIGH_ORDER: u64 = 0x05;
+const STREAM_HISTORICAL_NORMAL_ORDER: u64 = 0x06;
+const STREAM_KEY_CONTENT: u64 = 0x07;
+const STREAM_VALUE_CONTENT: u64 = 0x08;
+const STREAM_READ_WARMUP: u64 = 0x10;
+const STREAM_READ_PRIMARY: u64 = 0x11;
+const STREAM_READ_PAIRED: u64 = 0x12;
+const STREAM_BURST_ORDER: u64 = 0x20;
+const STREAM_LATENCY_SAMPLE: u64 = 0x30;
 
 type AnyResult<T> = Result<T, Box<dyn Error>>;
 type BenchCache = HybridCache<Bytes, EngineValue>;
@@ -42,6 +64,12 @@ enum PriorityWorkload {
 enum ReadPattern {
     Random,
     Sequential,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadSchedule {
+    Configured(ReadPattern),
+    Permutation,
 }
 
 impl ReadPattern {
@@ -81,7 +109,7 @@ struct Config {
     wave_bytes: usize,
     block_size_bytes: usize,
     block_buffer_pool_bytes: usize,
-    extent_slot_size: usize,
+    extent_entry_charge: usize,
     extent_size: usize,
     extent_index_cache_bytes: usize,
     extent_index_write_buffer_bytes: usize,
@@ -171,6 +199,9 @@ impl Config {
         if read_hotset == 0 || read_hotset > workload.entries {
             return Err(invalid("EXTENT_BENCH_READ_HOTSET must be in 1..=EXTENT_BENCH_ENTRIES").into());
         }
+        let storage_reads = env_bool("EXTENT_BENCH_STORAGE_READS", false)?;
+        let read_warmup =
+            env_optional_u64("EXTENT_BENCH_READ_WARMUP")?.unwrap_or(if storage_reads { read_hotset } else { 0 });
 
         Ok(Self {
             root,
@@ -181,7 +212,10 @@ impl Config {
             wave_bytes,
             block_size_bytes,
             block_buffer_pool_bytes: env_mib("EXTENT_BENCH_BLOCK_BUFFER_MIB", 256)?,
-            extent_slot_size: env_kib("EXTENT_BENCH_SLOT_KIB", foyer_extent::DEFAULT_SLOT_SIZE / KIB)?,
+            extent_entry_charge: env_kib(
+                "EXTENT_BENCH_ENTRY_CHARGE_KIB",
+                foyer_extent::DEFAULT_ENTRY_CHARGE / KIB,
+            )?,
             extent_size: env_mib("EXTENT_BENCH_EXTENT_MIB", 64)?,
             extent_index_cache_bytes: env_mib("EXTENT_BENCH_INDEX_CACHE_MIB", 1024)?,
             extent_index_write_buffer_bytes: env_mib("EXTENT_BENCH_INDEX_WRITE_BUFFER_MIB", 64)?,
@@ -195,10 +229,10 @@ impl Config {
             shards: env_usize("EXTENT_BENCH_SHARDS", cores.next_power_of_two())?,
             write_concurrency: env_usize("EXTENT_BENCH_EXTENT_WRITE_CONCURRENCY", (cores / 2).clamp(1, 8))?,
             reads,
-            read_warmup: env_u64("EXTENT_BENCH_READ_WARMUP", 0)?,
+            read_warmup,
             read_hotset,
             read_pattern: parse_read_pattern()?,
-            storage_reads: env_bool("EXTENT_BENCH_STORAGE_READS", false)?,
+            storage_reads,
             direct_io,
             recover_only,
             recover_write_wave: env_bool("EXTENT_BENCH_RECOVER_WRITE_WAVE", false)?,
@@ -208,27 +242,42 @@ impl Config {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum WriteOrder {
+    Random(Permutation),
+    Historical {
+        split: u64,
+        high: Option<Permutation>,
+        normal: Permutation,
+    },
+}
+
 #[derive(Debug)]
 struct Workload {
+    seed: u64,
     entries: u64,
     payload_bytes: u64,
     entry_sizes: Vec<usize>,
     key_sizes: Vec<usize>,
-    cycle_bytes: u64,
     priority: PriorityWorkload,
+    write_order: WriteOrder,
 }
 
 impl Workload {
     fn from_env() -> AnyResult<Self> {
+        let seed = env_seed("EXTENT_BENCH_SEED", DEFAULT_SCENARIO_SEED)?;
         let entry_sizes = env_list_kib("EXTENT_BENCH_ENTRY_KIB", &[4, 16, 64, 256, 1024])?;
         let key_sizes = env_list_usize("EXTENT_BENCH_KEY_BYTES", &[32, 96, 256, 1024])?;
-        if key_sizes.iter().any(|size| *size == 0 || *size > MAX_KEY_SIZE) {
-            return Err(invalid(format!("EXTENT_BENCH_KEY_BYTES values must be in 1..={MAX_KEY_SIZE}")).into());
+        if key_sizes
+            .iter()
+            .any(|size| *size < size_of::<u64>() || *size > MAX_KEY_SIZE)
+        {
+            return Err(invalid(format!(
+                "EXTENT_BENCH_KEY_BYTES values must be in {}..={MAX_KEY_SIZE} so every benchmark key is unique",
+                size_of::<u64>()
+            ))
+            .into());
         }
-        let cycle_bytes = entry_sizes.iter().try_fold(0u64, |sum, size| {
-            sum.checked_add(*size as u64)
-                .ok_or_else(|| invalid("entry size pattern overflows u64"))
-        })?;
         let requested_entries = env_optional_u64("EXTENT_BENCH_ENTRIES")?;
         let requested_payload = env_optional_usize("EXTENT_BENCH_PAYLOAD_MIB")?
             .map(|mib| checked_mul(mib, MIB, "EXTENT_BENCH_PAYLOAD_MIB"))
@@ -239,42 +288,83 @@ impl Workload {
         }
 
         let target_payload = requested_payload.unwrap_or(600 * MIB as u64);
-        let entries = match requested_entries {
-            Some(entries) if entries > 0 => entries,
+        if target_payload == 0 {
+            return Err(invalid("EXTENT_BENCH_PAYLOAD_MIB must be positive").into());
+        }
+        let (entries, payload_bytes) = match requested_entries {
+            Some(entries) if entries > 0 => (entries, randomized_payload_bytes(entries, &entry_sizes, seed)?),
             Some(_) => return Err(invalid("EXTENT_BENCH_ENTRIES must be positive").into()),
-            None => entries_for_payload(target_payload, &entry_sizes, cycle_bytes),
+            None => entries_for_randomized_payload(target_payload, &entry_sizes, seed)?,
         };
-        let payload_bytes = patterned_bytes(entries, &entry_sizes, cycle_bytes);
         let priority = parse_priority_workload()?;
+        let write_order = match priority {
+            PriorityWorkload::ScopeDb => WriteOrder::Random(Permutation::new(entries, seed, STREAM_WRITE_ORDER)),
+            PriorityWorkload::HistoricalHigh => {
+                let split = entries / 2;
+                WriteOrder::Historical {
+                    split,
+                    high: (split > 0).then(|| Permutation::new(split, seed, STREAM_HISTORICAL_HIGH_ORDER)),
+                    normal: Permutation::new(entries - split, seed, STREAM_HISTORICAL_NORMAL_ORDER),
+                }
+            }
+        };
         Ok(Self {
+            seed,
             entries,
             payload_bytes,
             entry_sizes,
             key_sizes,
-            cycle_bytes,
             priority,
+            write_order,
         })
     }
 
     fn entry_size(&self, index: u64) -> usize {
-        self.entry_sizes[index as usize % self.entry_sizes.len()]
+        randomized_size(&self.entry_sizes, self.seed, STREAM_ENTRY_SIZE, index)
     }
 
     fn key_size(&self, index: u64) -> usize {
-        self.key_sizes[index as usize % self.key_sizes.len()]
+        randomized_size(&self.key_sizes, self.seed, STREAM_KEY_SIZE, index)
     }
 
     fn maximum_entry_size(&self) -> usize {
         self.entry_sizes.iter().copied().max().unwrap()
     }
 
-    fn wave_entries(&self, wave_bytes: usize) -> u64 {
-        ((wave_bytes as u64).saturating_mul(self.entry_sizes.len() as u64) / self.cycle_bytes).max(1)
+    fn write_index(&self, position: u64) -> u64 {
+        match self.write_order {
+            WriteOrder::Random(permutation) => permutation.get(position),
+            WriteOrder::Historical { split, high, .. } if position < split => high
+                .expect("non-empty historical high range must have a permutation")
+                .get(position),
+            WriteOrder::Historical { split, normal, .. } => split + normal.get(position - split),
+        }
+    }
+
+    fn write_wave_end(&self, start: u64, target_bytes: usize) -> u64 {
+        let mut end = start;
+        let mut bytes = 0_u64;
+        while end < self.entries && (end == start || bytes < target_bytes as u64) {
+            bytes = bytes.saturating_add(self.entry_size(self.write_index(end)) as u64);
+            end += 1;
+        }
+        end
+    }
+
+    fn entries_for_bytes_from(&self, start: u64, target_bytes: usize) -> u64 {
+        let mut entries = 0_u64;
+        let mut bytes = 0_u64;
+        while entries == 0 || bytes < target_bytes as u64 {
+            let index = start.saturating_add(entries);
+            bytes = bytes.saturating_add(self.entry_size(index) as u64);
+            entries = entries.saturating_add(1);
+        }
+        entries
     }
 
     fn priority(&self, index: u64) -> CachePriority {
         match self.priority {
-            PriorityWorkload::ScopeDb => match index % 10 {
+            PriorityWorkload::ScopeDb => match random_below(self.seed, STREAM_PRIORITY, index, 10) {
                 0 => CachePriority::High,
                 1..=3 => CachePriority::Normal,
                 _ => CachePriority::Low,
@@ -282,6 +372,26 @@ impl Workload {
             PriorityWorkload::HistoricalHigh if index < self.entries / 2 => CachePriority::High,
             PriorityWorkload::HistoricalHigh => CachePriority::Normal,
         }
+    }
+
+    const fn write_order_label(&self) -> &'static str {
+        match self.write_order {
+            WriteOrder::Random(_) => "random-permutation",
+            WriteOrder::Historical { .. } => "segmented-random-permutation",
+        }
+    }
+
+    fn scenario_manifest(&self) -> String {
+        format!(
+            "scenario_version={SCENARIO_VERSION}\nseed={}\nentries={}\npayload_bytes={}\nentry_bytes={}\nkey_bytes={}\npriority={}\nwrite_order={}\n",
+            self.seed,
+            self.entries,
+            self.payload_bytes,
+            join_sizes(&self.entry_sizes, 1),
+            join_sizes(&self.key_sizes, 1),
+            self.priority.label(),
+            self.write_order_label(),
+        )
     }
 }
 
@@ -342,6 +452,12 @@ struct IoMeasurements {
     read_ios: usize,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct ExtentReadMeasurements {
+    payload: EngineReadStats,
+    index: EntryIndexReadStats,
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> AnyResult<()> {
     if env::var_os("EXTENT_BENCH_PATH").is_none() {
@@ -353,7 +469,10 @@ async fn main() -> AnyResult<()> {
     fs::create_dir_all(&config.root)?;
 
     println!(
-        "foyer-engine benchmark: path={}, engines={}, entries={}, payload_mib={:.1}, capacity_mib={}, memory_mib={}, entry_kib={}, key_bytes={}, priority_workload={}, read_pattern={}, read_hotset={}, read_warmup={}, read_source={}, concurrency={} (>=2x cores), put_concurrency={}, io={}, extent_read_priority_us={}, extent_priority_floors={}/{}, recover_only={}, recover_write_wave={}, populate_only={}",
+        "foyer-engine benchmark: scenario_version={} seed={} seed_hex={:#018x} generator=counter-splitmix64-prp-v1 path={} engines={} entries={} payload_mib={:.1} capacity_mib={} memory_mib={} entry_kib={} key_bytes={} write_order={} priority_workload={} read_pattern={} read_hotset={} read_warmup={} warmup_order=random-permutation read_source={} concurrency={} (>=2x cores) put_concurrency={} io={} extent_read_priority_us={} extent_priority_floors={}/{} recover_only={} recover_write_wave={} populate_only={}",
+        SCENARIO_VERSION,
+        workload.seed,
+        workload.seed,
         config.root.display(),
         config
             .engines
@@ -367,6 +486,7 @@ async fn main() -> AnyResult<()> {
         config.memory_bytes / MIB,
         join_sizes(&workload.entry_sizes, KIB),
         join_sizes(&workload.key_sizes, 1),
+        workload.write_order_label(),
         workload.priority.label(),
         config.read_pattern.label(),
         config.read_hotset,
@@ -394,6 +514,7 @@ async fn run_engine(engine: DiskEngine, config: &Config, workload: Arc<Workload>
     println!("\nengine={} path={}", engine.label(), path.display());
 
     if config.recover_only {
+        validate_scenario_manifest(&path, &workload)?;
         recover_and_read(engine, config, workload, &path).await?;
         return Ok(());
     }
@@ -404,6 +525,7 @@ async fn run_engine(engine: DiskEngine, config: &Config, workload: Arc<Workload>
 
     let opened_at = Instant::now();
     let built = build_cache(engine, config, &path, RecoverMode::None).await?;
+    fs::write(path.join(SCENARIO_MANIFEST), workload.scenario_manifest())?;
     println!(
         "engine={} phase=open_fresh seconds={:.3}",
         engine.label(),
@@ -471,11 +593,13 @@ async fn recover_and_read(engine: DiskEngine, config: &Config, workload: Arc<Wor
             workload.clone(),
             config.read_warmup,
             config.concurrency,
-            config.read_pattern,
+            ReadSchedule::Permutation,
+            STREAM_READ_WARMUP,
             config.read_hotset,
             config.storage_reads,
         )
         .await?;
+        validate_read_measurements("read_warmup", &warmup)?;
         println!(
             "engine={} phase=read_warmup operations={} hits={} misses={} errors={} invalid={} seconds={:.3} ops_s={:.0}",
             engine.label(),
@@ -489,17 +613,22 @@ async fn recover_and_read(engine: DiskEngine, config: &Config, workload: Arc<Wor
         );
     }
 
+    let io_before = io_measurements(&recovered.cache);
+    let extent_read_before = extent_read_measurements(&recovered.extent);
     let reads = run_reads(
         &recovered.cache,
         workload.clone(),
         config.reads,
         config.concurrency,
-        config.read_pattern,
+        ReadSchedule::Configured(config.read_pattern),
+        STREAM_READ_PRIMARY,
         config.read_hotset,
         config.storage_reads,
     )
     .await?;
-    let io = io_measurements(&recovered.cache);
+    validate_read_measurements("read", &reads)?;
+    let io = io_delta(io_measurements(&recovered.cache), io_before);
+    let extent_read = extent_read_delta(extent_read_measurements(&recovered.extent), extent_read_before);
     println!(
         "engine={} phase=read operations={} hits={} misses={} errors={} invalid={} hit_ratio={:.3} seconds={:.3} ops_s={:.0} hit_mib_s={:.1} disk_read_mib={:.1} disk_read_ios={}",
         engine.label(),
@@ -529,7 +658,7 @@ async fn recover_and_read(engine: DiskEngine, config: &Config, workload: Arc<Wor
     print_latencies(engine, "get", &reads.latencies);
     print_latencies(engine, "get_hit", &reads.hit_latencies);
     print_latencies(engine, "get_miss", &reads.miss_latencies);
-    print_extent_read_stats(engine, &recovered.extent);
+    print_extent_read_stats(engine, "read", extent_read);
 
     if !config.recover_only || config.recover_write_wave {
         let before_burst = run_reads(
@@ -537,11 +666,13 @@ async fn recover_and_read(engine: DiskEngine, config: &Config, workload: Arc<Wor
             workload.clone(),
             config.reads,
             config.concurrency,
-            config.read_pattern,
+            ReadSchedule::Configured(config.read_pattern),
+            STREAM_READ_PAIRED,
             config.read_hotset,
             config.storage_reads,
         )
         .await?;
+        validate_read_measurements("read_before_write_burst", &before_burst)?;
         println!(
             "engine={} phase=read_before_write_burst operations={} hits={} misses={} errors={} invalid={} seconds={:.3} ops_s={:.0}",
             engine.label(),
@@ -632,7 +763,7 @@ async fn build_cache(
         DiskEngine::Extent => {
             let queue_entries = (config.queue_bytes / (4 * KIB)).max(1);
             let extent = ExtentEngineConfig::new(path.join("extent-engine"), config.capacity_bytes as u64)
-                .with_test_layout(config.extent_slot_size, config.extent_size)
+                .with_test_layout(config.extent_entry_charge, config.extent_size)
                 .with_write_concurrency(config.write_concurrency)
                 .with_io_read_priority_duration(config.extent_io_read_priority)
                 .with_index_cache_size(config.extent_index_cache_bytes)
@@ -669,15 +800,13 @@ async fn build_cache(
 }
 
 async fn run_writes(cache: &BenchCache, config: &Config, workload: Arc<Workload>) -> AnyResult<WriteMeasurements> {
-    let wave_entries = workload.wave_entries(config.wave_bytes);
-    let sample_stride = (workload.entries / LATENCY_SAMPLE_TARGET).max(1);
     let mut measurements = WriteMeasurements::default();
     let mut start = 0u64;
     let progress_stride = (workload.entries / 20).max(1);
     let mut next_progress = progress_stride;
 
     while start < workload.entries {
-        let end = start.saturating_add(wave_entries).min(workload.entries);
+        let end = workload.write_wave_end(start, config.wave_bytes);
         let worker_count = config.put_concurrency.min((end - start) as usize).max(1);
         let wave_started = Instant::now();
         let mut workers = Vec::with_capacity(worker_count);
@@ -686,10 +815,11 @@ async fn run_writes(cache: &BenchCache, config: &Config, workload: Arc<Workload>
             let workload = workload.clone();
             workers.push(tokio::task::spawn_blocking(move || {
                 let mut result = WriteMeasurements::default();
-                let mut index = start + worker as u64;
-                while index < end {
-                    let key = make_key(index, workload.key_size(index));
-                    let value = make_value(index, workload.entry_size(index));
+                let mut position = start + worker as u64;
+                while position < end {
+                    let index = workload.write_index(position);
+                    let key = make_key(index, workload.key_size(index), workload.seed);
+                    let value = make_value(index, workload.entry_size(index), workload.seed);
                     let priority = workload.priority(index);
                     let submitted = Instant::now();
                     cache.insert_with_properties(
@@ -697,12 +827,18 @@ async fn run_writes(cache: &BenchCache, config: &Config, workload: Arc<Workload>
                         EngineValue::new(value, priority).expect("benchmark values must be non-empty"),
                         properties(priority),
                     );
-                    if index.is_multiple_of(sample_stride) {
+                    if should_sample(
+                        position,
+                        workload.entries,
+                        LATENCY_SAMPLE_TARGET,
+                        workload.seed,
+                        STREAM_LATENCY_SAMPLE ^ STREAM_WRITE_ORDER,
+                    ) {
                         result.latencies.push(submitted.elapsed());
                     }
                     result.operations += 1;
                     result.bytes += workload.entry_size(index) as u64;
-                    index += worker_count as u64;
+                    position += worker_count as u64;
                 }
                 result
             }));
@@ -730,6 +866,13 @@ async fn run_writes(cache: &BenchCache, config: &Config, workload: Arc<Workload>
             next_progress = next_progress.saturating_add(progress_stride);
         }
     }
+    if measurements.operations != workload.entries || measurements.bytes != workload.payload_bytes {
+        return Err(io::Error::other(format!(
+            "randomized write plan diverged: operations={}/{} bytes={}/{}",
+            measurements.operations, workload.entries, measurements.bytes, workload.payload_bytes
+        ))
+        .into());
+    }
     Ok(measurements)
 }
 
@@ -738,13 +881,14 @@ async fn run_reads(
     workload: Arc<Workload>,
     reads: u64,
     concurrency: usize,
-    pattern: ReadPattern,
+    schedule: ReadSchedule,
+    stream: u64,
     hotset: u64,
     storage_reads: bool,
 ) -> AnyResult<ReadMeasurements> {
-    let sample_stride = (reads / LATENCY_SAMPLE_TARGET).max(1);
     let started = Instant::now();
     let worker_count = concurrency.min(reads as usize).max(1);
+    let permutation = (schedule == ReadSchedule::Permutation).then(|| Permutation::new(hotset, workload.seed, stream));
     let mut workers = Vec::with_capacity(worker_count);
     for worker in 0..worker_count {
         let cache = cache.clone();
@@ -753,13 +897,18 @@ async fn run_reads(
             let mut result = ReadMeasurements::default();
             let mut operation = worker as u64;
             while operation < reads {
-                let index = match pattern {
-                    ReadPattern::Random => mix64(operation ^ 0x9e37_79b9_7f4a_7c15) % hotset,
-                    ReadPattern::Sequential => operation % hotset,
+                let index = match schedule {
+                    ReadSchedule::Configured(ReadPattern::Random) => {
+                        random_below(workload.seed, stream, operation, hotset)
+                    }
+                    ReadSchedule::Configured(ReadPattern::Sequential) => operation % hotset,
+                    ReadSchedule::Permutation => permutation
+                        .expect("permutation schedule must construct a permutation")
+                        .get(operation),
                 };
                 let priority = workload.priority(index);
                 result.requests_by_priority[priority.to_byte() as usize] += 1;
-                let key = make_key(index, workload.key_size(index));
+                let key = make_key(index, workload.key_size(index), workload.seed);
                 let requested = Instant::now();
                 let outcome = if storage_reads {
                     match cache.storage().load(&key).await {
@@ -771,7 +920,7 @@ async fn run_reads(
                             result.hit_bytes += value.value().len() as u64;
                             if loaded_key != key
                                 || value.priority() != priority
-                                || !validate_value(index, workload.entry_size(index), value.value())
+                                || !validate_value(index, workload.entry_size(index), workload.seed, value.value())
                             {
                                 result.invalid += 1;
                             }
@@ -783,7 +932,12 @@ async fn run_reads(
                             result.hit_bytes += piece.value().value().len() as u64;
                             if piece.key() != &key
                                 || piece.value().priority() != priority
-                                || !validate_value(index, workload.entry_size(index), piece.value().value())
+                                || !validate_value(
+                                    index,
+                                    workload.entry_size(index),
+                                    workload.seed,
+                                    piece.value().value(),
+                                )
                             {
                                 result.invalid += 1;
                             }
@@ -806,7 +960,12 @@ async fn run_reads(
                             result.hit_bytes += entry.value().value().len() as u64;
                             if entry.key() != &key
                                 || entry.value().priority() != priority
-                                || !validate_value(index, workload.entry_size(index), entry.value().value())
+                                || !validate_value(
+                                    index,
+                                    workload.entry_size(index),
+                                    workload.seed,
+                                    entry.value().value(),
+                                )
                             {
                                 result.invalid += 1;
                             }
@@ -822,7 +981,13 @@ async fn run_reads(
                         }
                     }
                 };
-                if operation.is_multiple_of(sample_stride) {
+                if should_sample(
+                    operation,
+                    reads,
+                    LATENCY_SAMPLE_TARGET,
+                    workload.seed,
+                    STREAM_LATENCY_SAMPLE ^ stream,
+                ) {
                     let latency = requested.elapsed();
                     result.latencies.push(latency);
                     match outcome {
@@ -853,13 +1018,31 @@ enum ReadOutcome {
     Error,
 }
 
+fn validate_read_measurements(phase: &str, measurements: &ReadMeasurements) -> AnyResult<()> {
+    if measurements.errors > 0 || measurements.invalid > 0 {
+        return Err(io::Error::other(format!(
+            "{phase} observed {} read errors and {} invalid values",
+            measurements.errors, measurements.invalid
+        ))
+        .into());
+    }
+    if measurements.operations != measurements.hits.saturating_add(measurements.misses) {
+        return Err(io::Error::other(format!(
+            "{phase} accounting diverged: operations={} hits={} misses={}",
+            measurements.operations, measurements.hits, measurements.misses
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 async fn run_read_under_write_burst(
     cache: &BenchCache,
     config: &Config,
     workload: Arc<Workload>,
 ) -> AnyResult<(WriteMeasurements, ReadMeasurements)> {
-    let burst_entries = workload.wave_entries(config.wave_bytes);
-    let sample_stride = (burst_entries / LATENCY_SAMPLE_TARGET).max(1);
+    let burst_entries = workload.entries_for_bytes_from(workload.entries, config.wave_bytes);
+    let burst_order = Permutation::new(burst_entries, workload.seed, STREAM_BURST_ORDER);
     let writer_cache = cache.clone();
     let writer_workload = workload.clone();
     let started = Arc::new(tokio::sync::Notify::new());
@@ -867,10 +1050,11 @@ async fn run_read_under_write_burst(
     let writer = tokio::task::spawn_blocking(move || {
         let foreground = Instant::now();
         let mut measurements = WriteMeasurements::default();
-        for offset in 0..burst_entries {
+        for position in 0..burst_entries {
+            let offset = burst_order.get(position);
             let index = writer_workload.entries.saturating_add(offset);
-            let key = make_key(index, writer_workload.key_size(index));
-            let value = make_value(index, writer_workload.entry_size(index));
+            let key = make_key(index, writer_workload.key_size(index), writer_workload.seed);
+            let value = make_value(index, writer_workload.entry_size(index), writer_workload.seed);
             let priority = writer_workload.priority(index);
             let submitted = Instant::now();
             writer_cache.insert_with_properties(
@@ -878,12 +1062,18 @@ async fn run_read_under_write_burst(
                 EngineValue::new(value, priority).expect("benchmark values must be non-empty"),
                 properties(priority),
             );
-            if offset.is_multiple_of(sample_stride) {
+            if should_sample(
+                position,
+                burst_entries,
+                LATENCY_SAMPLE_TARGET,
+                writer_workload.seed,
+                STREAM_LATENCY_SAMPLE ^ STREAM_BURST_ORDER,
+            ) {
                 measurements.latencies.push(submitted.elapsed());
             }
             measurements.operations += 1;
             measurements.bytes += writer_workload.entry_size(index) as u64;
-            if offset == 0 {
+            if position == 0 {
                 writer_started.notify_one();
             }
         }
@@ -897,11 +1087,13 @@ async fn run_read_under_write_burst(
         workload,
         config.reads,
         config.concurrency,
-        config.read_pattern,
+        ReadSchedule::Configured(config.read_pattern),
+        STREAM_READ_PAIRED,
         config.read_hotset,
         config.storage_reads,
     )
     .await?;
+    validate_read_measurements("read_under_write_burst", &reads)?;
     let mut writes = writer.await?;
     let drain = Instant::now();
     cache.storage().wait().await;
@@ -909,29 +1101,37 @@ async fn run_read_under_write_burst(
     Ok((writes, reads))
 }
 
-fn make_key(index: u64, len: usize) -> Bytes {
+fn make_key(index: u64, len: usize, seed: u64) -> Bytes {
     let mut key = vec![0u8; len];
-    let encoded = index.to_le_bytes();
-    let prefix = encoded.len().min(len);
-    key[..prefix].copy_from_slice(&encoded[..prefix]);
-    for (offset, byte) in key[prefix..].iter_mut().enumerate() {
-        *byte = mix64(index.wrapping_add(offset as u64)) as u8;
+    key[..8].copy_from_slice(&index.to_le_bytes());
+    for (chunk_index, chunk) in key[8..].chunks_mut(8).enumerate() {
+        let random = random_word(seed, STREAM_KEY_CONTENT ^ mix64(index), chunk_index as u64).to_le_bytes();
+        chunk.copy_from_slice(&random[..chunk.len()]);
     }
     Bytes::from(key)
 }
 
-fn make_value(index: u64, len: usize) -> Bytes {
-    let mut value = vec![index as u8; len];
+fn make_value(index: u64, len: usize, seed: u64) -> Bytes {
+    let fill = random_word(seed, STREAM_VALUE_CONTENT, index) as u8;
+    let mut value = vec![fill; len];
     value[..8].copy_from_slice(&index.to_le_bytes());
     value[8..16].copy_from_slice(&(len as u64).to_le_bytes());
+    value[16..24].copy_from_slice(&seed.to_le_bytes());
     Bytes::from(value)
 }
 
-fn validate_value(index: u64, len: usize, value: &Bytes) -> bool {
-    value.len() == len
-        && value.get(..8) == Some(index.to_le_bytes().as_slice())
-        && value.get(8..16) == Some((len as u64).to_le_bytes().as_slice())
-        && value.get(16).copied() == Some(index as u8)
+fn validate_value(index: u64, len: usize, seed: u64, value: &Bytes) -> bool {
+    if value.len() != len
+        || value.get(..8) != Some(index.to_le_bytes().as_slice())
+        || value.get(8..16) != Some((len as u64).to_le_bytes().as_slice())
+        || value.get(16..24) != Some(seed.to_le_bytes().as_slice())
+    {
+        return false;
+    }
+    let fill = random_word(seed, STREAM_VALUE_CONTENT, index) as u8;
+    [24, len / 3, len / 2, len.saturating_sub(1)]
+        .into_iter()
+        .all(|position| value.get(position).copied() == Some(fill))
 }
 
 fn properties(priority: CachePriority) -> HybridCacheProperties {
@@ -940,14 +1140,6 @@ fn properties(priority: CachePriority) -> HybridCacheProperties {
         CachePriority::Normal | CachePriority::High => Hint::Normal,
     };
     HybridCacheProperties::default().with_hint(hint)
-}
-
-const fn mix64(mut value: u64) -> u64 {
-    value ^= value >> 30;
-    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value ^= value >> 27;
-    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
 }
 
 fn print_latencies(engine: DiskEngine, operation: &str, latencies: &[Duration]) {
@@ -993,12 +1185,12 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
     };
     if let Some(stats) = handle.physical_write_stats() {
         println!(
-            "engine={} phase=extent_write physical_mib={:.1} physical_runs={} data_mib={:.1} owner_mib={:.1} index_mib={:.1} allocator_mib={:.1}",
+            "engine={} phase=extent_write physical_mib={:.1} physical_runs={} data_mib={:.1} directory_mib={:.1} index_mib={:.1} allocator_mib={:.1}",
             engine.label(),
             as_mib(stats.total_bytes()),
             stats.total_runs(),
             as_mib(stats.data_bytes),
-            as_mib(stats.slot_owner_bytes),
+            as_mib(stats.entry_directory_bytes),
             as_mib(stats.index_bytes),
             as_mib(stats.allocator_bytes),
         );
@@ -1071,7 +1263,7 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
     }
     if let Some(checkpoint) = handle.checkpoint_stats() {
         println!(
-            "engine={} phase=extent_checkpoint published={} requested={} durable={} in_flight={} dirty_changes={} failed={}",
+            "engine={} phase=extent_checkpoint published={} requested={} durable={} in_flight={} dirty_bytes={} failed={}",
             engine.label(),
             checkpoint.published_epoch,
             checkpoint.requested_epoch,
@@ -1079,13 +1271,13 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
             checkpoint
                 .in_flight_epoch
                 .map_or_else(|| "none".to_string(), |epoch| epoch.to_string()),
-            checkpoint.dirty_changes,
+            checkpoint.dirty_bytes,
             checkpoint.failed,
         );
         if checkpoint.failed
             || checkpoint.in_flight_epoch.is_some()
             || checkpoint.durable_epoch < checkpoint.published_epoch
-            || checkpoint.dirty_changes > 0
+            || checkpoint.dirty_bytes > 0
         {
             return Err(io::Error::other("Extent benchmark ended behind its recovery frontier").into());
         }
@@ -1096,34 +1288,69 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
     Ok(())
 }
 
-fn print_extent_read_stats(engine: DiskEngine, handle: &Option<ExtentEngineHandle>) {
-    let Some(handle) = handle else {
+fn extent_read_measurements(handle: &Option<ExtentEngineHandle>) -> Option<ExtentReadMeasurements> {
+    let handle = handle.as_ref()?;
+    Some(ExtentReadMeasurements {
+        payload: handle.read_stats()?,
+        index: handle.entry_index_read_stats()?,
+    })
+}
+
+fn extent_read_delta(
+    after: Option<ExtentReadMeasurements>,
+    before: Option<ExtentReadMeasurements>,
+) -> Option<ExtentReadMeasurements> {
+    let after = after?;
+    let before = before.unwrap_or_default();
+    Some(ExtentReadMeasurements {
+        payload: EngineReadStats {
+            calls: after.payload.calls.saturating_sub(before.payload.calls),
+            data_frames: after.payload.data_frames.saturating_sub(before.payload.data_frames),
+            data_runs: after.payload.data_runs.saturating_sub(before.payload.data_runs),
+            data_bytes: after.payload.data_bytes.saturating_sub(before.payload.data_bytes),
+        },
+        index: EntryIndexReadStats {
+            cache_hits: after.index.cache_hits.saturating_sub(before.index.cache_hits),
+            cache_misses: after.index.cache_misses.saturating_sub(before.index.cache_misses),
+            read_operations: after.index.read_operations.saturating_sub(before.index.read_operations),
+            read_bytes: after.index.read_bytes.saturating_sub(before.index.read_bytes),
+            filter_checks: after.index.filter_checks.saturating_sub(before.index.filter_checks),
+            filter_positives: after
+                .index
+                .filter_positives
+                .saturating_sub(before.index.filter_positives),
+            false_positives: after.index.false_positives.saturating_sub(before.index.false_positives),
+            data_reads: after.index.data_reads.saturating_sub(before.index.data_reads),
+        },
+    })
+}
+
+fn print_extent_read_stats(engine: DiskEngine, measured_phase: &str, measurements: Option<ExtentReadMeasurements>) {
+    let Some(measurements) = measurements else {
         return;
     };
-    if let Some(read) = handle.read_stats() {
-        println!(
-            "engine={} phase=extent_read calls={} data_slots={} data_runs={} data_mib={:.1}",
-            engine.label(),
-            read.calls,
-            read.data_slots,
-            read.data_runs,
-            as_mib(read.data_bytes),
-        );
-    }
-    if let Some(index) = handle.entry_index_read_stats() {
-        println!(
-            "engine={} phase=extent_index_read cache_hits={} cache_misses={} read_ops={} read_mib={:.1} filter_checks={} filter_positives={} false_positives={} data_reads={}",
-            engine.label(),
-            index.cache_hits,
-            index.cache_misses,
-            index.read_operations,
-            as_mib(index.read_bytes),
-            index.filter_checks,
-            index.filter_positives,
-            index.false_positives,
-            index.data_reads,
-        );
-    }
+    println!(
+        "engine={} phase=extent_read measured_phase={} calls={} data_frames={} data_runs={} data_mib={:.1}",
+        engine.label(),
+        measured_phase,
+        measurements.payload.calls,
+        measurements.payload.data_frames,
+        measurements.payload.data_runs,
+        as_mib(measurements.payload.data_bytes),
+    );
+    println!(
+        "engine={} phase=extent_index_read measured_phase={} cache_hits={} cache_misses={} read_ops={} read_mib={:.1} filter_checks={} filter_positives={} false_positives={} data_reads={}",
+        engine.label(),
+        measured_phase,
+        measurements.index.cache_hits,
+        measurements.index.cache_misses,
+        measurements.index.read_operations,
+        as_mib(measurements.index.read_bytes),
+        measurements.index.filter_checks,
+        measurements.index.filter_positives,
+        measurements.index.false_positives,
+        measurements.index.data_reads,
+    );
 }
 
 fn io_measurements(cache: &BenchCache) -> IoMeasurements {
@@ -1136,25 +1363,55 @@ fn io_measurements(cache: &BenchCache) -> IoMeasurements {
     }
 }
 
-fn entries_for_payload(target: u64, sizes: &[usize], cycle_bytes: u64) -> u64 {
-    let cycles = target / cycle_bytes;
-    let mut entries = cycles.saturating_mul(sizes.len() as u64);
-    let mut bytes = cycles.saturating_mul(cycle_bytes);
-    let mut position = 0usize;
+fn entries_for_randomized_payload(target: u64, sizes: &[usize], seed: u64) -> AnyResult<(u64, u64)> {
+    let mut entries = 0_u64;
+    let mut bytes = 0_u64;
     while bytes < target {
-        bytes = bytes.saturating_add(sizes[position] as u64);
-        entries += 1;
-        position = (position + 1) % sizes.len();
+        let size = randomized_size(sizes, seed, STREAM_ENTRY_SIZE, entries) as u64;
+        bytes = bytes
+            .checked_add(size)
+            .ok_or_else(|| invalid("randomized payload size overflows u64"))?;
+        entries = entries
+            .checked_add(1)
+            .ok_or_else(|| invalid("randomized payload entry count overflows u64"))?;
     }
-    entries.max(1)
+    Ok((entries.max(1), bytes))
 }
 
-fn patterned_bytes(entries: u64, sizes: &[usize], cycle_bytes: u64) -> u64 {
-    let cycles = entries / sizes.len() as u64;
-    let remainder = entries % sizes.len() as u64;
-    cycles
-        .saturating_mul(cycle_bytes)
-        .saturating_add(sizes[..remainder as usize].iter().map(|size| *size as u64).sum::<u64>())
+fn randomized_payload_bytes(entries: u64, sizes: &[usize], seed: u64) -> AnyResult<u64> {
+    Ok((0..entries).try_fold(0_u64, |bytes, index| {
+        bytes
+            .checked_add(randomized_size(sizes, seed, STREAM_ENTRY_SIZE, index) as u64)
+            .ok_or_else(|| invalid("randomized payload size overflows u64"))
+    })?)
+}
+
+fn randomized_size(sizes: &[usize], seed: u64, stream: u64, index: u64) -> usize {
+    sizes[random_below(seed, stream, index, sizes.len() as u64) as usize]
+}
+
+fn validate_scenario_manifest(path: &Path, workload: &Workload) -> AnyResult<()> {
+    let manifest_path = path.join(SCENARIO_MANIFEST);
+    let actual = fs::read_to_string(&manifest_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "read benchmark scenario manifest {}: {error}; recreate this image with scenario version {SCENARIO_VERSION}",
+                manifest_path.display()
+            ),
+        )
+    })?;
+    let expected = workload.scenario_manifest();
+    if actual != expected {
+        return Err(io::Error::other(format!(
+            "benchmark scenario does not match {}\nexpected:\n{}actual:\n{}",
+            manifest_path.display(),
+            expected,
+            actual
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 fn directory_sizes(path: &Path) -> io::Result<(u64, u64)> {
@@ -1329,6 +1586,21 @@ fn env_u64(name: &str, default: u64) -> AnyResult<u64> {
                 }
             })
             .map_err(Into::into),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn env_seed(name: &str, default: u64) -> AnyResult<u64> {
+    match env::var(name) {
+        Ok(value) => {
+            let parsed = value
+                .strip_prefix("0x")
+                .or_else(|| value.strip_prefix("0X"))
+                .map_or_else(|| value.parse::<u64>(), |hex| u64::from_str_radix(hex, 16))
+                .map_err(|_| invalid(format!("{name} must be a decimal or 0x-prefixed u64")))?;
+            Ok(parsed)
+        }
         Err(env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(error.into()),
     }

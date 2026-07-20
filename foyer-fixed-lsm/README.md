@@ -43,11 +43,11 @@ A crash can therefore leave orphan files or duplicate old WAL records, but canno
 reference an unsynced table. Open validates referenced tables, ignores already-flushed WAL records,
 and removes only unreferenced temporary/orphan files after the live version is established.
 
-The ExtentStore adapter supplies a hard disk budget derived from its static layout. WAL frames,
-temporary manifest copies, flush SSTs, and all compaction outputs reserve space before I/O.
-Reservations include transient input/output overlap and are released only after obsolete files are
-unlinked and the directory is synced. Capacity exhaustion fails the write or maintenance pipeline
-before the configured cache budget is crossed.
+The ExtentStore adapter supplies a soft disk-capacity target derived from its static layout. WAL
+frames, temporary manifest copies, flush SSTs, and all compaction outputs reserve and account space
+before I/O. Reservations include transient input/output overlap and are released only after obsolete
+files are unlinked and the directory is synced. Usage may exceed the target without failing the
+write or maintenance pipeline; the host filesystem remains the allocation boundary.
 
 ## Compaction policy
 
@@ -132,7 +132,7 @@ At 100M live entries and at least `core * 2` clients, the implementation is reta
 - uses at most 7.6 GB for the 100M-entry index after compaction; and
 - passes the integrated 300 GiB ScopeDB-cache workload with complete content validation, competitive
   Foyer payload throughput, and bounded p99/p99.9 latency;
-- enforces the cache's physical disk budget including transient compaction space, and passes
+- accounts for index usage and transient compaction space without rejecting overcommit, and passes
   process-crash, kill-loop, corruption, and long-running churn tests.
 
 Failure means deleting this experiment and using RocksDB behind the same EntryIndex adapter.

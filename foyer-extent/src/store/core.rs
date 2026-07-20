@@ -20,10 +20,13 @@ use crate::{
         checkpoint::{CheckpointCoordinator, CheckpointStats},
         config::{ExtentStoreConfig, ExtentStoreOptions},
         format::{EntryLocation, StoreLayout},
-        index::{EntryIndex, EntryIndexReadStats, EntryIndexStats, INDEX_DIRECTORY},
+        index::{EntryIndex, EntryIndexMemoryLookup, EntryIndexReadStats, EntryIndexStats, INDEX_DIRECTORY},
         io::IoSchedulerStats,
         operation::{BatchInsertResult, EntryInsert, GetResult, InsertOutcome},
-        pool::{DATA_FILE, EntryAllocation, EntryWrite, ExtentPool, SLOT_OWNER_FILE, STATE_FILE},
+        pool::{
+            DATA_FILE, ENTRY_DIRECTORY_FILE, EntryAllocation, EntryWrite, ExtentPool, LEGACY_SLOT_OWNER_FILE,
+            STATE_FILE,
+        },
         reclaim::{AllocationDecision, ReclaimResult, Reclaimer},
         stats::{ExtentOccupancy, PhysicalWriteStats},
     },
@@ -39,6 +42,13 @@ pub struct ExtentStore {
     checkpoints: CheckpointCoordinator,
     #[cfg(test)]
     injected_fault: AtomicU8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreparedGet {
+    Location(EntryLocation),
+    Miss,
+    Unknown(KeyDigest),
 }
 
 #[cfg(test)]
@@ -79,7 +89,7 @@ impl ExtentStore {
         let root = path.as_ref();
         fs::create_dir_all(root).map_err(|error| Error::io("create extent store directory", error))?;
         remove_owned_directory(&root.join(INDEX_DIRECTORY))?;
-        for file in [DATA_FILE, SLOT_OWNER_FILE, STATE_FILE] {
+        for file in [DATA_FILE, ENTRY_DIRECTORY_FILE, LEGACY_SLOT_OWNER_FILE, STATE_FILE] {
             remove_owned_file(&root.join(file))?;
         }
         Self::create(root, config)
@@ -119,8 +129,8 @@ impl ExtentStore {
         let index = Arc::new(index);
         let pool = Arc::new(pool);
         let mutations = Arc::new(Mutex::new(()));
-        let dirty_changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let checkpoints = CheckpointCoordinator::new(index.clone(), pool.clone(), mutations.clone(), dirty_changes)?;
+        let dirty_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let checkpoints = CheckpointCoordinator::new(index.clone(), pool.clone(), mutations.clone(), dirty_bytes)?;
         Ok(Self {
             index,
             pool,
@@ -133,8 +143,8 @@ impl ExtentStore {
         })
     }
 
-    pub const fn slot_size(&self) -> usize {
-        self.layout.slot_size
+    pub const fn entry_charge(&self) -> usize {
+        self.layout.entry_charge
     }
 
     pub const fn file_size(&self) -> u64 {
@@ -166,6 +176,10 @@ impl ExtentStore {
         self.index.read_stats()
     }
 
+    pub fn entry_index_io_read_stats(&self) -> EntryIndexReadStats {
+        self.index.io_read_stats()
+    }
+
     pub fn checkpoint_stats(&self) -> CheckpointStats {
         self.checkpoints.stats()
     }
@@ -184,16 +198,37 @@ impl ExtentStore {
         self.get_with_stats(key).map(|result| result.value)
     }
 
+    #[cfg(test)]
     pub fn get_with_stats(&self, key: &EntryKey) -> Result<GetResult> {
+        let prepared = self.prepare_get(key)?;
+        self.get_prepared(key, prepared)
+    }
+
+    pub(crate) fn prepare_get(&self, key: &EntryKey) -> Result<PreparedGet> {
         let key_digest = KeyDigest::for_key(key);
-        let Some(location) = self.index.get(key_digest)? else {
-            return Ok(GetResult::default());
+        Ok(match self.index.lookup_memory(key_digest)? {
+            EntryIndexMemoryLookup::Location(location) => PreparedGet::Location(location),
+            EntryIndexMemoryLookup::Miss => PreparedGet::Miss,
+            EntryIndexMemoryLookup::Unknown => PreparedGet::Unknown(key_digest),
+        })
+    }
+
+    pub(crate) fn get_prepared(&self, key: &EntryKey, prepared: PreparedGet) -> Result<GetResult> {
+        let location = match prepared {
+            PreparedGet::Location(location) => location,
+            PreparedGet::Miss => return Ok(GetResult::default()),
+            PreparedGet::Unknown(key_digest) => {
+                let Some(location) = self.index.peek(key_digest)? else {
+                    return Ok(GetResult::default());
+                };
+                location
+            }
         };
         let stored = self.pool.read_entry(key, location)?;
         Ok(GetResult {
             priority: stored.value.as_ref().map(|_| location.priority),
             value: stored.value,
-            data_slots: stored.data_slots,
+            data_frames: stored.data_frames,
             data_runs: stored.data_runs,
             data_bytes: stored.data_bytes,
         })
@@ -230,7 +265,7 @@ impl ExtentStore {
         let mut reclaim = ReclaimResult::default();
         let mut write_runs = 0usize;
         let mut written_bytes = 0usize;
-        let mut published_changes = 0usize;
+        let mut published_bytes = 0usize;
         let mut input_index = 0usize;
 
         while input_index < inserts.len() {
@@ -265,8 +300,10 @@ impl ExtentStore {
                 }
 
                 let stored_priority = insert.priority;
-                let slots = self.slots_for_len(stored_len);
-                let allocation = match self.reclaimer().allocate(stored_priority, slots, &protected_extents)? {
+                let allocation = match self
+                    .reclaimer()
+                    .allocate(stored_priority, stored_len, &protected_extents)?
+                {
                     AllocationDecision::Allocated(allocation, reclaimed) => {
                         reclaim.merge(reclaimed);
                         allocation
@@ -283,7 +320,7 @@ impl ExtentStore {
                     }
                 };
                 let location = EntryLocation {
-                    first_slot: allocation.first_slot,
+                    data_offset: allocation.data_offset,
                     extent_generation: allocation.extent_generation,
                     stored_len: u32::try_from(stored_len).expect("validated stored entry length must fit u32"),
                     checksum,
@@ -328,35 +365,31 @@ impl ExtentStore {
                 .map(|(pending, location)| (pending.key_digest, *location))
                 .collect::<Vec<_>>();
             let indexed = self.index.insert_batch(&index_inserts)?;
-            let mut changed_slots = 0usize;
             for (pending, outcome) in pending.iter().zip(indexed.outcomes) {
-                if outcome != InsertOutcome::Rejected {
-                    changed_slots = changed_slots.saturating_add(pending.allocation.slot_count as usize);
-                }
+                published_bytes = published_bytes.saturating_add(pending.allocation.stored_len as usize);
                 outcomes[pending.input_index] = Some(outcome);
             }
-            published_changes = published_changes.saturating_add(changed_slots);
             write_runs = write_runs
                 .saturating_add(physical.data_runs)
-                .saturating_add(physical.slot_owner_runs)
+                .saturating_add(physical.entry_directory_runs)
                 .saturating_add(indexed.write_runs);
             written_bytes = written_bytes
                 .saturating_add(physical.data_bytes)
-                .saturating_add(physical.slot_owner_bytes)
+                .saturating_add(physical.entry_directory_bytes)
                 .saturating_add(indexed.written_bytes);
         }
 
-        if published_changes > 0 {
-            // Payload and owner durability is the publication fence. Checkpoint epochs therefore
+        if published_bytes > 0 {
+            // Payload and directory durability is the publication fence. Checkpoint epochs therefore
             // persist only immutable allocator/index metadata and never race fdatasync with later
             // buffered writes to the same monolithic files.
             self.pool.sync_payload()?;
             #[cfg(test)]
             crate::store::crash_if_requested("extent_after_payload_sync");
-            self.checkpoints.record_publication(published_changes)?;
+            self.checkpoints.record_publication(published_bytes)?;
         }
         let checkpoint_target = self.checkpoints.published_epoch();
-        if self.checkpoints.dirty_changes() >= self.options.checkpoint_changes {
+        if self.checkpoints.dirty_bytes() >= self.options.checkpoint_bytes {
             self.checkpoints.request_background(checkpoint_target)?;
         }
         drop(mutation);
@@ -377,8 +410,8 @@ impl ExtentStore {
         self.checkpoints.ensure_healthy()?;
         let removed = self.index.remove(KeyDigest::for_key(key))?;
         if removed {
-            let target = self.checkpoints.record_publication(1)?;
-            if self.checkpoints.dirty_changes() >= self.options.checkpoint_changes {
+            let target = self.checkpoints.record_publication(self.layout.entry_charge)?;
+            if self.checkpoints.dirty_bytes() >= self.options.checkpoint_bytes {
                 self.checkpoints.request_background(target)?;
             }
             drop(mutation);
@@ -453,16 +486,11 @@ impl ExtentStore {
         Ok(())
     }
 
-    fn slots_for_len(&self, len: usize) -> u32 {
-        u32::try_from(len.div_ceil(self.slot_size())).expect("a validated extent value must use at most u32 slots")
-    }
-
     fn reclaimer(&self) -> Reclaimer<'_> {
         Reclaimer::new(
             &self.index,
             &self.pool,
             &self.checkpoints,
-            self.slot_size(),
             self.priority_capacity_floors(),
             self.options.hot_frequency,
             self.options.low_hot_frequency,
@@ -524,9 +552,9 @@ fn validate_options(options: ExtentStoreOptions) -> Result<()> {
             "extent write_run_size must be greater than zero".to_string(),
         ));
     }
-    if options.checkpoint_changes == 0 {
+    if options.checkpoint_bytes == 0 {
         return Err(Error::InvalidConfig(
-            "extent checkpoint_changes must be greater than zero".to_string(),
+            "extent checkpoint_bytes must be greater than zero".to_string(),
         ));
     }
     if options.index_write_buffer_size < fixed_lsm::KEY_SIZE + fixed_lsm::VALUE_SIZE + 8 {
@@ -576,16 +604,16 @@ fn validate_layout_options(layout: StoreLayout, options: ExtentStoreOptions) -> 
             options.extent_size, layout.extent_size
         )));
     }
-    if !options.read_run_size.is_multiple_of(layout.slot_size) {
+    if !options.read_run_size.is_multiple_of(crate::format::PAGE_SIZE) {
         return Err(Error::InvalidConfig(format!(
-            "extent read_run_size must be a multiple of slot_size ({})",
-            layout.slot_size
+            "extent read_run_size must be a multiple of page size ({})",
+            crate::format::PAGE_SIZE
         )));
     }
-    if !options.write_run_size.is_multiple_of(layout.slot_size) {
+    if !options.write_run_size.is_multiple_of(crate::format::PAGE_SIZE) {
         return Err(Error::InvalidConfig(format!(
-            "extent write_run_size must be a multiple of slot_size ({})",
-            layout.slot_size
+            "extent write_run_size must be a multiple of page size ({})",
+            crate::format::PAGE_SIZE
         )));
     }
     let usable_extents = layout.extent_count.saturating_sub(1);
@@ -614,7 +642,7 @@ mod tests {
     use super::*;
     use crate::{
         format::PAGE_SIZE,
-        store::{format::SLOT_OWNER_SIZE, pool::AllocationResult},
+        store::{format::ENTRY_OWNER_SIZE, pool::AllocationResult},
     };
 
     fn key(index: u64) -> EntryKey {
@@ -623,7 +651,7 @@ mod tests {
         EntryKey::new(bytes).unwrap()
     }
 
-    fn full_slot_value(byte: u8) -> Vec<u8> {
+    fn full_frame_value(byte: u8) -> Vec<u8> {
         let key = key(0);
         let envelope = stored_entry_len(&key, &[]).unwrap();
         vec![byte; PAGE_SIZE - envelope]
@@ -634,14 +662,14 @@ mod tests {
             .with_extent_size(PAGE_SIZE * 8)
             .with_index_write_buffer_size(PAGE_SIZE * 4)
             .with_index_cache_size(1024 * 1024)
-            .with_checkpoint_changes(usize::MAX)
+            .with_checkpoint_bytes(usize::MAX)
     }
 
     fn store(root: &Path, capacity: u64) -> ExtentStore {
         ExtentStore::create(
             root,
             ExtentStoreConfig::new(capacity)
-                .with_slot_size(PAGE_SIZE)
+                .with_entry_charge(PAGE_SIZE)
                 .with_options(options()),
         )
         .unwrap()
@@ -671,6 +699,25 @@ mod tests {
         assert_eq!(reopened.pool.layout(), layout);
         assert_eq!(reopened.get(&key(1)).unwrap(), Some(vec![2; 200]));
         assert!(reopened.get(&key(2)).unwrap().is_none());
+    }
+
+    #[test]
+    fn prepared_get_reuses_memory_lookup_and_returns_definitive_misses() {
+        let dir = tempdir().unwrap();
+        let store = store(dir.path(), 4 * 1024 * 1024);
+        let entry_key = key(7);
+        assert_eq!(store.prepare_get(&entry_key).unwrap(), PreparedGet::Miss);
+
+        store.insert(&entry_key, &[7; 128], CachePriority::Normal).unwrap();
+        let prepared = store.prepare_get(&entry_key).unwrap();
+        assert!(matches!(prepared, PreparedGet::Location(_)));
+        assert_eq!(
+            store.get_prepared(&entry_key, prepared).unwrap().value,
+            Some(vec![7; 128])
+        );
+
+        assert!(store.remove(&entry_key).unwrap());
+        assert_eq!(store.prepare_get(&entry_key).unwrap(), PreparedGet::Miss);
     }
 
     #[test]
@@ -740,13 +787,13 @@ mod tests {
     }
 
     #[test]
-    fn multi_slot_entry_respects_read_run_limit_and_reopens() {
+    fn multi_frame_entry_respects_read_run_limit_and_reopens() {
         let dir = tempdir().unwrap();
         let options = options().with_read_run_size(PAGE_SIZE);
         let store = ExtentStore::create(
             dir.path(),
             ExtentStoreConfig::new(4 * 1024 * 1024)
-                .with_slot_size(PAGE_SIZE)
+                .with_entry_charge(PAGE_SIZE)
                 .with_options(options),
         )
         .unwrap();
@@ -760,16 +807,56 @@ mod tests {
         );
         let stats = store.physical_write_stats();
         assert_eq!(stats.data_bytes, (PAGE_SIZE * 4) as u64);
-        assert_eq!(stats.slot_owner_bytes, (SLOT_OWNER_SIZE * 4) as u64);
+        assert_eq!(stats.entry_directory_bytes, ENTRY_OWNER_SIZE as u64);
         let read = store.get_with_stats(&key(7)).unwrap();
         assert_eq!(read.value, Some(value.clone()));
-        assert_eq!(read.data_slots, 4);
+        assert_eq!(read.data_frames, 4);
         assert_eq!(read.data_runs, 4);
 
         store.sync().unwrap();
         drop(store);
         let reopened = ExtentStore::open_with_options(dir.path(), options).unwrap();
         assert_eq!(reopened.get(&key(7)).unwrap(), Some(value));
+    }
+
+    #[test]
+    fn small_entries_share_a_write_frame() {
+        let dir = tempdir().unwrap();
+        let store = store(dir.path(), 4 * 1024 * 1024);
+        let keys = (0..8).map(key).collect::<Vec<_>>();
+        let values = (0..8).map(|index| vec![index as u8; 100]).collect::<Vec<_>>();
+        let inserts = keys
+            .iter()
+            .zip(&values)
+            .map(|(key, value)| EntryInsert::new(key, value, CachePriority::Normal))
+            .collect::<Vec<_>>();
+
+        let result = store.insert_batch_with_stats(&inserts).unwrap();
+        assert!(
+            result
+                .outcomes
+                .iter()
+                .all(|outcome| *outcome == InsertOutcome::Inserted)
+        );
+        let writes = store.physical_write_stats();
+        assert_eq!(writes.data_runs, 1);
+        assert_eq!(writes.data_bytes, PAGE_SIZE as u64);
+        assert_eq!(writes.entry_directory_runs, 1);
+        assert_eq!(writes.entry_directory_bytes, (keys.len() * ENTRY_OWNER_SIZE) as u64);
+        let occupancy = store.extent_occupancy();
+        assert_eq!(occupancy.used_entries(CachePriority::Normal), keys.len() as u64);
+        assert_eq!(occupancy.used_bytes(CachePriority::Normal), PAGE_SIZE as u64);
+
+        let locations = keys
+            .iter()
+            .map(|key| store.index.peek(KeyDigest::for_key(key)).unwrap().unwrap())
+            .collect::<Vec<_>>();
+        for pair in locations.windows(2) {
+            assert_eq!(pair[1].data_offset, pair[0].data_offset + u64::from(pair[0].stored_len));
+        }
+        for (key, value) in keys.iter().zip(values) {
+            assert_eq!(store.get(key).unwrap(), Some(value));
+        }
     }
 
     #[test]
@@ -801,14 +888,46 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_threshold_counts_published_stored_bytes() {
+        let dir = tempdir().unwrap();
+        let first_key = key(1);
+        let second_key = key(2);
+        let first_value = vec![1; 700];
+        let second_value = vec![2; 1_300];
+        let first_bytes = stored_entry_len(&first_key, &first_value).unwrap();
+        let second_bytes = stored_entry_len(&second_key, &second_value).unwrap();
+        let checkpoint_options = options().with_checkpoint_bytes(first_bytes + second_bytes);
+        let store = ExtentStore::create(
+            dir.path(),
+            ExtentStoreConfig::new(4 * 1024 * 1024)
+                .with_entry_charge(PAGE_SIZE)
+                .with_options(checkpoint_options),
+        )
+        .unwrap();
+        store.checkpoints.pause_after_capture();
+
+        store.insert(&first_key, &first_value, CachePriority::Normal).unwrap();
+        assert_eq!(store.checkpoint_stats().dirty_bytes, first_bytes);
+        assert_eq!(store.checkpoint_stats().requested_epoch, 0);
+
+        store.insert(&second_key, &second_value, CachePriority::Normal).unwrap();
+        store.checkpoints.wait_until_captured();
+        let checkpoint = store.checkpoint_stats();
+        assert_eq!(checkpoint.published_epoch, 2);
+        assert_eq!(checkpoint.requested_epoch, 2);
+        store.checkpoints.resume_checkpoint();
+        store.sync().unwrap();
+    }
+
+    #[test]
     fn checkpoint_epoch_does_not_block_later_publication() {
         let dir = tempdir().unwrap();
-        let checkpoint_options = options().with_checkpoint_changes(1);
+        let checkpoint_options = options().with_checkpoint_bytes(1);
         let store = Arc::new(
             ExtentStore::create(
                 dir.path(),
                 ExtentStoreConfig::new(4 * 1024 * 1024)
-                    .with_slot_size(PAGE_SIZE)
+                    .with_entry_charge(PAGE_SIZE)
                     .with_options(checkpoint_options),
             )
             .unwrap(),
@@ -845,7 +964,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = Arc::new(store(dir.path(), 2 * 1024 * 1024));
         let entries = store.pool.layout().max_entries;
-        let initial = full_slot_value(7);
+        let initial = full_frame_value(7);
         for index in 0..entries - 1 {
             assert_ne!(
                 store.insert(&key(index), &initial, CachePriority::Low).unwrap(),
@@ -855,7 +974,7 @@ mod tests {
         store.sync().unwrap();
 
         store.checkpoints.pause_after_capture();
-        let updated = full_slot_value(8);
+        let updated = full_frame_value(8);
         assert_eq!(
             store.insert(&key(0), &updated, CachePriority::Low).unwrap(),
             InsertOutcome::Updated
@@ -869,7 +988,7 @@ mod tests {
         let (sent, received) = mpsc::channel();
         let writer = {
             let store = store.clone();
-            let value = full_slot_value(9);
+            let value = full_frame_value(9);
             std::thread::spawn(move || {
                 let result = store.insert(&key(100_000), &value, CachePriority::High);
                 sent.send(result).unwrap();
@@ -887,17 +1006,17 @@ mod tests {
         );
         writer.join().unwrap();
         store.sync().unwrap();
-        assert_eq!(store.get(&key(100_000)).unwrap(), Some(full_slot_value(9)));
+        assert_eq!(store.get(&key(100_000)).unwrap(), Some(full_frame_value(9)));
     }
 
     #[test]
     fn checkpoint_failure_is_retained_and_rejects_later_mutations() {
         let dir = tempdir().unwrap();
-        let checkpoint_options = options().with_checkpoint_changes(1);
+        let checkpoint_options = options().with_checkpoint_bytes(1);
         let store = ExtentStore::create(
             dir.path(),
             ExtentStoreConfig::new(4 * 1024 * 1024)
-                .with_slot_size(PAGE_SIZE)
+                .with_entry_charge(PAGE_SIZE)
                 .with_options(checkpoint_options),
         )
         .unwrap();
@@ -919,7 +1038,7 @@ mod tests {
     fn physical_write_stats_separate_payload_and_metadata() {
         let dir = tempdir().unwrap();
         let store = store(dir.path(), 4 * 1024 * 1024);
-        let values = [full_slot_value(1), full_slot_value(2)];
+        let values = [full_frame_value(1), full_frame_value(2)];
         store
             .insert_batch(&[
                 EntryInsert::new(&key(1), &values[0], CachePriority::Normal),
@@ -930,8 +1049,8 @@ mod tests {
         let before_checkpoint = store.physical_write_stats();
         assert_eq!(before_checkpoint.data_runs, 1);
         assert_eq!(before_checkpoint.data_bytes, (PAGE_SIZE * 2) as u64);
-        assert_eq!(before_checkpoint.slot_owner_runs, 1);
-        assert_eq!(before_checkpoint.slot_owner_bytes, (SLOT_OWNER_SIZE * 2) as u64);
+        assert_eq!(before_checkpoint.entry_directory_runs, 1);
+        assert_eq!(before_checkpoint.entry_directory_bytes, (ENTRY_OWNER_SIZE * 2) as u64);
         assert_eq!(before_checkpoint.index_runs, 0);
         assert_eq!(before_checkpoint.allocator_runs, 0);
 
@@ -947,7 +1066,7 @@ mod tests {
         assert_eq!(
             after_checkpoint.total_bytes(),
             after_checkpoint.data_bytes
-                + after_checkpoint.slot_owner_bytes
+                + after_checkpoint.entry_directory_bytes
                 + after_checkpoint.index_bytes
                 + after_checkpoint.allocator_bytes
         );
@@ -955,13 +1074,13 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn direct_io_handles_partial_slots_and_reopens() {
+    fn direct_io_handles_partial_frames_and_reopens() {
         let dir = tempdir().unwrap();
         let options = options().with_direct_io(true);
         let store = match ExtentStore::create(
             dir.path(),
             ExtentStoreConfig::new(2 * 1024 * 1024)
-                .with_slot_size(PAGE_SIZE)
+                .with_entry_charge(PAGE_SIZE)
                 .with_options(options),
         ) {
             Ok(store) => store,
@@ -978,19 +1097,31 @@ mod tests {
 
         assert!(store.direct_io());
         let value = vec![9; PAGE_SIZE / 2 + 17];
-        let full = full_slot_value(8);
-        store.insert(&key(1), &value, CachePriority::Normal).unwrap();
-        store.insert(&key(2), &full, CachePriority::Normal).unwrap();
+        let full = full_frame_value(8);
+        let first_key = key(1);
+        let second_key = key(2);
+        let result = store
+            .insert_batch_with_stats(&[
+                EntryInsert::new(&first_key, &value, CachePriority::Normal),
+                EntryInsert::new(&second_key, &full, CachePriority::Normal),
+            ])
+            .unwrap();
+        assert!(
+            result
+                .outcomes
+                .iter()
+                .all(|outcome| *outcome == InsertOutcome::Inserted)
+        );
         let partial_read = store.get_with_stats(&key(1)).unwrap();
         assert_eq!(partial_read.value, Some(value.clone()));
-        assert_eq!(partial_read.data_slots, 1);
+        assert_eq!(partial_read.data_frames, 1);
         assert_eq!(partial_read.data_runs, 1);
         assert_eq!(partial_read.data_bytes, PAGE_SIZE);
         let full_read = store.get_with_stats(&key(2)).unwrap();
         assert_eq!(full_read.value, Some(full.clone()));
-        assert_eq!(full_read.data_slots, 1);
+        assert_eq!(full_read.data_frames, 2);
         assert_eq!(full_read.data_runs, 1);
-        assert_eq!(full_read.data_bytes, PAGE_SIZE);
+        assert_eq!(full_read.data_bytes, PAGE_SIZE * 2);
         store.sync().unwrap();
         drop(store);
 
@@ -1103,7 +1234,7 @@ mod tests {
         let store = ExtentStore::create(
             dir.path(),
             ExtentStoreConfig::new(2 * 1024 * 1024)
-                .with_slot_size(PAGE_SIZE)
+                .with_entry_charge(PAGE_SIZE)
                 .with_options(options().with_priority_capacity_floors(25, 50)),
         )
         .unwrap();
@@ -1163,7 +1294,7 @@ mod tests {
         let error = ExtentStore::create(
             dir.path(),
             ExtentStoreConfig::new(2 * 1024 * 1024)
-                .with_slot_size(PAGE_SIZE)
+                .with_entry_charge(PAGE_SIZE)
                 .with_options(options().with_priority_capacity_floors(40, 61)),
         )
         .unwrap_err();
@@ -1177,7 +1308,7 @@ mod tests {
         let layout = store.pool.layout();
         store.insert(&key(0), &[1; 16], CachePriority::Low).unwrap();
 
-        let normal_entries = (layout.extent_count as usize - 2).saturating_mul(layout.slots_per_extent as usize);
+        let normal_entries = (layout.extent_count as usize - 2).saturating_mul(layout.entries_per_extent as usize);
         for index in 0..normal_entries {
             assert_ne!(
                 store
@@ -1234,11 +1365,11 @@ mod tests {
         assert_eq!(result.reclaim.total_promoted_bytes(), 16);
         assert_eq!(
             result.reclaim.total_evicted_entries(),
-            layout.slots_per_extent as usize - 1
+            layout.entries_per_extent as usize - 1
         );
         assert_eq!(
             result.reclaim.total_evicted_bytes(),
-            (layout.slots_per_extent as usize - 1) * 16
+            (layout.entries_per_extent as usize - 1) * 16
         );
         assert_eq!(store.get(&key(0)).unwrap(), Some(vec![5; 16]));
     }
@@ -1249,7 +1380,7 @@ mod tests {
         let store = ExtentStore::create(
             dir.path(),
             ExtentStoreConfig::new(2 * 1024 * 1024)
-                .with_slot_size(PAGE_SIZE)
+                .with_entry_charge(PAGE_SIZE)
                 .with_options(options().with_low_hot_frequency(15)),
         )
         .unwrap();
@@ -1280,7 +1411,7 @@ mod tests {
         let store = ExtentStore::create(
             dir.path(),
             ExtentStoreConfig::new(2 * 1024 * 1024)
-                .with_slot_size(PAGE_SIZE)
+                .with_entry_charge(PAGE_SIZE)
                 .with_options(options().with_hot_frequency(15).with_low_hot_frequency(2)),
         )
         .unwrap();
@@ -1328,18 +1459,18 @@ mod tests {
         let result = store
             .insert_batch_with_stats(&[EntryInsert::new(&incoming, &[6; 16], CachePriority::Normal)])
             .unwrap();
-        let promoted = promotion_limit(layout.slots_per_extent);
+        let promoted = promotion_limit(layout.extent_size) / layout.entry_charge;
         assert_ne!(result.outcomes[0], InsertOutcome::Rejected);
         assert_eq!(result.reclaim.total_reclaimed_extents(), 1);
         assert_eq!(result.reclaim.total_promoted_entries(), promoted);
         assert_eq!(result.reclaim.total_promoted_bytes(), promoted * 16);
         assert_eq!(
             result.reclaim.total_evicted_entries(),
-            layout.slots_per_extent as usize - promoted
+            layout.entries_per_extent as usize - promoted
         );
         assert_eq!(
             result.reclaim.total_evicted_bytes(),
-            (layout.slots_per_extent as usize - promoted) * 16
+            (layout.entries_per_extent as usize - promoted) * 16
         );
     }
 

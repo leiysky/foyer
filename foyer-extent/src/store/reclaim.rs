@@ -5,7 +5,7 @@ use crate::{
     model::{CachePriority, EntryKey, KeyDigest},
     store::{
         checkpoint::CheckpointCoordinator,
-        format::{EntryLocation, SlotOwner},
+        format::{EntryLocation, EntryOwner},
         index::EntryIndex,
         operation::InsertOutcome,
         pool::{
@@ -16,7 +16,7 @@ use crate::{
     },
 };
 
-const PROMOTION_PORTION_DENOMINATOR: u32 = 8;
+const PROMOTION_PORTION_DENOMINATOR: usize = 8;
 
 /// Coordinates allocation pressure, eviction, and bounded hot-entry promotion.
 ///
@@ -26,7 +26,6 @@ pub struct Reclaimer<'a> {
     index: &'a EntryIndex,
     pool: &'a ExtentPool,
     checkpoints: &'a CheckpointCoordinator,
-    slot_size: usize,
     priority_capacity_floors: [u32; 3],
     hot_frequency: u8,
     low_hot_frequency: u8,
@@ -37,7 +36,6 @@ impl<'a> Reclaimer<'a> {
         index: &'a EntryIndex,
         pool: &'a ExtentPool,
         checkpoints: &'a CheckpointCoordinator,
-        slot_size: usize,
         priority_capacity_floors: [u32; 3],
         hot_frequency: u8,
         low_hot_frequency: u8,
@@ -46,7 +44,6 @@ impl<'a> Reclaimer<'a> {
             index,
             pool,
             checkpoints,
-            slot_size,
             priority_capacity_floors,
             hot_frequency,
             low_hot_frequency,
@@ -56,15 +53,20 @@ impl<'a> Reclaimer<'a> {
     pub fn allocate(
         &self,
         priority: CachePriority,
-        slots: u32,
+        stored_len: usize,
         protected_extents: &HashSet<u32>,
     ) -> Result<AllocationDecision> {
         self.recover_pending()?;
         let mut reclaimed = ReclaimResult::default();
         loop {
-            match self.pool.allocate(priority, slots)? {
+            match self.pool.allocate(priority, stored_len)? {
                 AllocationResult::Allocated(allocation) => {
                     return Ok(AllocationDecision::Allocated(allocation, reclaimed));
+                }
+                AllocationResult::ReclaimRequired if !protected_extents.is_empty() => {
+                    // Reclaim persists allocator state. Publish pending byte ranges first so every
+                    // durable cursor names only complete directory records and a sealed I/O frame.
+                    return Ok(AllocationDecision::FlushRequired(reclaimed));
                 }
                 AllocationResult::ReclaimRequired => {}
             }
@@ -72,9 +74,7 @@ impl<'a> Reclaimer<'a> {
             let Some((victim, is_current)) = candidate else {
                 return Ok(AllocationDecision::Rejected(reclaimed));
             };
-            if protected_extents.contains(&victim.extent) {
-                return Ok(AllocationDecision::FlushRequired(reclaimed));
-            }
+            debug_assert!(!protected_extents.contains(&victim.extent));
             let victim = if is_current {
                 self.pool.seal_current(victim)?
             } else {
@@ -90,11 +90,11 @@ impl<'a> Reclaimer<'a> {
         };
         self.pool.sync_payload()?;
         let mut removed = Vec::new();
-        for (physical_slot, owner) in self.pool.slot_owners(transaction.source)? {
+        for (data_offset, owner) in self.pool.entry_owners(transaction.source)? {
             let Some(location) = self.index.peek(owner.key_digest)? else {
                 continue;
             };
-            if location.first_slot == physical_slot && location.extent_generation == transaction.source.generation {
+            if location.data_offset == data_offset && location.extent_generation == transaction.source.generation {
                 removed.push(owner.key_digest);
             }
         }
@@ -112,7 +112,7 @@ impl<'a> Reclaimer<'a> {
         let live = self.live_victims(victim)?;
         let hot_frequency = self.frequency_threshold(victim.priority);
         if victim.priority == incoming
-            && promotion_limit(self.pool.layout().slots_per_extent) > 0
+            && promotion_limit(self.pool.layout().extent_size) > 0
             && live.iter().any(|entry| entry.frequency >= hot_frequency)
         {
             let transaction = self.pool.begin_reclaim(victim)?;
@@ -146,11 +146,11 @@ impl<'a> Reclaimer<'a> {
 
     fn live_victims(&self, victim: ExtentVictim) -> Result<Vec<LiveVictim>> {
         let mut live = Vec::new();
-        for (physical_slot, owner) in self.pool.slot_owners(victim)? {
+        for (data_offset, owner) in self.pool.entry_owners(victim)? {
             let Some(location) = self.index.peek(owner.key_digest)? else {
                 continue;
             };
-            if location.first_slot == physical_slot && location.extent_generation == victim.generation {
+            if location.data_offset == data_offset && location.extent_generation == victim.generation {
                 live.push(LiveVictim {
                     owner,
                     location,
@@ -170,12 +170,13 @@ impl<'a> Reclaimer<'a> {
         live.sort_unstable_by_key(|entry| (Reverse(entry.frequency), Reverse(entry.owner.sequence)));
         // Retain at most the hottest eighth. That guarantees each compaction frees seven eighths
         // of its source and caps promotion write amplification at one seventh.
-        let promotion_limit = promotion_limit(self.pool.layout().slots_per_extent);
-        let mut promoted_slots = 0usize;
+        let promotion_limit = promotion_limit(self.pool.layout().extent_size);
+        let mut promoted_capacity = 0usize;
         let mut promotions = Vec::new();
         for entry in live.iter().filter(|entry| entry.frequency >= hot_frequency) {
-            let slots = self.slots_for_len(entry.location.stored_len as usize);
-            if promoted_slots.saturating_add(slots as usize) > promotion_limit {
+            let stored_len = entry.location.stored_len as usize;
+            let charge = stored_len.max(self.pool.layout().entry_charge);
+            if promoted_capacity.saturating_add(charge) > promotion_limit {
                 continue;
             }
             let Some((key, value)) = self.pool.read_stored_entry(entry.location)? else {
@@ -185,10 +186,10 @@ impl<'a> Reclaimer<'a> {
             if key_digest != entry.owner.key_digest {
                 continue;
             }
-            let Some(allocation) = self.pool.allocate_reclaim_target(transaction, slots)? else {
+            let Some(allocation) = self.pool.allocate_reclaim_target(transaction, stored_len)? else {
                 break;
             };
-            promoted_slots += slots as usize;
+            promoted_capacity += charge;
             promotions.push(Promotion {
                 key,
                 key_digest,
@@ -248,8 +249,8 @@ impl<'a> Reclaimer<'a> {
         );
         Ok(ReclaimResult {
             stats,
-            write_runs: written.data_runs.saturating_add(written.slot_owner_runs),
-            written_bytes: written.data_bytes.saturating_add(written.slot_owner_bytes),
+            write_runs: written.data_runs.saturating_add(written.entry_directory_runs),
+            written_bytes: written.data_bytes.saturating_add(written.entry_directory_bytes),
         })
     }
 
@@ -258,10 +259,6 @@ impl<'a> Reclaimer<'a> {
             CachePriority::Low => self.low_hot_frequency,
             CachePriority::Normal | CachePriority::High => self.hot_frequency,
         }
-    }
-
-    fn slots_for_len(&self, len: usize) -> u32 {
-        u32::try_from(len.div_ceil(self.slot_size)).expect("a validated extent value must use at most u32 slots")
     }
 }
 
@@ -289,7 +286,7 @@ impl ReclaimResult {
 
 #[derive(Debug, Clone, Copy)]
 struct LiveVictim {
-    owner: SlotOwner,
+    owner: EntryOwner,
     location: EntryLocation,
     frequency: u8,
 }
@@ -328,7 +325,6 @@ fn select_victim(
     }
 }
 
-pub fn promotion_limit(slots_per_extent: u32) -> usize {
-    let limit = (slots_per_extent / PROMOTION_PORTION_DENOMINATOR).min(slots_per_extent.saturating_sub(1));
-    usize::try_from(limit).expect("extent promotion limit must fit usize")
+pub fn promotion_limit(extent_size: usize) -> usize {
+    (extent_size / PROMOTION_PORTION_DENOMINATOR).min(extent_size.saturating_sub(1))
 }

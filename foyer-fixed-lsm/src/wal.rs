@@ -191,6 +191,26 @@ pub fn cleanup_wal_files(directory: &Path, keep_id: u64) -> Result<u64> {
     Ok(removed_bytes)
 }
 
+pub fn cleanup_empty_wal_files(directory: &Path, keep_id: u64) -> Result<()> {
+    let mut removed = false;
+    for (id, path) in list_wal_files(directory)? {
+        if id == keep_id {
+            continue;
+        }
+        let bytes = fs::metadata(&path)
+            .map_err(|error| Error::io("stat empty WAL candidate", error))?
+            .len();
+        if bytes == 0 {
+            fs::remove_file(path).map_err(|error| Error::io("remove empty WAL", error))?;
+            removed = true;
+        }
+    }
+    if removed {
+        sync_directory(directory)?;
+    }
+    Ok(())
+}
+
 pub fn cleanup_wal_files_through(directory: &Path, maximum_id: u64) -> Result<u64> {
     let mut removed_bytes = 0_u64;
     for (id, path) in list_wal_files(directory)? {

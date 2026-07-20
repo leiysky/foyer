@@ -6,13 +6,15 @@
 
 ```text
 Stored Entry
-  -> contiguous allocation slots
-  -> cache extent (allocation and reclaim unit)
-  -> preallocated data/owner files
+  -> contiguous byte allocation
+  -> page-aligned publication frame
+  -> cache extent (append and reclaim unit)
+  -> preallocated data/directory files
 ```
 
 Range parsing and application-level assembly belong above this store. One Entry always has one
-`EntryLocation` and one durable index record, regardless of how many slots hold its bytes.
+`EntryLocation` and one durable index record. Multiple small Stored Entries may share one I/O frame,
+but no Stored Entry crosses a cache-extent boundary.
 
 ## Static layout
 
@@ -20,34 +22,40 @@ The store directory contains:
 
 | Path | Role |
 | --- | --- |
-| `data` | Preallocated payload slots |
-| `owners` | Fixed owner record per physical slot |
+| `data` | Preallocated packed Stored Entry bytes |
+| `directory` | One fixed owner record per Entry allocation |
 | `state` | Two alternating checksummed allocator-state copies |
 | `index-lsm/` | FixedRecordLSM WAL, manifests, and SSTs |
 
-A slot-owner record binds a slot to the key digest, extent generation, value length, checksum, and
-priority. Multi-slot Stored Entries repeat enough ownership information to reclaim them without
-consulting a variable-length metadata heap. Exact key validation remains in the Stored Entry.
+An Entry-directory record binds one allocation's byte offset to the key digest, extent generation,
+value length, checksum, sequence, and priority. Reclaim enumerates this compact sidecar instead of
+reading the entire payload extent. Exact key validation remains in the Stored Entry.
 
 The capacity calculation includes all four components. One extent is excluded from usable
-capacity as reclaim headroom, and fewer than five physical extents are rejected. The index
-reservation is derived from the maximum usable entry count and covers three bounded regions: one
-steady-state index copy, one atomic compaction output copy, and one WAL/L0 write tail. WAL append,
-manifest replacement, flush output, and compaction output reserve bytes from the same hard budget.
-Obsolete bytes are released only after unlink and directory sync, so runtime compaction cannot
-silently exceed the cache size limit.
+capacity as reclaim headroom, and fewer than five physical extents are rejected. Allocation is
+bounded by both packed payload bytes and directory entries. The 4 KiB minimum Entry charge derives
+the maximum Entry count without rounding physical allocations. The index capacity target is derived
+from that count and plans for three regions: one steady-state index copy, one atomic compaction
+output copy, and one WAL/L0 write tail. WAL append, manifest replacement, flush output, and
+compaction output remain fully accounted, but this target is soft: transient or sustained
+overcommit is reported as pressure and never by itself rejects a cache write. Obsolete bytes are
+released only after unlink and directory sync, preserving exact usage without turning an estimate
+into a cache-health boundary.
 
 ## Lookup
 
-The index lookup order is active overlay, frozen checkpoint overlay, then durable LSM. A lookup that
-enters the LSM records the durable-base revision, rechecks both overlays after I/O, and retries if a
-frozen overlay retired meanwhile. This closes the miss race without invalidating readers for every
-unrelated active mutation.
+The index lookup order is active overlay, frozen checkpoint overlay, then durable LSM. A memory
+probe can return a known location or a definitive range miss without entering the blocking I/O
+pool; an unknown result continues through the durable LSM. A lookup that enters the LSM records the
+durable-base revision, rechecks both overlays after I/O, and retries if a frozen overlay retired
+meanwhile. This closes the miss race without invalidating readers for every unrelated active
+mutation.
 
-After a single-Entry index lookup, `ExtentPool` validates the extent generation, reads contiguous
-slots in runs bounded by `read_run_size`, checksum-checks the Stored Entry, and rechecks the generation.
-This path does not read owner metadata, so a hot index lookup does not add an owner-file I/O. Owner
-records exist for reclaim and recovery accounting, not foreground lookup. Any stale, torn, or
+After a single-Entry index lookup, `ExtentPool` validates the extent generation, reads the indexed
+byte range in runs bounded by `read_run_size`, checksum-checks the Stored Entry, and rechecks the
+generation. Direct I/O expands the read to the covering 4 KiB frame span; buffered I/O reads only
+the logical bytes. This path does not read Entry-directory metadata, so a hot index lookup does not
+add a sidecar I/O. Directory records exist for reclaim and tail recovery, not foreground lookup. Any stale, torn, or
 mismatched location is a miss/error boundary, never an unverified hit. There is deliberately no
 second batch-read implementation beside Foyer's point-load interface.
 
@@ -55,7 +63,7 @@ second batch-read implementation beside Foyer's point-load interface.
 
 `ExtentPool` owns a cooperative synchronous I/O scheduler for the payload data plane. One read
 permit spans all physical runs of an Entry payload; acquisition is an atomic lock-free fast path and never
-waits for a write. Data and owner write runs plus their publication syncs use write permits. A write
+waits for a write. Data and Entry-directory write runs plus their publication syncs use write permits. A write
 first looks for a read-quiescent point, but the read-priority interval is bounded (2 ms by default),
 so continuously arriving reads cannot starve cache publication or reclaim. Existing write
 concurrency remains the hard cap. A zero interval bypasses admission and accounting entirely.
@@ -73,22 +81,25 @@ runtime tuning signals rather than acknowledged-write semantics.
 
 ## Insert and checkpoint
 
-An insert validates the Entry, allocates contiguous slots, writes payload and slot owners, installs the
-location in the active overlay, and synchronizes the payload publication fence. It then advances a
-logical epoch. Once `checkpoint_changes` is reached, or the periodic cache worker requests one, the
-coordinator captures immutable allocator and index images under the mutation lock and releases it.
+An insert validates the Entry and reserves an exact byte range plus one directory position. Adjacent
+same-extent allocations in a store batch are packed into page-aligned write frames; only the final
+frame is padded. The store writes payload and Entry-directory records, advances the extent cursor to
+the frame boundary, installs locations in the active overlay, and synchronizes the payload
+publication fence. It then advances a logical epoch. Once `checkpoint_bytes` is reached, or the
+periodic cache worker requests one, the coordinator captures immutable allocator and index images
+under the mutation lock and releases it.
 
 Durable checkpoint order is:
 
 ```text
-payload + owners sync
+payload + Entry directory sync
   -> alternating allocator-state copy
   -> synced FixedRecordLSM batch + live-entry application state
   -> frozen-overlay retirement
 ```
 
 Publication returns to the Foyer flush worker after the payload fence; metadata checkpointing has
-no per-insert strict mode. Mutation-count and periodic triggers feed the same coalescing checkpoint
+no per-insert strict mode. Published-byte and periodic triggers feed the same coalescing checkpoint
 worker, which advances the durable frontier while later mutations may continue. A checkpoint error
 becomes sticky and subsequent mutations fail rather than continuing with an unknown durability
 state. Graceful `sync` and close wait for the latest epoch and already-scheduled FixedRecordLSM
@@ -112,8 +123,9 @@ across reopen; extent ownership remains part of the durable allocator state.
 
 Within the selected class, valuable entries may be promoted into the reclaim target; others are
 removed from the index. Promotion is considered only for same-priority reclaim and is capped at the
-hottest one eighth of the source extent, bounding promotion-only write amplification at one
-seventh. Extent generation changes fence all stale locations.
+hottest one eighth of the source extent using `max(stored length, Entry charge)`, bounding both
+payload and directory pressure and keeping promotion-only write amplification near one seventh.
+Extent generation changes fence all stale locations.
 
 The concrete `Reclaimer` owns that complete transition. `ExtentStore` invokes it only from the
 ordered publication path while holding the mutation lock; it is deliberately not an independent
@@ -146,15 +158,15 @@ pinned tier. ExtentStore supplies no range or payload-layout knowledge to the LS
 
 ## Failure model
 
-- A frozen V3 fixture covers the complete payload, owner, allocator, manifest, and WAL recovery
-  path. The current store must read it, append a new entry, and reopen both entries. Any intentional
-  format break therefore requires an explicit compatibility decision rather than an encoder and
-  decoder changing unnoticed together.
+- A frozen V3 fixture covers the former payload, owner, allocator, manifest, and WAL layout. V4 must
+  reject it and the explicit recreate path must remove legacy owned files before creating the new
+  directory layout. Current-format tests separately cover append, reopen, active-tail recovery,
+  reclaim, and process abort.
 - Incomplete final WAL frames are ignored; corruption inside the durable prefix is an error.
 - The newest invalid allocator or manifest copy falls back to the older valid copy.
 - New SSTs are synced before a manifest can reference them.
 - Obsolete SST/WAL files are unlinked only after the new manifest is durable.
-- A crash before index publication may leak slots; a crash after it recovers only previously
+- A crash before index publication may leak byte allocations or directory positions; a crash after it recovers only previously
   durable payload/generation state.
 - Since this is an expendable cache, an integrator may recreate an invalid top-level store; the
   store itself still reports the corruption precisely.

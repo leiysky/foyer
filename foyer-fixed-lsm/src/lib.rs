@@ -9,7 +9,10 @@ mod table;
 mod wal;
 
 pub use self::{
-    db::{Durability, FixedLsm, FixedLsmOptions, FixedLsmStats, WriteBatch, WriteOptions},
+    db::{
+        Durability, FixedLsm, FixedLsmMemoryLookup, FixedLsmOptions, FixedLsmReadStats, FixedLsmStats, WriteBatch,
+        WriteOptions,
+    },
     error::{Error, Result},
     format::{KEY_SIZE, Key, VALUE_SIZE, Value},
 };

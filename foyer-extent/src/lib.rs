@@ -14,7 +14,7 @@ pub use self::{
     cache::{Cache, CacheBuilder},
     entry::{EngineValue, Entry},
     error::{Error, Result},
-    format::DEFAULT_SLOT_SIZE,
+    format::DEFAULT_ENTRY_CHARGE,
     foyer_engine::{EngineReadStats, EngineWriteStats, ExtentEngineConfig, ExtentEngineHandle},
     model::{CachePriority, MAX_KEY_SIZE},
     store::{

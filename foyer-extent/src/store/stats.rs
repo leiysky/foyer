@@ -4,28 +4,28 @@ use crate::model::CachePriority;
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ExtentOccupancy {
     usable_extents: u32,
-    slots_per_extent: u32,
-    slot_size: usize,
+    entries_per_extent: u32,
     occupied_extents: [u32; 3],
-    used_slots: [u64; 3],
+    used_entries: [u64; 3],
+    used_bytes: [u64; 3],
     capacity_floor_extents: [u32; 3],
 }
 
 impl ExtentOccupancy {
     pub(crate) const fn new(
         usable_extents: u32,
-        slots_per_extent: u32,
-        slot_size: usize,
+        entries_per_extent: u32,
         occupied_extents: [u32; 3],
-        used_slots: [u64; 3],
+        used_entries: [u64; 3],
+        used_bytes: [u64; 3],
         capacity_floor_extents: [u32; 3],
     ) -> Self {
         Self {
             usable_extents,
-            slots_per_extent,
-            slot_size,
+            entries_per_extent,
             occupied_extents,
-            used_slots,
+            used_entries,
+            used_bytes,
             capacity_floor_extents,
         }
     }
@@ -34,20 +34,20 @@ impl ExtentOccupancy {
         self.usable_extents
     }
 
-    pub const fn slots_per_extent(self) -> u32 {
-        self.slots_per_extent
+    pub const fn entries_per_extent(self) -> u32 {
+        self.entries_per_extent
     }
 
     pub const fn occupied_extents(self, priority: CachePriority) -> u32 {
         self.occupied_extents[priority as usize]
     }
 
-    pub const fn used_slots(self, priority: CachePriority) -> u64 {
-        self.used_slots[priority as usize]
+    pub const fn used_entries(self, priority: CachePriority) -> u64 {
+        self.used_entries[priority as usize]
     }
 
     pub const fn used_bytes(self, priority: CachePriority) -> u64 {
-        self.used_slots(priority).saturating_mul(self.slot_size as u64)
+        self.used_bytes[priority as usize]
     }
 
     pub const fn capacity_floor_extents(self, priority: CachePriority) -> u32 {
@@ -67,8 +67,8 @@ impl ExtentOccupancy {
 pub struct PhysicalWriteStats {
     pub data_runs: u64,
     pub data_bytes: u64,
-    pub slot_owner_runs: u64,
-    pub slot_owner_bytes: u64,
+    pub entry_directory_runs: u64,
+    pub entry_directory_bytes: u64,
     pub index_runs: u64,
     pub index_bytes: u64,
     pub allocator_runs: u64,
@@ -78,14 +78,14 @@ pub struct PhysicalWriteStats {
 impl PhysicalWriteStats {
     pub const fn total_runs(self) -> u64 {
         self.data_runs
-            .saturating_add(self.slot_owner_runs)
+            .saturating_add(self.entry_directory_runs)
             .saturating_add(self.index_runs)
             .saturating_add(self.allocator_runs)
     }
 
     pub const fn total_bytes(self) -> u64 {
         self.data_bytes
-            .saturating_add(self.slot_owner_bytes)
+            .saturating_add(self.entry_directory_bytes)
             .saturating_add(self.index_bytes)
             .saturating_add(self.allocator_bytes)
     }
@@ -93,8 +93,8 @@ impl PhysicalWriteStats {
     pub(crate) fn merge(&mut self, other: Self) {
         self.data_runs = self.data_runs.saturating_add(other.data_runs);
         self.data_bytes = self.data_bytes.saturating_add(other.data_bytes);
-        self.slot_owner_runs = self.slot_owner_runs.saturating_add(other.slot_owner_runs);
-        self.slot_owner_bytes = self.slot_owner_bytes.saturating_add(other.slot_owner_bytes);
+        self.entry_directory_runs = self.entry_directory_runs.saturating_add(other.entry_directory_runs);
+        self.entry_directory_bytes = self.entry_directory_bytes.saturating_add(other.entry_directory_bytes);
         self.index_runs = self.index_runs.saturating_add(other.index_runs);
         self.index_bytes = self.index_bytes.saturating_add(other.index_bytes);
         self.allocator_runs = self.allocator_runs.saturating_add(other.allocator_runs);

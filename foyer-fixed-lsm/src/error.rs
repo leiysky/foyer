@@ -13,11 +13,6 @@ pub enum Error {
         reason: String,
     },
     Background(String),
-    CapacityExceeded {
-        capacity: u64,
-        used: u64,
-        requested: u64,
-    },
     SequenceExhausted,
     Io {
         context: &'static str,
@@ -57,14 +52,6 @@ impl fmt::Display for Error {
             Self::Background(reason) => {
                 write!(f, "FixedRecordLSM background pipeline failed: {reason}")
             }
-            Self::CapacityExceeded {
-                capacity,
-                used,
-                requested,
-            } => write!(
-                f,
-                "FixedRecordLSM disk capacity exceeded: {used} bytes used + {requested} bytes requested > {capacity} bytes"
-            ),
             Self::SequenceExhausted => f.write_str("FixedRecordLSM sequence space is exhausted"),
             Self::Io { context, source } => {
                 write!(f, "FixedRecordLSM I/O error ({context}): {source}")
@@ -83,7 +70,6 @@ impl std::error::Error for Error {
             | Self::DatabaseLocked(_)
             | Self::Corruption { .. }
             | Self::Background(_)
-            | Self::CapacityExceeded { .. }
             | Self::SequenceExhausted => None,
         }
     }

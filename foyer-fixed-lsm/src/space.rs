@@ -2,10 +2,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
 
-/// Enforces the fixed on-disk budget across WAL, flush, and compaction output.
+/// Tracks on-disk usage against a soft capacity target across WAL, flush, and compaction output.
 ///
 /// Reservations include transient files. Bytes are released only after obsolete files have been
-/// unlinked and the directory entry update has been synchronized.
+/// unlinked and the directory entry update has been synchronized. Exceeding `capacity` is allowed;
+/// callers can expose it as pressure but must not reject a write solely because of this target.
 #[derive(Debug)]
 pub struct DiskBudget {
     capacity: u64,
@@ -13,18 +14,11 @@ pub struct DiskBudget {
 }
 
 impl DiskBudget {
-    pub fn new(capacity: u64, used: u64) -> Result<Self> {
-        if used > capacity {
-            return Err(Error::CapacityExceeded {
-                capacity,
-                used,
-                requested: 0,
-            });
-        }
-        Ok(Self {
+    pub fn new(capacity: u64, used: u64) -> Self {
+        Self {
             capacity,
             used: AtomicU64::new(used),
-        })
+        }
     }
 
     pub fn capacity(&self) -> u64 {
@@ -36,20 +30,18 @@ impl DiskBudget {
     }
 
     pub fn reserve(&self, bytes: u64) -> Result<DiskReservation<'_>> {
-        let result = self.used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-            used.checked_add(bytes).filter(|next| *next <= self.capacity)
-        });
+        let result = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| used.checked_add(bytes));
         match result {
             Ok(_) => Ok(DiskReservation {
                 budget: self,
                 bytes,
                 committed: false,
             }),
-            Err(used) => Err(Error::CapacityExceeded {
-                capacity: self.capacity,
-                used,
-                requested: bytes,
-            }),
+            Err(used) => Err(Error::InvalidOptions(format!(
+                "disk usage accounting overflows u64: used={used}, requested={bytes}"
+            ))),
         }
     }
 
@@ -91,17 +83,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reservations_include_transient_bytes_and_release_on_drop() {
-        let budget = DiskBudget::new(100, 40).unwrap();
+    fn reservations_include_transient_bytes_allow_overcommit_and_release_on_drop() {
+        let budget = DiskBudget::new(100, 40);
         let reservation = budget.reserve(50).unwrap();
         assert_eq!(budget.used(), 90);
-        assert!(matches!(budget.reserve(11), Err(Error::CapacityExceeded { .. })));
+        let overcommitted = budget.reserve(11).unwrap();
+        assert_eq!(budget.used(), 101);
+        drop(overcommitted);
         drop(reservation);
         assert_eq!(budget.used(), 40);
 
-        budget.reserve(60).unwrap().commit();
-        assert_eq!(budget.used(), 100);
-        budget.release(60);
+        budget.reserve(61).unwrap().commit();
+        assert_eq!(budget.used(), 101);
+        budget.release(61);
         assert_eq!(budget.used(), 40);
+    }
+
+    #[test]
+    fn opening_usage_above_the_soft_capacity_is_allowed() {
+        let budget = DiskBudget::new(100, 125);
+        assert_eq!(budget.capacity(), 100);
+        assert_eq!(budget.used(), 125);
     }
 }

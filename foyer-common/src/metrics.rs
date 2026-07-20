@@ -403,7 +403,7 @@ impl Metrics {
         let storage_engine_checkpoint_in_flight =
             foyer_storage_engine_checkpoint.gauge(&[name.clone(), "in_flight_epoch".into()]);
         let storage_engine_checkpoint_dirty =
-            foyer_storage_engine_checkpoint.gauge(&[name.clone(), "dirty_changes".into()]);
+            foyer_storage_engine_checkpoint.gauge(&[name.clone(), "dirty_bytes".into()]);
         let priorities = ["low", "normal", "high"];
         let storage_engine_priority_extents = std::array::from_fn(|priority| {
             foyer_storage_engine_priority_extents.gauge(&[name.clone(), priorities[priority].into(), "occupied".into()])

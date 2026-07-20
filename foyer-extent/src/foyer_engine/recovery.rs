@@ -76,7 +76,7 @@ fn recreate_store(path: &Path, config: ExtentStoreConfig) -> crate::Result<Exten
 
 fn verify_layout(store: ExtentStore, config: ExtentStoreConfig) -> crate::Result<ExtentStore> {
     let expected = StoreLayout::create(config)?;
-    if store.slot_size() != expected.slot_size || store.file_size() != expected.total_file_size {
+    if store.entry_charge() != expected.entry_charge || store.file_size() != expected.total_file_size {
         return Err(Error::InvalidSuperblock(
             "recovered Extent layout does not match static configuration".to_string(),
         ));
@@ -99,7 +99,7 @@ mod tests {
 
     fn config() -> ExtentStoreConfig {
         ExtentStoreConfig::new(4 * 1024 * 1024)
-            .with_slot_size(PAGE_SIZE)
+            .with_entry_charge(PAGE_SIZE)
             .with_options(
                 ExtentStoreOptions::default()
                     .with_extent_size(PAGE_SIZE * 8)

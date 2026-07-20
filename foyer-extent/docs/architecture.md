@@ -12,7 +12,7 @@ Foyer or the public cache facade.
 3. **Extent store** — `ExtentStore` owns ordered entry publication and coordinates the
    checkpoint frontier. Its concrete `Reclaimer` owns allocation pressure, priority-aware victim
    selection, generation-reuse fencing, and bounded hot-entry promotion.
-4. **Persistence** — `ExtentPool` owns physical payload, owner, and allocator files. Its
+4. **Persistence** — `ExtentPool` owns physical payload, Entry-directory, and allocator files. Its
    cooperative I/O scheduler admits payload reads, publication writes, and payload syncs without
    owning buffers or executing work on another thread. `EntryIndex` owns digest-to-location
    lookup through FixedRecordLSM. FixedRecordLSM remains a separate fixed-record storage crate and
@@ -38,7 +38,7 @@ The pending-write keeper assigns a generation to every submission. Completion of
 same-key write removes only its own generation and cannot erase a newer pending value. The first
 background write or checkpoint failure is sticky: later submissions are shed, existing reads stay
 available, and close reports the causal error. A periodic checkpoint request bounds recovery lag
-when traffic never reaches the mutation-count threshold.
+when traffic never reaches the published-byte threshold.
 
 The Foyer integration exports queue ownership, async-write outcomes, checkpoint frontiers, and
 pipeline health through the shared metrics registry. The runtime handle is a debugging and
@@ -48,12 +48,14 @@ engine config. Physical-I/O accounting includes payload and FixedRecordLSM index
 read is counted even when generation or key validation turns it into a cache miss; cumulative index
 counters are reconciled under one accounting lock so concurrent readers report every delta once.
 Storage-usage polling does no directory walk: ExtentPool captures its fixed allocation once and
-FixedRecordLSM exposes the disk budget it already maintains for admission and compaction.
+FixedRecordLSM exposes O(1) usage accounting against the EntryIndex capacity target. Foreground
+reads reconcile only lightweight table-I/O counters; full database, cache, and WAL statistics are
+collected only from explicit observation paths.
 
 Test-only injection points exercise no-space, short-write, sync, and flush-worker panic behavior.
-They are compiled out of production code. A frozen full-store V3 image is decoded and advanced by
-the current store, while subprocess crash tests cover publication boundaries that cannot be
-represented by returned I/O errors.
+They are compiled out of production code. A frozen full-store V3 image verifies the explicit V4
+incompatibility and recreation path, while V4 round-trip and subprocess crash tests cover
+publication boundaries that cannot be represented by returned I/O errors.
 
 Benchmark and reference-engine code belongs outside production modules. It may use public
 observability surfaces, but production code must not depend on benchmark configuration or an

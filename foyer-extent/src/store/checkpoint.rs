@@ -33,7 +33,7 @@ struct CheckpointShared {
     index: Arc<EntryIndex>,
     pool: Arc<ExtentPool>,
     mutations: Arc<Mutex<()>>,
-    dirty_changes: Arc<AtomicUsize>,
+    dirty_bytes: Arc<AtomicUsize>,
     published_epoch: AtomicU64,
     state: Mutex<CheckpointState>,
     changed: Condvar,
@@ -54,7 +54,7 @@ pub struct CheckpointStats {
     pub requested_epoch: u64,
     pub durable_epoch: u64,
     pub in_flight_epoch: Option<u64>,
-    pub dirty_changes: usize,
+    pub dirty_bytes: usize,
     pub failed: bool,
 }
 
@@ -85,13 +85,13 @@ impl CheckpointCoordinator {
         index: Arc<EntryIndex>,
         pool: Arc<ExtentPool>,
         mutations: Arc<Mutex<()>>,
-        dirty_changes: Arc<AtomicUsize>,
+        dirty_bytes: Arc<AtomicUsize>,
     ) -> Result<Self> {
         let shared = Arc::new(CheckpointShared {
             index,
             pool,
             mutations,
-            dirty_changes,
+            dirty_bytes,
             published_epoch: AtomicU64::new(0),
             state: Mutex::new(CheckpointState::default()),
             changed: Condvar::new(),
@@ -115,10 +115,12 @@ impl CheckpointCoordinator {
         })
     }
 
-    /// Records one externally visible logical mutation. The caller holds the store mutation lock.
-    pub fn record_publication(&self, changes: usize) -> Result<u64> {
+    /// Records one externally visible publication and its Stored Entry byte charge.
+    ///
+    /// The caller holds the store mutation lock.
+    pub fn record_publication(&self, bytes: usize) -> Result<u64> {
         self.ensure_healthy()?;
-        if changes == 0 {
+        if bytes == 0 {
             return Ok(self.shared.published_epoch.load(Ordering::Acquire));
         }
         let current = self.shared.published_epoch.load(Ordering::Relaxed);
@@ -126,12 +128,12 @@ impl CheckpointCoordinator {
             .checked_add(1)
             .ok_or_else(|| Error::CheckpointFailed("publication epoch is exhausted".to_string()))?;
         self.shared.published_epoch.store(next, Ordering::Release);
-        self.shared.dirty_changes.fetch_add(changes, Ordering::Relaxed);
+        self.shared.dirty_bytes.fetch_add(bytes, Ordering::Relaxed);
         Ok(next)
     }
 
-    pub fn dirty_changes(&self) -> usize {
-        self.shared.dirty_changes.load(Ordering::Relaxed)
+    pub fn dirty_bytes(&self) -> usize {
+        self.shared.dirty_bytes.load(Ordering::Relaxed)
     }
 
     pub fn published_epoch(&self) -> u64 {
@@ -145,7 +147,7 @@ impl CheckpointCoordinator {
             requested_epoch: state.requested_epoch,
             durable_epoch: state.durable_epoch,
             in_flight_epoch: state.in_flight_epoch,
-            dirty_changes: self.shared.dirty_changes.load(Ordering::Relaxed),
+            dirty_bytes: self.shared.dirty_bytes.load(Ordering::Relaxed),
             failed: state.error.is_some(),
         }
     }
@@ -186,7 +188,7 @@ impl CheckpointCoordinator {
         drop(state);
 
         let result = self.shared.prepare_epoch(target).and_then(|epoch| {
-            self.shared.dirty_changes.store(0, Ordering::Relaxed);
+            self.shared.dirty_bytes.store(0, Ordering::Relaxed);
             self.shared.persist_epoch(epoch)
         });
         self.shared.complete(target, result)
@@ -356,7 +358,7 @@ fn checkpoint_worker(shared: Arc<CheckpointShared>) {
 
         let checkpoint = shared.prepare_epoch(target);
         if checkpoint.is_ok() {
-            shared.dirty_changes.store(0, Ordering::Relaxed);
+            shared.dirty_bytes.store(0, Ordering::Relaxed);
         }
         drop(mutation);
         #[cfg(test)]

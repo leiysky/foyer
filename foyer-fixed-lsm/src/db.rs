@@ -21,7 +21,10 @@ use crate::{
     manifest::{Manifest, ManifestTable},
     space::{DiskBudget, DiskReservation},
     table::{Table, TableIoCounters, TableIterator, parse_table_file_name, table_file_size, table_path},
-    wal::{Wal, cleanup_wal_files, cleanup_wal_files_through, replay_all, sync_all_wal_files, total_wal_bytes},
+    wal::{
+        Wal, cleanup_empty_wal_files, cleanup_wal_files, cleanup_wal_files_through, replay_all, sync_all_wal_files,
+        total_wal_bytes,
+    },
 };
 
 const LEVEL_COUNT: usize = 7;
@@ -38,8 +41,8 @@ const LOCK_FILE: &str = "LOCK";
 pub struct FixedLsmOptions {
     pub write_buffer_capacity: usize,
     pub cache_capacity: usize,
-    /// Hard budget for all files in the database directory, including transient WAL, flush, and
-    /// compaction output.
+    /// Soft capacity target for all files in the database directory, including transient WAL,
+    /// flush, and compaction output. Usage is accounted beyond this target without rejecting I/O.
     pub max_disk_bytes: u64,
 }
 
@@ -191,6 +194,24 @@ pub struct FixedLsmStats {
     pub trivial_move_operations: u64,
 }
 
+/// Lightweight cumulative table-read counters.
+///
+/// Unlike [`FixedLsm::stats`], this snapshot is O(1): it does not inspect WAL files or lock the
+/// writer, version, page-cache shards, or background-maintenance state.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FixedLsmReadStats {
+    pub read_operations: u64,
+    pub read_bytes: u64,
+}
+
+/// Result of a point lookup that is guaranteed not to perform table I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixedLsmMemoryLookup {
+    Value(Value),
+    Miss,
+    Unknown,
+}
+
 #[derive(Debug, Default)]
 struct MaintenanceCounters {
     flush_operations: AtomicU64,
@@ -301,6 +322,10 @@ impl Version {
         Self {
             levels: std::array::from_fn(|_| Vec::new()),
         }
+    }
+
+    fn may_contain(&self, key: &Key) -> bool {
+        self.levels.iter().flatten().any(|table| table.contains_range(key))
     }
 
     fn from_tables(tables: Vec<Arc<Table>>) -> Result<Self> {
@@ -484,7 +509,7 @@ impl FixedLsm {
         let manifest = Manifest::initial();
         manifest.persist(directory, LEVEL_COUNT)?;
         let wal = Wal::create(directory, 1)?;
-        let disk_budget = DiskBudget::new(options.max_disk_bytes, database_storage_bytes(directory)?)?;
+        let disk_budget = DiskBudget::new(options.max_disk_bytes, database_storage_bytes(directory)?);
         let cache = Arc::new(BlockCache::new(options.cache_capacity));
         let io = Arc::new(TableIoCounters::default());
         Self::from_inner(Inner {
@@ -556,6 +581,8 @@ impl FixedLsm {
         let wal = Wal::create(directory, wal_id)?;
         if recovered.records.is_empty() {
             let _ = cleanup_wal_files(directory, wal_id)?;
+        } else {
+            cleanup_empty_wal_files(directory, wal_id)?;
         }
         let maximum_file_id = maximum_table_file_id(directory)?;
         let next_file_id = manifest.next_file_id.max(maximum_file_id.saturating_add(1));
@@ -564,7 +591,7 @@ impl FixedLsm {
         manifest.next_sequence = next_sequence;
         cleanup_orphan_tables(directory, &version)?;
         Manifest::cleanup_temporary_files(directory)?;
-        let disk_budget = DiskBudget::new(options.max_disk_bytes, database_storage_bytes(directory)?)?;
+        let disk_budget = DiskBudget::new(options.max_disk_bytes, database_storage_bytes(directory)?);
         Self::from_inner(Inner {
             directory: directory.to_path_buf(),
             options,
@@ -614,6 +641,32 @@ impl FixedLsm {
             }
         }
         Ok(version.get(key)?.and_then(|record| record.value))
+    }
+
+    /// Probe memtables and in-memory table ranges without issuing table I/O.
+    pub fn probe_memory(&self, key: &Key) -> Result<FixedLsmMemoryLookup> {
+        self.check_background_failure()?;
+        let (mutable, immutables, version) = {
+            let state = rwlock_read(&self.inner.state);
+            (state.mutable.clone(), state.immutables.clone(), state.version.clone())
+        };
+        if let Some(record) = mutable.get(key) {
+            return Ok(record
+                .value
+                .map_or(FixedLsmMemoryLookup::Miss, FixedLsmMemoryLookup::Value));
+        }
+        for immutable in immutables.iter().rev() {
+            if let Some(record) = immutable.get(key) {
+                return Ok(record
+                    .value
+                    .map_or(FixedLsmMemoryLookup::Miss, FixedLsmMemoryLookup::Value));
+            }
+        }
+        Ok(if version.may_contain(key) {
+            FixedLsmMemoryLookup::Unknown
+        } else {
+            FixedLsmMemoryLookup::Miss
+        })
     }
 
     pub fn write(&self, batch: &WriteBatch, options: WriteOptions) -> Result<()> {
@@ -690,6 +743,15 @@ impl FixedLsm {
     /// writer, version, page-cache, or background-maintenance state.
     pub fn disk_used_bytes(&self) -> u64 {
         self.inner.disk_budget.used()
+    }
+
+    /// Return cumulative physical table-read counters without collecting a full database snapshot.
+    pub fn read_stats(&self) -> FixedLsmReadStats {
+        let io = self.inner.io.snapshot();
+        FixedLsmReadStats {
+            read_operations: io.read_operations,
+            read_bytes: io.read_bytes,
+        }
     }
 
     pub fn put(&self, key: Key, value: Value, options: WriteOptions) -> Result<()> {
@@ -871,17 +933,7 @@ impl FixedLsm {
 
     fn reserve_wal(&self, record_count: usize) -> Result<DiskReservation<'_>> {
         let bytes = Wal::frame_size(record_count)?;
-        match self.inner.disk_budget.reserve(bytes) {
-            Ok(reservation) => Ok(reservation),
-            Err(Error::CapacityExceeded { .. }) => {
-                // A full WAL or concurrent compaction may hold reclaimable bytes. Drain
-                // maintenance once before declaring the hard budget exhausted. This happens
-                // outside the writer mutex so manifest publication cannot deadlock behind it.
-                self.flush()?;
-                self.inner.disk_budget.reserve(bytes)
-            }
-            Err(error) => Err(error),
-        }
+        self.inner.disk_budget.reserve(bytes)
     }
 
     fn record_wal_write(&self, bytes: u64) {
@@ -1594,11 +1646,12 @@ mod tests {
 
     use crate::{
         db::{
-            FixedLsm, FixedLsmOptions, MemValue, WriteBatch, WriteOptions, database_storage_bytes,
-            dynamic_level_targets_for_bottom_bytes, mutex_lock, overlap_ratio_order,
+            FixedLsm, FixedLsmMemoryLookup, FixedLsmOptions, MemValue, WriteBatch, WriteOptions,
+            database_storage_bytes, dynamic_level_targets_for_bottom_bytes, mutex_lock, overlap_ratio_order,
         },
         error::Error,
         format::DATA_BLOCK_SIZE,
+        wal::wal_path,
     };
 
     fn key(index: u64) -> [u8; 24] {
@@ -1654,7 +1707,46 @@ mod tests {
     }
 
     #[test]
-    fn disk_budget_rejects_a_wal_batch_before_mutating_memory() {
+    fn repeated_reopen_removes_obsolete_empty_wals() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = FixedLsm::create(directory.path(), test_options()).unwrap();
+        db.put(key(1), value(1, 1), WriteOptions::sync()).unwrap();
+        drop(db);
+
+        let db = FixedLsm::open(directory.path(), test_options()).unwrap();
+        assert_eq!(db.get(&key(1)).unwrap(), Some(value(1, 1)));
+        assert!(wal_path(directory.path(), 1).is_file());
+        assert!(wal_path(directory.path(), 2).is_file());
+        drop(db);
+
+        let db = FixedLsm::open(directory.path(), test_options()).unwrap();
+        assert_eq!(db.get(&key(1)).unwrap(), Some(value(1, 1)));
+        assert!(wal_path(directory.path(), 1).is_file());
+        assert!(!wal_path(directory.path(), 2).exists());
+        assert!(wal_path(directory.path(), 3).is_file());
+    }
+
+    #[test]
+    fn memory_probe_distinguishes_values_misses_and_possible_table_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = FixedLsm::create(directory.path(), test_options()).unwrap();
+        assert_eq!(db.probe_memory(&key(1)).unwrap(), FixedLsmMemoryLookup::Miss);
+
+        db.put(key(1), value(1, 1), WriteOptions::buffered()).unwrap();
+        assert_eq!(
+            db.probe_memory(&key(1)).unwrap(),
+            FixedLsmMemoryLookup::Value(value(1, 1))
+        );
+        db.flush().unwrap();
+        assert_eq!(db.probe_memory(&key(1)).unwrap(), FixedLsmMemoryLookup::Unknown);
+        assert_eq!(db.probe_memory(&key(2)).unwrap(), FixedLsmMemoryLookup::Miss);
+
+        db.delete(key(1), WriteOptions::buffered()).unwrap();
+        assert_eq!(db.probe_memory(&key(1)).unwrap(), FixedLsmMemoryLookup::Miss);
+    }
+
+    #[test]
+    fn disk_budget_soft_limit_does_not_reject_a_wal_batch() {
         let directory = tempfile::tempdir().unwrap();
         let options = FixedLsmOptions {
             max_disk_bytes: 512,
@@ -1667,47 +1759,36 @@ mod tests {
             batch.put(key(index), value(index, 1));
         }
 
-        assert!(matches!(
-            db.write(&batch, WriteOptions::sync()),
-            Err(Error::CapacityExceeded { .. })
-        ));
+        db.write(&batch, WriteOptions::sync()).unwrap();
         let stats = db.stats();
-        assert_eq!(stats.disk_used_bytes, before);
-        assert_eq!(stats.mutable_entries, 0);
-        assert_eq!(stats.writes, 0);
+        assert!(stats.disk_used_bytes > stats.disk_capacity_bytes);
+        assert!(stats.disk_used_bytes > before);
+        assert_eq!(stats.writes, 16);
+        assert_eq!(db.get(&key(0)).unwrap(), Some(value(0, 1)));
     }
 
     #[test]
-    fn disk_budget_includes_transient_compaction_output() {
+    fn disk_budget_soft_limit_does_not_reject_compaction_output() {
         let directory = tempfile::tempdir().unwrap();
         let options = FixedLsmOptions {
-            max_disk_bytes: 200 * 1024,
+            max_disk_bytes: 1,
             ..test_options()
         };
         let db = FixedLsm::create(directory.path(), options).unwrap();
-        let mut failure = None;
         for run in 0..5 {
             let mut batch = WriteBatch::with_capacity(16);
             for index in 0..16 {
                 batch.put(key(index), value(index, run + 1));
             }
-            if let Err(error) = db.write(&batch, WriteOptions::sync()) {
-                failure = Some(error);
-                break;
-            }
-            if let Err(error) = db.flush() {
-                failure = Some(error);
-                break;
-            }
+            db.write(&batch, WriteOptions::sync()).unwrap();
+            db.flush().unwrap();
         }
-
-        let failure = failure.expect("compaction must exhaust its transient disk headroom");
-        assert!(failure.to_string().contains("disk capacity exceeded"));
+        db.compact().unwrap();
         let stats = db.stats();
-        assert!(stats.disk_used_bytes <= stats.disk_capacity_bytes);
-        assert!(stats.background_failed);
-        assert!(db.ensure_healthy().is_err());
-        assert!(db.wait_for_maintenance().is_err());
+        assert!(stats.disk_used_bytes > stats.disk_capacity_bytes);
+        assert!(!stats.background_failed);
+        assert!(db.ensure_healthy().is_ok());
+        assert_eq!(db.get(&key(0)).unwrap(), Some(value(0, 5)));
     }
 
     #[test]
@@ -1893,6 +1974,10 @@ mod tests {
         assert_eq!(db.get(&key(1)).unwrap(), None);
         let read_bytes = db.stats().table_read_bytes - before;
         assert_eq!(read_bytes, 3 * DATA_BLOCK_SIZE as u64);
+        let lightweight = db.read_stats();
+        let full = db.stats();
+        assert_eq!(lightweight.read_operations, full.table_read_operations);
+        assert_eq!(lightweight.read_bytes, full.table_read_bytes);
     }
 
     #[test]

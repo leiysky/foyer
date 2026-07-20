@@ -25,6 +25,7 @@ pub use self::{
 };
 pub(crate) use self::{
     config::PriorityCapacityFloors,
+    core::PreparedGet,
     format::StoreLayout,
     operation::{BatchInsertResult, EntryInsert, InsertOutcome},
 };
