@@ -144,6 +144,7 @@ async fn public_cache_recovers_complete_entries() {
     cache.put(Entry::new(key.clone(), value.clone(), CachePriority::High).unwrap());
     assert_eq!(cache.estimated_entry_count(), 1);
     assert_eq!(cache.get(&key).await.unwrap().value(), &value);
+    cache.wait().await;
     cache.close().await.unwrap();
     drop(cache);
 

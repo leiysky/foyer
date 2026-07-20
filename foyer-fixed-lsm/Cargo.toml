@@ -17,7 +17,6 @@ name = "fixed_lsm"
 [dependencies]
 crc-fast = { workspace = true }
 fs4 = { workspace = true, features = ["sync"] }
-rustix = { workspace = true }
 twox-hash = { workspace = true, features = ["xxhash3_64"] }
 
 [dev-dependencies]

@@ -121,7 +121,8 @@ where
         };
 
         loop {
-            if let Some(record) = candidate.get() {
+            {
+                let record = candidate.get()?;
                 let state = unsafe { &*record.state().get() };
                 if !state.is_visited() {
                     break;
@@ -133,9 +134,6 @@ where
                         candidate.move_next();
                     }
                 }
-            } else {
-                // Queue is empty, no record to evict
-                return None;
             }
         }
 

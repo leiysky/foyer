@@ -1,12 +1,11 @@
+#[cfg(test)]
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::{
     collections::{HashMap, HashSet},
     fs,
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
 };
-
-#[cfg(test)]
-use std::sync::atomic::{AtomicU8, Ordering};
 
 #[cfg(test)]
 use crate::model::CachePriority;

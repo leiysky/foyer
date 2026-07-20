@@ -28,10 +28,12 @@ fixed-lsm = { workspace = true }
 foyer = { workspace = true }
 futures-core = { workspace = true }
 rocksdb = { workspace = true, optional = true }
-rustix = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 twox-hash = { workspace = true, features = ["xxhash3_64"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true }
 
 [dev-dependencies]
 foyer-storage = { workspace = true, features = ["test_utils"] }

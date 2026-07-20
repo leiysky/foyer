@@ -59,7 +59,19 @@ impl Cache {
         self.inner.remove(&Bytes::copy_from_slice(key));
     }
 
-    /// Gracefully drain and close the cache.
+    /// Wait for currently queued disk work to complete and publish a durable checkpoint.
+    ///
+    /// A put remains best effort until selected by the engine. Call `wait` before `close` when the
+    /// caller needs every accepted command ahead of this barrier to finish rather than using the
+    /// bounded shutdown policy.
+    pub async fn wait(&self) {
+        self.inner.storage().wait().await;
+    }
+
+    /// Close the cache using the bounded best-effort shutdown policy.
+    ///
+    /// Close completes an already executing atomic batch and may discard the unstarted queue tail.
+    /// Call [`Self::wait`] first when a durable barrier is required.
     pub async fn close(&self) -> Result<()> {
         self.inner
             .close()

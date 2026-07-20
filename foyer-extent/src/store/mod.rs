@@ -23,15 +23,14 @@ pub use self::{
     io::IoSchedulerStats,
     stats::{ExtentOccupancy, PhysicalWriteStats, ReclaimStats},
 };
+#[cfg(test)]
+pub(crate) use self::{config::ExtentStoreOptions, core::InjectedFault};
 pub(crate) use self::{
     config::PriorityCapacityFloors,
     core::PreparedGet,
     format::StoreLayout,
     operation::{BatchInsertResult, EntryInsert, InsertOutcome},
 };
-
-#[cfg(test)]
-pub(crate) use self::{config::ExtentStoreOptions, core::InjectedFault};
 
 #[cfg(test)]
 pub(crate) fn crash_if_requested(point: &str) {
