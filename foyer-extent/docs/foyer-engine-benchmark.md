@@ -18,7 +18,8 @@ cargo bench -p foyer-extent --bench foyer_engine_compare
 
 The default entry sizes are 4, 16, 64, 256, and 1024 KiB. Default key sizes are 32, 96, 256, and
 1024 bytes. Access concurrency defaults to twice the detected CPU core count and values below that
-are rejected.
+are rejected. Put concurrency uses the same value by default; `EXTENT_BENCH_PUT_CONCURRENCY` can
+override it for an explicit write-side control run without weakening concurrent read validation.
 
 After the cold-memory read phase, the benchmark repeats the read workload on the same cache to
 establish a warm steady-state control, then runs it again while a new-key write wave is being
@@ -89,7 +90,7 @@ EXTENT_BENCH_CAPACITY_MIB=450000 \
 EXTENT_BENCH_ENTRIES=100000000 \
 EXTENT_BENCH_ENTRY_KIB=4 \
 EXTENT_BENCH_KEY_BYTES=32,96,256,1024 \
-EXTENT_BENCH_READS=1000000 \
+EXTENT_BENCH_POPULATE_ONLY=1 \
 cargo bench -p foyer-extent --bench foyer_engine_compare
 
 EXTENT_BENCH_PATH=/mnt/local-nvme/extent-100m \
@@ -102,8 +103,13 @@ EXTENT_BENCH_RECOVER_ONLY=1 \
 cargo bench -p foyer-extent --bench foyer_engine_compare
 ```
 
+`EXTENT_BENCH_POPULATE_ONLY=1` closes after the initial write workload and reports the durable
+footprint without performing the normal reopen, reads, or write burst. It is mutually exclusive
+with `EXTENT_BENCH_RECOVER_ONLY` and leaves a clean image for repeated cold-recovery trials.
+
 Important tuning variables remain explicit: `EXTENT_BENCH_ENGINES`, `EXTENT_BENCH_CONCURRENCY`,
-`EXTENT_BENCH_SHARDS`, `EXTENT_BENCH_BLOCK_MIB`, `EXTENT_BENCH_BLOCK_BUFFER_MIB`,
+`EXTENT_BENCH_PUT_CONCURRENCY`, `EXTENT_BENCH_SHARDS`, `EXTENT_BENCH_BLOCK_MIB`,
+`EXTENT_BENCH_BLOCK_BUFFER_MIB`,
 `EXTENT_BENCH_SEGMENT_MIB`, `EXTENT_BENCH_SLOT_KIB`, `EXTENT_BENCH_INDEX_CACHE_MIB`,
 `EXTENT_BENCH_INDEX_WRITE_BUFFER_MIB`, `EXTENT_BENCH_EXTENT_WRITE_CONCURRENCY`, and
 `EXTENT_BENCH_IO_READ_PRIORITY_US`. Priority-isolation experiments may also override

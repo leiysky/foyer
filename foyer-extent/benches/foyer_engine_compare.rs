@@ -89,6 +89,7 @@ struct Config {
     extent_high_capacity_percent: u8,
     extent_normal_capacity_percent: u8,
     concurrency: usize,
+    put_concurrency: usize,
     shards: usize,
     write_concurrency: usize,
     reads: u64,
@@ -96,6 +97,7 @@ struct Config {
     direct_io: bool,
     recover_only: bool,
     recover_write_wave: bool,
+    populate_only: bool,
     reset: bool,
 }
 
@@ -135,6 +137,12 @@ impl Config {
             return Err(invalid("direct I/O benchmark mode is only supported on Linux").into());
         }
         let recover_only = env_bool("EXTENT_BENCH_RECOVER_ONLY", false)?;
+        let populate_only = env_bool("EXTENT_BENCH_POPULATE_ONLY", false)?;
+        if recover_only && populate_only {
+            return Err(
+                invalid("EXTENT_BENCH_RECOVER_ONLY and EXTENT_BENCH_POPULATE_ONLY are mutually exclusive").into(),
+            );
+        }
         let extent_high_capacity_percent = env_percent(
             "EXTENT_BENCH_HIGH_CAPACITY_PERCENT",
             DEFAULT_HIGH_PRIORITY_CAPACITY_PERCENT,
@@ -148,6 +156,11 @@ impl Config {
                 "EXTENT_BENCH_HIGH_CAPACITY_PERCENT and EXTENT_BENCH_NORMAL_CAPACITY_PERCENT must sum to at most 100",
             )
             .into());
+        }
+
+        let put_concurrency = env_usize("EXTENT_BENCH_PUT_CONCURRENCY", concurrency)?;
+        if put_concurrency == 0 {
+            return Err(invalid("EXTENT_BENCH_PUT_CONCURRENCY must be positive").into());
         }
 
         Ok(Self {
@@ -169,6 +182,7 @@ impl Config {
             extent_high_capacity_percent,
             extent_normal_capacity_percent,
             concurrency,
+            put_concurrency,
             shards: env_usize("EXTENT_BENCH_SHARDS", cores.next_power_of_two())?,
             write_concurrency: env_usize("EXTENT_BENCH_EXTENT_WRITE_CONCURRENCY", (cores / 2).clamp(1, 8))?,
             reads: env_u64("EXTENT_BENCH_READS", workload.entries.saturating_mul(2))?,
@@ -176,6 +190,7 @@ impl Config {
             direct_io,
             recover_only,
             recover_write_wave: env_bool("EXTENT_BENCH_RECOVER_WRITE_WAVE", false)?,
+            populate_only,
             reset: env_bool("EXTENT_BENCH_RESET", !recover_only)?,
         })
     }
@@ -329,7 +344,7 @@ async fn main() -> AnyResult<()> {
     fs::create_dir_all(&config.root)?;
 
     println!(
-        "foyer-engine benchmark: path={}, engines={}, entries={}, payload_mib={:.1}, capacity_mib={}, memory_mib={}, entry_kib={}, key_bytes={}, priority_workload={}, read_pattern={}, concurrency={} (>=2x cores), io={}, extent_read_priority_us={}, extent_priority_floors={}/{}, recover_only={}, recover_write_wave={}",
+        "foyer-engine benchmark: path={}, engines={}, entries={}, payload_mib={:.1}, capacity_mib={}, memory_mib={}, entry_kib={}, key_bytes={}, priority_workload={}, read_pattern={}, concurrency={} (>=2x cores), put_concurrency={}, io={}, extent_read_priority_us={}, extent_priority_floors={}/{}, recover_only={}, recover_write_wave={}, populate_only={}",
         config.root.display(),
         config
             .engines
@@ -346,12 +361,14 @@ async fn main() -> AnyResult<()> {
         workload.priority.label(),
         config.read_pattern.label(),
         config.concurrency,
+        config.put_concurrency,
         if config.direct_io { "direct" } else { "buffered" },
         config.extent_io_read_priority.as_micros(),
         config.extent_high_capacity_percent,
         config.extent_normal_capacity_percent,
         config.recover_only,
         config.recover_write_wave,
+        config.populate_only,
     );
 
     for engine in config.engines.iter().copied() {
@@ -413,6 +430,10 @@ async fn run_engine(engine: DiskEngine, config: &Config, workload: Arc<Workload>
         as_mib(logical),
         as_mib(allocated),
     );
+
+    if config.populate_only {
+        return Ok(());
+    }
 
     recover_and_read(engine, config, workload, &path).await
 }
@@ -618,7 +639,7 @@ async fn run_writes(cache: &BenchCache, config: &Config, workload: Arc<Workload>
 
     while start < workload.entries {
         let end = start.saturating_add(wave_entries).min(workload.entries);
-        let worker_count = config.concurrency.min((end - start) as usize).max(1);
+        let worker_count = config.put_concurrency.min((end - start) as usize).max(1);
         let wave_started = Instant::now();
         let mut workers = Vec::with_capacity(worker_count);
         for worker in 0..worker_count {
