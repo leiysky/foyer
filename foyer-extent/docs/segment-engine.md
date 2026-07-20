@@ -139,8 +139,10 @@ iterator, transaction model, column family, compression selector, or pluggable c
 
 Its fixed policy uses immutable SSTs, Bloom filters, a bounded block cache, partitioned leveled
 compaction, and alternating manifests. Open reads fence summaries and a bounded WAL tail; detailed
-metadata and data blocks are demand-loaded. SegmentEngine supplies no range or payload-layout
-knowledge to the LSM.
+metadata and data blocks are demand-loaded. One eighth of the runtime cache budget is reserved for
+lazy, table-local Bloom pages, which become lock-free after their first validated read. The
+remaining shared budget serves evictable data pages and any Bloom pages that cannot enter the
+pinned tier. SegmentEngine supplies no range or payload-layout knowledge to the LSM.
 
 ## Failure model
 

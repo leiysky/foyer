@@ -58,13 +58,27 @@ The integrated 300 GiB run stored and fully revalidated 7,602,593 blobs spanning
 sustained 359.5 MiB/s payload submission, reopened in 60.7 ms warm and 71.6 ms after dropping the
 page cache, and produced 2.532/2.977 ms recovered-read p99/p99.9. Peak RSS was 1.19 GiB.
 
+A later 10-million-entry hot-path profile compared the persistent index with Foyer's in-memory
+block index at four clients. Borrowing cached data pages in place, probing L0 Bloom filters before
+absent data blocks, and lazily pinning Bloom pages raised FixedRecordLSM from 0.858 to a three-run
+median of 1.250 Mops/s and reduced median p50 from 2.37 to 1.64 microseconds. With a one-million-key
+working set, raising the cache budget from 256 MiB to 1 GiB raised throughput from 0.587 to
+1.002 Mops/s and reduced p99 from 7.34 to 2.67 microseconds; only 39 data-page misses occurred
+during the measured ten million lookups. The same index changes improved the complete storage path
+by only 2.6%, confirming that a resident index is no longer its primary bottleneck.
+
+The final development-host validation and its production-canary boundary are recorded in
+the [storage validation closeout](../validation-closeout-2026-07-20.md).
+
 ## Configuration policy
 
-The static format and compaction policy are fixed at their balanced values. Runtime configuration
-may tune allocation/service sizes, FixedRecordLSM block-cache and write-buffer budgets, and
-checkpoint size/interval. It does not expose block format, Bloom shape, level topology, or
-compaction style. A low-benefit algorithm variant should be rejected; a materially better design
-must replace this one after a matched RocksDB and ScopeDB/Foyer evaluation.
+The static format and compaction policy are fixed at their balanced values. The index cache defaults
+to a lazily populated 1 GiB upper bound; one eighth is a bounded pinned-Bloom budget and the rest is
+a shared evictable page cache. Runtime configuration may tune the total cache, allocation/service
+sizes, FixedRecordLSM write-buffer budget, and checkpoint size/interval. It does not expose the
+cache split, block format, Bloom shape, level topology, or compaction style. A low-benefit
+algorithm variant should be rejected; a materially better design must replace this one after a
+matched RocksDB and ScopeDB/Foyer evaluation.
 
 ## Consequences
 

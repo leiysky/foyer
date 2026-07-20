@@ -152,6 +152,8 @@ their own `HybridCache<Bytes, EngineValue>` can install
 
 The vendored implementation retains its ScopeDB license. Its architecture, failure model, and
 matched BlockEngine benchmark are documented under [`foyer-extent/docs`](foyer-extent/docs).
+The final i8g.large development-host evidence and production-canary boundary are recorded in the
+[`ExtentEngine storage validation closeout`](foyer-extent/docs/validation-closeout-2026-07-20.md).
 This fork's minimum supported Rust version is 1.91.
 Extent production support is Linux-only, and online `HybridCache::clear()` is not yet supported.
 
