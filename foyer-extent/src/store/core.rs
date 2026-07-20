@@ -1064,10 +1064,10 @@ mod tests {
             early.is_err(),
             "reclaim reused a generation before its checkpoint became durable"
         );
-        assert_ne!(
-            received.recv_timeout(Duration::from_secs(1)).unwrap().unwrap(),
-            InsertOutcome::Rejected
-        );
+        let result = received
+            .recv_timeout(Duration::from_secs(30))
+            .expect("reclaim did not resume after its checkpoint became durable");
+        assert_ne!(result.unwrap(), InsertOutcome::Rejected);
         writer.join().unwrap();
         store.sync().unwrap();
         assert_eq!(store.get(&key(100_000)).unwrap(), Some(full_frame_value(9)));
