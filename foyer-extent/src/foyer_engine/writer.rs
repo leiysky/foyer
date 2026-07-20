@@ -237,6 +237,8 @@ impl WriteWorker {
                     return;
                 }
             }
+            self.stats
+                .record_remaining_index_reads(self.statistics.as_ref(), self.segment.index_read_stats());
             let completed = Instant::now();
             self.stats.record_write_batch(completed.duration_since(started));
             self.stats.record_write_publications(
@@ -279,6 +281,7 @@ impl WriteWorker {
 
 pub fn sync_segment(segment: &SegmentEngine, statistics: &Statistics, stats: &EngineStats) -> crate::Result<()> {
     let result = segment.sync();
+    stats.record_remaining_index_reads(statistics, segment.index_read_stats());
     let physical = segment.physical_write_stats();
     stats.record_remaining_writes(statistics, physical.total_runs(), physical.total_bytes());
     result

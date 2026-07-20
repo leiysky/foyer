@@ -138,6 +138,9 @@ async fn public_cache_recovers_complete_entries() {
         .build()
         .await
         .unwrap();
+    assert_eq!(cache.storage_usage().capacity(), DISK_CAPACITY);
+    assert!(cache.engine_handle().write_stats().is_some());
+    assert_eq!(cache.statistics().disk_read_ios(), 0);
     cache.put(Entry::new(key.clone(), value.clone(), CachePriority::High).unwrap());
     assert_eq!(cache.get(&key).await.unwrap().value(), &value);
     cache.close().await.unwrap();
@@ -148,10 +151,29 @@ async fn public_cache_recovers_complete_entries() {
         .build()
         .await
         .unwrap();
+    let handle = recovered.engine_handle();
+    let disk_reads_before = (
+        recovered.statistics().disk_read_ios() as u64,
+        recovered.statistics().disk_read_bytes() as u64,
+    );
+    let index_reads_before = handle.index_read_stats().unwrap();
+    let payload_reads_before = handle.read_stats().unwrap();
     let entry = recovered.get(&key).await.unwrap();
     assert_eq!(entry.key(), &key);
     assert_eq!(entry.value(), &value);
     assert_eq!(entry.priority(), CachePriority::High);
+    let index_reads_after = handle.index_read_stats().unwrap();
+    let payload_reads_after = handle.read_stats().unwrap();
+    assert_eq!(
+        recovered.statistics().disk_read_ios() as u64 - disk_reads_before.0,
+        index_reads_after.read_operations - index_reads_before.read_operations + payload_reads_after.data_runs
+            - payload_reads_before.data_runs,
+    );
+    assert_eq!(
+        recovered.statistics().disk_read_bytes() as u64 - disk_reads_before.1,
+        index_reads_after.read_bytes - index_reads_before.read_bytes + payload_reads_after.data_bytes
+            - payload_reads_before.data_bytes,
+    );
     recovered.delete(&key);
     // Delete is an asynchronous best-effort hint. A racing read may still observe the previous
     // complete entry, but never a partial value or a different priority.

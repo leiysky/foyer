@@ -8,7 +8,9 @@ use std::{
 
 use foyer::{Metrics, Statistics};
 
-use crate::{CachePriority, CheckpointStats, PriorityOccupancy, ReclaimStats, foyer_engine::mutex_lock};
+use crate::{
+    CachePriority, CheckpointStats, IndexReadStats, PriorityOccupancy, ReclaimStats, foyer_engine::mutex_lock,
+};
 
 const LATENCY_SAMPLE_CAPACITY: usize = 16_384;
 
@@ -52,7 +54,8 @@ pub struct EngineStats {
     reclaim: Mutex<ReclaimStats>,
     reads: EngineReadCounters,
     writes: EngineWriteCounters,
-    recorded_writes: Mutex<RecordedWrites>,
+    recorded_writes: Mutex<RecordedIo>,
+    recorded_index_reads: Mutex<RecordedIo>,
     write_batches: Mutex<LatencySamples>,
     write_publications: Mutex<LatencySamples>,
 }
@@ -65,6 +68,7 @@ impl EngineStats {
             reads: EngineReadCounters::default(),
             writes: EngineWriteCounters::default(),
             recorded_writes: Mutex::default(),
+            recorded_index_reads: Mutex::default(),
             write_batches: Mutex::default(),
             write_publications: Mutex::default(),
         }
@@ -212,7 +216,19 @@ impl EngineStats {
     pub fn record_disk_reads(&self, statistics: &Statistics, bytes: usize, runs: usize) {
         record_io(bytes, runs, |bytes| {
             statistics.record_disk_read(bytes);
+            self.metrics.storage_disk_read.increase(1);
+            self.metrics.storage_disk_read_bytes.increase(bytes as u64);
         });
+    }
+
+    pub fn record_remaining_index_reads(&self, statistics: &Statistics, total: IndexReadStats) {
+        let mut recorded = mutex_lock(&self.recorded_index_reads);
+        let runs = usize::try_from(total.read_operations.saturating_sub(recorded.runs)).unwrap_or(usize::MAX);
+        let bytes = usize::try_from(total.read_bytes.saturating_sub(recorded.bytes)).unwrap_or(usize::MAX);
+        recorded.runs = total.read_operations;
+        recorded.bytes = total.read_bytes;
+        drop(recorded);
+        self.record_disk_reads(statistics, bytes, runs);
     }
 
     pub fn record_synchronous_writes(&self, statistics: &Statistics, runs: usize, bytes: usize) {
@@ -222,6 +238,8 @@ impl EngineStats {
         drop(recorded);
         record_io(bytes, runs, |bytes| {
             statistics.record_disk_write(bytes);
+            self.metrics.storage_disk_write.increase(1);
+            self.metrics.storage_disk_write_bytes.increase(bytes as u64);
         });
     }
 
@@ -234,12 +252,14 @@ impl EngineStats {
         drop(recorded);
         record_io(bytes, runs, |bytes| {
             statistics.record_disk_write(bytes);
+            self.metrics.storage_disk_write.increase(1);
+            self.metrics.storage_disk_write_bytes.increase(bytes as u64);
         });
     }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-struct RecordedWrites {
+struct RecordedIo {
     runs: u64,
     bytes: u64,
 }
@@ -336,6 +356,8 @@ fn record_io(bytes: usize, runs: usize, mut record: impl FnMut(usize)) {
 
 #[cfg(test)]
 mod tests {
+    use foyer::Throttle;
+
     use super::*;
 
     #[test]
@@ -353,5 +375,43 @@ mod tests {
         let stats = EngineStats::new(Arc::new(Metrics::noop()));
         assert_eq!(stats.writes(), EngineWriteStats::default());
         assert_eq!(stats.reads(), EngineReadStats::default());
+    }
+
+    #[test]
+    fn cumulative_index_reads_are_recorded_exactly_once() {
+        let stats = EngineStats::new(Arc::new(Metrics::noop()));
+        let statistics = Statistics::new(Throttle::default());
+        stats.record_remaining_index_reads(
+            &statistics,
+            IndexReadStats {
+                read_operations: 3,
+                read_bytes: 10,
+                ..Default::default()
+            },
+        );
+        assert_eq!(statistics.disk_read_ios(), 3);
+        assert_eq!(statistics.disk_read_bytes(), 10);
+
+        stats.record_remaining_index_reads(
+            &statistics,
+            IndexReadStats {
+                read_operations: 3,
+                read_bytes: 10,
+                ..Default::default()
+            },
+        );
+        assert_eq!(statistics.disk_read_ios(), 3);
+        assert_eq!(statistics.disk_read_bytes(), 10);
+
+        stats.record_remaining_index_reads(
+            &statistics,
+            IndexReadStats {
+                read_operations: 5,
+                read_bytes: 16,
+                ..Default::default()
+            },
+        );
+        assert_eq!(statistics.disk_read_ios(), 5);
+        assert_eq!(statistics.disk_read_bytes(), 16);
     }
 }

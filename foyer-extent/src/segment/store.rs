@@ -1259,6 +1259,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(value.value, None);
+        assert_eq!(value.data_runs, 1);
+        assert_eq!(value.data_slots, 1);
+        assert_eq!(value.data_bytes, stored_blob_len(&key, &old_value).unwrap());
     }
 
     #[test]

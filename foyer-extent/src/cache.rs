@@ -1,9 +1,11 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 
 use bytes::Bytes;
-use foyer::{Hint, HybridCache, HybridCachePolicy, HybridCacheProperties, RecoverMode, Spawner};
+use foyer::{
+    Hint, HybridCache, HybridCachePolicy, HybridCacheProperties, RecoverMode, Spawner, Statistics, StorageUsage,
+};
 
-use crate::{CachePriority, EngineValue, Entry, Error, ExtentEngineConfig, Result, model::BlobKey};
+use crate::{CachePriority, EngineValue, Entry, Error, ExtentEngineConfig, ExtentEngineHandle, Result, model::BlobKey};
 
 const CACHE_ENTRY_META_SIZE: usize = 64;
 
@@ -11,6 +13,7 @@ const CACHE_ENTRY_META_SIZE: usize = 64;
 #[derive(Debug, Clone)]
 pub struct Cache {
     inner: HybridCache<Bytes, EngineValue>,
+    engine_handle: ExtentEngineHandle,
 }
 
 impl Cache {
@@ -60,6 +63,21 @@ impl Cache {
             .close()
             .await
             .map_err(|source| Error::foyer("close Extent cache", source))
+    }
+
+    /// Return a read-only handle to the attached disk engine.
+    pub fn engine_handle(&self) -> ExtentEngineHandle {
+        self.engine_handle.clone()
+    }
+
+    /// Return an O(1) snapshot of the disk capacity governed by the engine.
+    pub fn storage_usage(&self) -> StorageUsage {
+        self.inner.storage().storage_usage()
+    }
+
+    /// Return the shared Foyer physical I/O statistics.
+    pub fn statistics(&self) -> &Arc<Statistics> {
+        self.inner.statistics()
     }
 }
 
@@ -118,6 +136,7 @@ impl CacheBuilder {
             ));
         }
 
+        let engine_handle = self.engine.handle();
         let mut memory = HybridCache::builder()
             .with_name(self.name)
             .with_flush_on_close(false)
@@ -144,6 +163,6 @@ impl CacheBuilder {
             .build()
             .await
             .map_err(|source| Error::foyer("open Extent cache", source))?;
-        Ok(Cache { inner })
+        Ok(Cache { inner, engine_handle })
     }
 }

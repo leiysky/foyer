@@ -26,6 +26,9 @@ shedding while reads are active; high-priority writes retain the hard queue budg
 `ExtentEngineHandle` exposes queue depth, publication/durability frontiers, asynchronous write
 outcomes, active read admission, scheduler waits, physical I/O, reclaim work, and the first sticky
 background failure. These observations do not turn fire-and-forget puts into acknowledged writes.
+The public `Cache` facade exposes this handle directly through `engine_handle()`, together with
+`storage_usage()` and the shared Foyer `statistics()`, so a production canary does not need to retain
+an internal builder config solely for observability.
 
 The Foyer-facing queue, pipeline, and recovery state is also exported through its metrics registry as
 `foyer_storage_engine_command_total`, `foyer_storage_engine_batch_total`,
@@ -37,6 +40,9 @@ The Foyer-facing queue, pipeline, and recovery state is also exported through it
 at reservation ownership changes; the worker refreshes checkpoint frontiers on every batch and
 periodic checkpoint tick. `storage_usage()` is an O(1) snapshot: preallocated segment-file usage is
 fixed by the discovered layout, while FixedRecordLSM reports its atomic disk-budget counter.
+The shared physical-I/O counters include both payload and index reads, including reads that finish
+as a validated cache miss, and all payload, checkpoint, and index writes. Cumulative FixedRecordLSM
+counters are reconciled exactly once so concurrent lookups cannot double-count index I/O.
 
 The physical hierarchy is allocation slots grouped into cache segments. A blob occupies contiguous
 slots within exactly one segment, and a segment is reused as one generation. Object ranges,

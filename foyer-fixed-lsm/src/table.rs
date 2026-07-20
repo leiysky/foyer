@@ -3,10 +3,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use crc_fast::{CrcAlgorithm, Digest};
@@ -51,34 +48,34 @@ pub struct TableIoStats {
 
 #[derive(Debug, Default)]
 pub struct TableIoCounters {
-    read_operations: AtomicU64,
-    read_bytes: AtomicU64,
-    write_operations: AtomicU64,
-    write_bytes: AtomicU64,
-    point_data_reads: AtomicU64,
-    point_false_positives: AtomicU64,
+    stats: Mutex<TableIoStats>,
 }
 
 impl TableIoCounters {
     pub fn snapshot(&self) -> TableIoStats {
-        TableIoStats {
-            read_operations: self.read_operations.load(Ordering::Relaxed),
-            read_bytes: self.read_bytes.load(Ordering::Relaxed),
-            write_operations: self.write_operations.load(Ordering::Relaxed),
-            write_bytes: self.write_bytes.load(Ordering::Relaxed),
-            point_data_reads: self.point_data_reads.load(Ordering::Relaxed),
-            point_false_positives: self.point_false_positives.load(Ordering::Relaxed),
-        }
+        *self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn record_read(&self, bytes: usize) {
-        self.read_operations.fetch_add(1, Ordering::Relaxed);
-        self.read_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        let mut stats = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        stats.read_operations = stats.read_operations.saturating_add(1);
+        stats.read_bytes = stats.read_bytes.saturating_add(bytes as u64);
     }
 
     fn record_write(&self, bytes: u64) {
-        self.write_operations.fetch_add(1, Ordering::Relaxed);
-        self.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+        let mut stats = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        stats.write_operations = stats.write_operations.saturating_add(1);
+        stats.write_bytes = stats.write_bytes.saturating_add(bytes);
+    }
+
+    fn record_point_data_read(&self) {
+        let mut stats = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        stats.point_data_reads = stats.point_data_reads.saturating_add(1);
+    }
+
+    fn record_point_false_positive(&self) {
+        let mut stats = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        stats.point_false_positives = stats.point_false_positives.saturating_add(1);
     }
 }
 
@@ -238,7 +235,7 @@ impl Table {
         if let Some(record) = self.cache.get_with(data_key, |data| find_record(&self.path, data, key)) {
             let record = record?;
             if filter_first && record.is_none() {
-                self.io.point_false_positives.fetch_add(1, Ordering::Relaxed);
+                self.io.record_point_false_positive();
             }
             return Ok(record);
         }
@@ -246,11 +243,11 @@ impl Table {
             return Ok(None);
         }
         let data = self.read_data_block(block, Some(fence))?;
-        self.io.point_data_reads.fetch_add(1, Ordering::Relaxed);
+        self.io.record_point_data_read();
         let data = self.cache.insert(data_key, data);
         let record = find_record(&self.path, &data, key)?;
         if record.is_none() {
-            self.io.point_false_positives.fetch_add(1, Ordering::Relaxed);
+            self.io.record_point_false_positive();
         }
         Ok(record)
     }
@@ -952,7 +949,8 @@ mod tests {
     use std::{
         fs::{File, OpenOptions},
         io,
-        sync::Arc,
+        sync::{Arc, Barrier},
+        thread,
     };
 
     use crate::{
@@ -988,6 +986,42 @@ mod tests {
             offset += written as u64;
         }
         Ok(())
+    }
+
+    #[test]
+    fn io_snapshots_keep_operations_and_bytes_paired() {
+        const WORKERS: usize = 8;
+        const READS_PER_WORKER: usize = 1_024;
+        const READ_BYTES: usize = 4_096;
+
+        let io = Arc::new(TableIoCounters::default());
+        let start = Arc::new(Barrier::new(WORKERS + 1));
+        let workers = (0..WORKERS)
+            .map(|_| {
+                let io = io.clone();
+                let start = start.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    for _ in 0..READS_PER_WORKER {
+                        io.record_read(READ_BYTES);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        start.wait();
+        let expected_operations = (WORKERS * READS_PER_WORKER) as u64;
+        loop {
+            let snapshot = io.snapshot();
+            assert_eq!(snapshot.read_bytes, snapshot.read_operations * READ_BYTES as u64);
+            if snapshot.read_operations == expected_operations {
+                break;
+            }
+            thread::yield_now();
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
     }
 
     #[test]

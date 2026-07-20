@@ -42,9 +42,13 @@ when traffic never reaches the mutation-count threshold.
 
 The Foyer integration exports queue ownership, async-write outcomes, checkpoint frontiers, and
 pipeline health through the shared metrics registry. The runtime handle is a debugging and
-benchmark view over the same domain state, not a separate accounting path. Storage-usage polling
-does no directory walk: SegmentStore captures its fixed allocation once and FixedRecordLSM exposes
-the disk budget it already maintains for admission and compaction.
+benchmark view over the same domain state, not a separate accounting path. The public cache facade
+retains and exposes that handle, shared Foyer statistics, and storage usage after consuming the
+engine config. Physical-I/O accounting includes payload and FixedRecordLSM index work. A payload
+read is counted even when generation or key validation turns it into a cache miss; cumulative index
+counters are reconciled under one accounting lock so concurrent readers report every delta once.
+Storage-usage polling does no directory walk: SegmentStore captures its fixed allocation once and
+FixedRecordLSM exposes the disk budget it already maintains for admission and compaction.
 
 Test-only injection points exercise no-space, short-write, sync, and flush-worker panic behavior.
 They are compiled out of production code. A frozen full-engine V3 image is decoded and advanced by

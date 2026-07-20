@@ -414,7 +414,7 @@ async fn run_engine(engine: DiskEngine, config: &Config, workload: Arc<Workload>
     );
 
     let write = run_writes(&built.cache, config, workload.clone()).await?;
-    let io = io_measurements(&built.cache, &built.extent);
+    let io = io_measurements(&built.cache);
     let elapsed = write.foreground + write.drain;
     println!(
         "engine={} phase=write operations={} logical_mib={:.1} foreground_seconds={:.3} drain_seconds={:.3} end_to_end_seconds={:.3} foreground_mib_s={:.1} end_to_end_mib_s={:.1} disk_write_mib={:.1} write_amp={:.3} disk_write_ios={} peak_rss_mib={}",
@@ -502,7 +502,7 @@ async fn recover_and_read(engine: DiskEngine, config: &Config, workload: Arc<Wor
         config.storage_reads,
     )
     .await?;
-    let io = io_measurements(&recovered.cache, &recovered.extent);
+    let io = io_measurements(&recovered.cache);
     println!(
         "engine={} phase=read operations={} hits={} misses={} errors={} invalid={} hit_ratio={:.3} seconds={:.3} ops_s={:.0} hit_mib_s={:.1} disk_read_mib={:.1} disk_read_ios={}",
         engine.label(),
@@ -560,9 +560,9 @@ async fn recover_and_read(engine: DiskEngine, config: &Config, workload: Arc<Wor
         print_latencies(engine, "get_hit_before_write_burst", &before_burst.hit_latencies);
         print_latencies(engine, "get_miss_before_write_burst", &before_burst.miss_latencies);
 
-        let io_before = io_measurements(&recovered.cache, &recovered.extent);
+        let io_before = io_measurements(&recovered.cache);
         let (burst, under_burst) = run_read_under_write_burst(&recovered.cache, config, workload).await?;
-        let io = io_delta(io_measurements(&recovered.cache, &recovered.extent), io_before);
+        let io = io_delta(io_measurements(&recovered.cache), io_before);
         println!(
             "engine={} phase=read_under_write_burst read_operations={} hits={} misses={} errors={} invalid={} read_seconds={:.3} read_ops_s={:.0} burst_operations={} burst_mib={:.1} burst_foreground_seconds={:.3} burst_drain_seconds={:.3} disk_read_mib={:.1} disk_write_mib={:.1} hit_p99_inflation={:.3}",
             engine.label(),
@@ -1130,19 +1130,14 @@ fn print_extent_read_stats(engine: DiskEngine, handle: &Option<ExtentEngineHandl
     }
 }
 
-fn io_measurements(cache: &BenchCache, extent: &Option<ExtentEngineHandle>) -> IoMeasurements {
+fn io_measurements(cache: &BenchCache) -> IoMeasurements {
     let stats = cache.statistics();
-    let mut measurements = IoMeasurements {
+    IoMeasurements {
         write_bytes: stats.disk_write_bytes(),
         write_ios: stats.disk_write_ios(),
         read_bytes: stats.disk_read_bytes(),
         read_ios: stats.disk_read_ios(),
-    };
-    if let Some(index) = extent.as_ref().and_then(ExtentEngineHandle::index_read_stats) {
-        measurements.read_bytes = measurements.read_bytes.saturating_add(index.read_bytes as usize);
-        measurements.read_ios = measurements.read_ios.saturating_add(index.read_operations as usize);
     }
-    measurements
 }
 
 fn entries_for_payload(target: u64, sizes: &[usize], cycle_bytes: u64) -> u64 {

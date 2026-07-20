@@ -472,6 +472,7 @@ impl ExtentEngine {
         let background_error = Arc::new(BackgroundError::new(metrics.clone()));
         metrics.storage_engine_healthy.absolute(1);
         let stats = Arc::new(EngineStats::new(metrics.clone()));
+        stats.record_remaining_index_reads(io_control.statistics(), segment.index_read_stats());
         stats.record_priority_occupancy(segment.priority_occupancy());
         let read_limiter = ReadLimiter::new(config.read_concurrency, metrics.clone());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -604,20 +605,23 @@ impl Engine<Bytes, EngineValue, HybridCacheProperties> for ExtentEngine {
                     let _read_permit = read_permit;
                     segment.get_with_stats(&blob_key)
                 })
-                .await?
-                .map_err(|error| extent_error("load Extent entry", error))?;
+                .await;
+            inner
+                .stats
+                .record_remaining_index_reads(inner.io_control.statistics(), inner.segment.index_read_stats());
+            let loaded = loaded?.map_err(|error| extent_error("load Extent entry", error))?;
             inner
                 .stats
                 .record_read(loaded.data_slots, loaded.data_runs, loaded.data_bytes);
+            inner
+                .stats
+                .record_disk_reads(inner.io_control.statistics(), loaded.data_bytes, loaded.data_runs);
             let Some(value) = loaded.value else {
                 return Ok(Load::Miss);
             };
             let priority = loaded
                 .priority
                 .expect("a validated Extent hit must retain its priority");
-            inner
-                .stats
-                .record_disk_reads(inner.io_control.statistics(), loaded.data_bytes, loaded.data_runs);
             Ok(Load::Entry {
                 key,
                 value: EngineValue::new(Bytes::from(value), priority).expect("a stored Extent hit must be non-empty"),
