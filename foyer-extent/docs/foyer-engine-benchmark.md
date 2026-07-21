@@ -121,6 +121,12 @@ write wave within usable extent capacity and require the same hit set and compar
 on both sides. A run that also changes eviction, accepted writes, or hit ratio measures a different
 workload and cannot establish scheduler latency benefit.
 
+`EXTENT_BENCH_READ_RUN_KIB` and `EXTENT_BENCH_WRITE_RUN_KIB` override Extent's runtime-only maximum
+payload I/O request sizes. They do not alter the persistent layout, so recover-only runs can compare
+multiple read-run sizes against the same image. Keep values page-aligned. The Extent write record
+reports payload, directory, index, and allocator run counts separately so a write-run experiment
+does not attribute metadata calls to payload splitting.
+
 ## 300 GiB buffered-I/O run
 
 Choose a capacity that fits the device and the desired eviction pressure. This example offers 300
@@ -203,7 +209,8 @@ Important tuning variables remain explicit: `EXTENT_BENCH_SEED`, `EXTENT_BENCH_E
 `EXTENT_BENCH_ENTRY_MEDIAN_KIB`, `EXTENT_BENCH_ENTRY_MAX_KIB`,
 `EXTENT_BENCH_EXTENT_MIB`, `EXTENT_BENCH_ENTRY_CHARGE_KIB`, `EXTENT_BENCH_INDEX_CACHE_MIB`,
 `EXTENT_BENCH_INDEX_WRITE_BUFFER_MIB`, `EXTENT_BENCH_EXTENT_WRITE_CONCURRENCY`, and
-`EXTENT_BENCH_IO_READ_PRIORITY_US`. Priority-isolation experiments may also override
+`EXTENT_BENCH_IO_READ_PRIORITY_US`, `EXTENT_BENCH_READ_RUN_KIB`, and
+`EXTENT_BENCH_WRITE_RUN_KIB`. Priority-isolation experiments may also override
 `EXTENT_BENCH_HIGH_CAPACITY_PERCENT` and `EXTENT_BENCH_NORMAL_CAPACITY_PERCENT`; their sum must not
 exceed 100.
 

@@ -5,7 +5,9 @@ use crate::format::DEFAULT_ENTRY_CHARGE;
 pub const DEFAULT_EXTENT_SIZE: usize = 64 * 1024 * 1024;
 pub const DEFAULT_HIGH_PRIORITY_CAPACITY_PERCENT: u8 = 10;
 pub const DEFAULT_NORMAL_PRIORITY_CAPACITY_PERCENT: u8 = 70;
-const DEFAULT_READ_RUN_SIZE: usize = 64 * 1024;
+// Keep the common <= 1 MiB value range in one direct-I/O request, including Stored Entry
+// metadata and the two covering page fragments. Larger entries remain bounded and are split.
+const DEFAULT_READ_RUN_SIZE: usize = 2 * 1024 * 1024;
 const DEFAULT_WRITE_RUN_SIZE: usize = 1024 * 1024;
 const DEFAULT_INDEX_WRITE_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 const DEFAULT_INDEX_CACHE_SIZE: usize = 1024 * 1024 * 1024;

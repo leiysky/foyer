@@ -18,7 +18,9 @@ const LATENCY_SAMPLE_CAPACITY: usize = 16_384;
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EngineReadStats {
     pub calls: u64,
+    /// Number of covering 4 KiB payload frames, not the number of I/O requests.
     pub data_frames: u64,
+    /// Number of userspace payload read calls after contiguous bytes are coalesced.
     pub data_runs: u64,
     pub data_bytes: u64,
 }

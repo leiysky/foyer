@@ -116,6 +116,8 @@ struct Config {
     extent_index_cache_bytes: usize,
     extent_index_write_buffer_bytes: usize,
     extent_io_read_priority: Duration,
+    extent_read_run_bytes: usize,
+    extent_write_run_bytes: usize,
     extent_high_capacity_percent: u8,
     extent_normal_capacity_percent: u8,
     concurrency: usize,
@@ -225,6 +227,8 @@ impl Config {
             extent_io_read_priority: Duration::from_micros(
                 env_optional_u64("EXTENT_BENCH_IO_READ_PRIORITY_US")?.unwrap_or(2_000),
             ),
+            extent_read_run_bytes: env_kib("EXTENT_BENCH_READ_RUN_KIB", 2 * MIB / KIB)?,
+            extent_write_run_bytes: env_kib("EXTENT_BENCH_WRITE_RUN_KIB", MIB / KIB)?,
             extent_high_capacity_percent,
             extent_normal_capacity_percent,
             concurrency,
@@ -648,7 +652,7 @@ async fn main() -> AnyResult<()> {
     fs::create_dir_all(&config.root)?;
 
     println!(
-        "foyer-engine benchmark: scenario_version={} seed={} seed_hex={:#018x} generator=counter-splitmix64-prp-v1 path={} engines={} entries={} payload_mib={:.1} capacity_mib={} memory_mib={} entry_distribution={} entry_size_config={} entry_size_observed_kib={} key_bytes={} write_order={} priority_workload={} read_pattern={} read_hotset={} read_warmup={} warmup_order=random-permutation read_source={} concurrency={} (>=2x cores) put_concurrency={} io={} extent_read_priority_us={} extent_priority_floors={}/{} recover_only={} recover_write_wave={} populate_only={} rewrite_passes={}",
+        "foyer-engine benchmark: scenario_version={} seed={} seed_hex={:#018x} generator=counter-splitmix64-prp-v1 path={} engines={} entries={} payload_mib={:.1} capacity_mib={} memory_mib={} entry_distribution={} entry_size_config={} entry_size_observed_kib={} key_bytes={} write_order={} priority_workload={} read_pattern={} read_hotset={} read_warmup={} warmup_order=random-permutation read_source={} concurrency={} (>=2x cores) put_concurrency={} io={} extent_read_priority_us={} extent_read_run_kib={} extent_write_run_kib={} extent_priority_floors={}/{} recover_only={} recover_write_wave={} populate_only={} rewrite_passes={}",
         SCENARIO_VERSION,
         workload.seed,
         workload.seed,
@@ -677,6 +681,8 @@ async fn main() -> AnyResult<()> {
         config.put_concurrency,
         if config.direct_io { "direct" } else { "buffered" },
         config.extent_io_read_priority.as_micros(),
+        config.extent_read_run_bytes / KIB,
+        config.extent_write_run_bytes / KIB,
         config.extent_high_capacity_percent,
         config.extent_normal_capacity_percent,
         config.recover_only,
@@ -972,6 +978,8 @@ async fn build_cache(
                 .with_test_layout(config.extent_entry_charge, config.extent_size)
                 .with_write_concurrency(config.write_concurrency)
                 .with_io_read_priority_duration(config.extent_io_read_priority)
+                .with_read_run_size(config.extent_read_run_bytes)
+                .with_write_run_size(config.extent_write_run_bytes)
                 .with_index_cache_size(config.extent_index_cache_bytes)
                 .with_index_write_buffer_size(config.extent_index_write_buffer_bytes)
                 .with_priority_capacity_floors(
@@ -1412,14 +1420,18 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
     };
     if let Some(stats) = handle.physical_write_stats() {
         println!(
-            "engine={} phase=extent_write physical_mib={:.1} physical_runs={} data_mib={:.1} directory_mib={:.1} index_mib={:.1} allocator_mib={:.1}",
+            "engine={} phase=extent_write physical_mib={:.1} physical_runs={} data_mib={:.1} data_runs={} directory_mib={:.1} directory_runs={} index_mib={:.1} index_runs={} allocator_mib={:.1} allocator_runs={}",
             engine.label(),
             as_mib(stats.total_bytes()),
             stats.total_runs(),
             as_mib(stats.data_bytes),
+            stats.data_runs,
             as_mib(stats.entry_directory_bytes),
+            stats.entry_directory_runs,
             as_mib(stats.index_bytes),
+            stats.index_runs,
             as_mib(stats.allocator_bytes),
+            stats.allocator_runs,
         );
     }
     if let Some(stats) = handle.io_scheduler_stats() {

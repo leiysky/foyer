@@ -72,12 +72,21 @@ mutation.
 
 After a single-Entry index lookup, `ExtentPool` validates the extent generation, reads the indexed
 byte range in runs bounded by `read_run_size`, validates the Stored Entry header and seeded 88-bit
-XXH3 value-content digest, compares the complete key, and rechecks the generation. Direct I/O
-expands the read to the covering 4 KiB frame span; buffered I/O reads only the logical bytes. This
-path does not read Entry-directory metadata, so a hot index lookup does not add a sidecar I/O.
+XXH3 value-content digest, compares the complete key, and rechecks the generation. The 2 MiB
+default keeps values through 1 MiB, including the Stored Entry metadata and alignment fragments, in
+one run. Direct I/O expands the read to the covering 4 KiB frame span; buffered I/O reads only the
+logical bytes. Frame counters describe pages covered, not separate I/O calls. This path does not
+read Entry-directory metadata, so a hot index lookup does not add a sidecar I/O.
 Directory records exist for reclaim and tail recovery, not foreground lookup. Any stale, torn, or
 mismatched location is a miss/error boundary, never an unverified hit. There is deliberately no
 second batch-read implementation beside Foyer's point-load interface.
+
+Run limits are runtime syscall-batching controls, not persistent-layout boundaries. A point read
+allocates only the covering range for that Entry, capped per syscall; setting a 2 MiB maximum does
+not make every read 2 MiB. The write path similarly coalesces adjacent allocations from one batch,
+but retains a 1 MiB default maximum so a large payload write does not monopolize the synchronous
+I/O scheduler. Both limits must be positive page multiples and can change across reopen without a
+format migration.
 
 ## I/O admission
 
@@ -221,6 +230,12 @@ accounting, and rejected index implementations are specified in
   checkpointing. Reclaim remains an ordered ExtentStore transition.
 - **A hard EntryIndex capacity limit** turns transient LSM amplification into a cache-health
   failure. The layout target is soft while usage remains exactly accounted.
+- **The former 64 KiB read-run maximum** came from the fixed-slot layout and split a common 64 KiB
+  value once its header, key, and direct-I/O alignment were included. A 2 MiB maximum makes the
+  bounded 1 MiB value workload one payload call per hit while preserving an explicit upper bound.
+- **Larger 4 MiB and 8 MiB write runs** reduce syscall count but did not materially improve
+  throughput in the bounded large-value validation and raised peak RSS. Writes remain capped at
+  1 MiB unless a production device demonstrates a different throughput/latency tradeoff.
 - **Synchronizing mutable payload files in the background checkpoint** lets the sync chase later
   writes. Each physical batch pays its bounded payload fence before immutable metadata capture.
 

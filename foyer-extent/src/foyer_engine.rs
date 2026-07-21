@@ -114,13 +114,13 @@ impl ExtentEngineConfig {
         self
     }
 
-    /// Bound one coalesced data read.
+    /// Bound one coalesced data read without changing the persistent layout.
     pub fn with_read_run_size(mut self, bytes: usize) -> Self {
         self.store.options.read_run_size = bytes;
         self
     }
 
-    /// Bound one coalesced data write.
+    /// Bound one coalesced data write without changing the persistent layout.
     pub fn with_write_run_size(mut self, bytes: usize) -> Self {
         self.store.options.write_run_size = bytes;
         self

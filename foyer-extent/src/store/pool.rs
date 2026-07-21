@@ -1473,6 +1473,53 @@ mod tests {
     }
 
     #[test]
+    fn default_read_run_coalesces_one_mib_value() {
+        let dir = tempdir().unwrap();
+        let extent_size = 2 * 1024 * 1024;
+        let options = ExtentStoreOptions::default().with_extent_size(extent_size);
+        let layout = StoreLayout::create(
+            ExtentStoreConfig::new(64 * 1024 * 1024)
+                .with_entry_charge(PAGE_SIZE)
+                .with_options(options),
+        )
+        .unwrap();
+        let mut pool = ExtentPool::create(
+            dir.path(),
+            layout,
+            false,
+            1,
+            Duration::ZERO,
+            options.read_run_size,
+            options.write_run_size,
+        )
+        .unwrap();
+        // Exercise the direct-I/O alignment branch without requiring O_DIRECT in the unit test.
+        pool.direct_io = true;
+
+        let key = key(1);
+        let value = vec![0x5a; 1024 * 1024];
+        let allocation = allocated(
+            pool.allocate(CachePriority::Normal, stored_entry_len(&key, &value).unwrap())
+                .unwrap(),
+        );
+        let location = pool
+            .write_batch(&[EntryWrite {
+                allocation,
+                key: &key,
+                key_digest: KeyDigest::for_key(&key),
+                value: &value,
+                content_digest: value_digest(&value),
+            }])
+            .unwrap()
+            .locations[0];
+
+        let loaded = pool.read_entry(&key, location).unwrap();
+        assert_eq!(loaded.value, Some(value));
+        assert_eq!(loaded.data_runs, 1);
+        assert!(loaded.data_frames > 1);
+    }
+
+    #[test]
     fn reopen_recovers_uncheckpointed_current_tail() {
         let dir = tempdir().unwrap();
         let pool = create_pool(dir.path());
