@@ -17,8 +17,9 @@ an acceptance result and retain every seed with its log. The default seed is fix
 reproducible without extra configuration.
 
 Every fresh image stores a scenario manifest next to the engine directory. Recover-only runs reject
-a missing or mismatched manifest, including a different seed, size list, priority workload, or
-scenario-generator version. Images created by an older benchmark must therefore be repopulated.
+a missing or mismatched manifest, including a different seed, size distribution, observed size
+quantiles, priority workload, or scenario-generator version. Images created by an older benchmark
+must therefore be repopulated.
 
 `EXTENT_BENCH_REWRITE_PASSES` adds measured same-value rewrite passes after the initial population.
 Each pass visits every existing key exactly once through an independent seeded random permutation,
@@ -53,13 +54,24 @@ for seed in 0x243f6a8885a308d3 0x13198a2e03707344 0xa4093822299f31d0; do
 done
 ```
 
-The default entry sizes are 4, 16, 64, 256, and 1024 KiB. Default key sizes are 32, 96, 256, and
-1024 bytes; custom key sizes must be at least eight bytes so the generated keys remain unique.
-Configured size choices are selected uniformly by independent seeded streams instead of cycling in
-a fixed order. Access concurrency defaults to twice the detected CPU core count and values below
-that are rejected. Put concurrency uses the same value by default; `EXTENT_BENCH_PUT_CONCURRENCY`
-can override it for an explicit write-side control run without weakening concurrent read
-validation.
+The default `uniform-list` entry distribution uses 4, 16, 64, 256, and 1024 KiB. Configured size
+choices are selected uniformly by independent seeded streams instead of cycling in a fixed order.
+Set `EXTENT_BENCH_ENTRY_DISTRIBUTION=log-normal` for a positive, skewed distribution. Its controls
+are `EXTENT_BENCH_ENTRY_MIN_KIB`, `EXTENT_BENCH_ENTRY_MEDIAN_KIB`, and
+`EXTENT_BENCH_ENTRY_MAX_KIB`. The maximum is both the unbounded distribution's p99.9 and a hard cap;
+this convention uniquely determines the distribution from a median and maximum without inventing
+a Gaussian standard deviation or generating negative sizes.
+
+Log-normal sizes are prepared as a fixed 65,536-bucket quantile table, rounded to KiB, then selected
+by an independent counter-based random stream. Floating-point distribution setup therefore remains
+outside measured engine work. The benchmark prints the configured distribution and its exact
+observed p50/p95/p99/p99.9/max for every seed.
+
+Default key sizes are 32, 96, 256, and 1024 bytes; custom key sizes must be at least eight bytes so
+the generated keys remain unique. Access concurrency defaults to twice the detected CPU core count
+and values below that are rejected. Put concurrency uses the same value by default;
+`EXTENT_BENCH_PUT_CONCURRENCY` can override it for an explicit write-side control run without
+weakening concurrent read validation.
 
 Storage-only reads default to one full hotset warmup. Warmup uses a randomized permutation without
 replacement, so every candidate is visited before measurement; `EXTENT_BENCH_READ_WARMUP` can
@@ -129,6 +141,33 @@ cargo bench -p foyer-extent --bench foyer_engine_compare
 Repeat with `EXTENT_BENCH_DIRECT=1` on Linux. Do not combine buffered and direct results in one
 comparison table.
 
+## 200 GiB bounded log-normal run
+
+This example interprets 1 MiB as both p99.9 and the hard size cap. It offers 200 GiB into a 128 GiB
+cache, exercising sustained reclaim without requiring a 200 GiB retained image. Run engines
+separately when the device cannot hold both images, but keep the same seed and configuration and
+drop the page cache before each run.
+
+```shell
+EXTENT_BENCH_PATH=/mnt/local-nvme/extent-200g-lognormal \
+EXTENT_BENCH_ENGINES=extent \
+EXTENT_BENCH_CAPACITY_MIB=131072 \
+EXTENT_BENCH_PAYLOAD_MIB=204800 \
+EXTENT_BENCH_MEMORY_MIB=256 \
+EXTENT_BENCH_QUEUE_MIB=512 \
+EXTENT_BENCH_WAVE_MIB=64 \
+EXTENT_BENCH_ENTRY_DISTRIBUTION=log-normal \
+EXTENT_BENCH_ENTRY_MIN_KIB=1 \
+EXTENT_BENCH_ENTRY_MEDIAN_KIB=64 \
+EXTENT_BENCH_ENTRY_MAX_KIB=1024 \
+EXTENT_BENCH_KEY_BYTES=8,32,96,256 \
+EXTENT_BENCH_DIRECT=1 \
+cargo bench -p foyer-extent --bench foyer_engine_compare
+```
+
+Repeat with at least three unrelated seeds and alternate Block/Extent order. Do not delete a
+populated image until its cold-recovery trials and raw-log copy have completed.
+
 ## 100-million-entry recovery run
 
 Populate once, then repeat recovery without rewriting the cache:
@@ -160,6 +199,8 @@ Important tuning variables remain explicit: `EXTENT_BENCH_SEED`, `EXTENT_BENCH_E
 `EXTENT_BENCH_CONCURRENCY`,
 `EXTENT_BENCH_PUT_CONCURRENCY`, `EXTENT_BENCH_SHARDS`, `EXTENT_BENCH_BLOCK_MIB`,
 `EXTENT_BENCH_BLOCK_BUFFER_MIB`,
+`EXTENT_BENCH_ENTRY_DISTRIBUTION`, `EXTENT_BENCH_ENTRY_KIB`, `EXTENT_BENCH_ENTRY_MIN_KIB`,
+`EXTENT_BENCH_ENTRY_MEDIAN_KIB`, `EXTENT_BENCH_ENTRY_MAX_KIB`,
 `EXTENT_BENCH_EXTENT_MIB`, `EXTENT_BENCH_ENTRY_CHARGE_KIB`, `EXTENT_BENCH_INDEX_CACHE_MIB`,
 `EXTENT_BENCH_INDEX_WRITE_BUFFER_MIB`, `EXTENT_BENCH_EXTENT_WRITE_CONCURRENCY`, and
 `EXTENT_BENCH_IO_READ_PRIORITY_US`. Priority-isolation experiments may also override

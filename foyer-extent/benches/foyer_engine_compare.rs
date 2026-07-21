@@ -21,15 +21,16 @@ use foyer_extent::{
 #[path = "support/scenario.rs"]
 mod scenario;
 
-use scenario::{Permutation, mix64, random_below, random_word, should_sample};
+use scenario::{Permutation, bounded_log_normal_table, mix64, random_below, random_word, should_sample};
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
 const LATENCY_SAMPLE_TARGET: u64 = 200_000;
 const ENTRY_OVERHEAD: usize = 64;
 const DEFAULT_SCENARIO_SEED: u64 = 0x6a09_e667_f3bc_c909;
-const SCENARIO_VERSION: u32 = 3;
-const SCENARIO_MANIFEST: &str = "foyer-engine-benchmark-scenario-v3.txt";
+const SCENARIO_VERSION: u32 = 4;
+const SCENARIO_MANIFEST: &str = "foyer-engine-benchmark-scenario-v4.txt";
+const ENTRY_SIZE_QUANTILE_BUCKETS: usize = 65_536;
 
 const STREAM_ENTRY_SIZE: u64 = 0x01;
 const STREAM_KEY_SIZE: u64 = 0x02;
@@ -256,11 +257,154 @@ enum WriteOrder {
 }
 
 #[derive(Debug)]
+enum EntrySizeDistribution {
+    UniformList(Vec<usize>),
+    BoundedLogNormal {
+        lookup: Vec<usize>,
+        minimum: usize,
+        median: usize,
+        p999_maximum: usize,
+    },
+}
+
+impl EntrySizeDistribution {
+    fn from_env() -> AnyResult<Self> {
+        let mode = env::var("EXTENT_BENCH_ENTRY_DISTRIBUTION").unwrap_or_else(|_| "uniform-list".to_string());
+        match mode.as_str() {
+            "uniform" | "uniform-list" | "list" => Ok(Self::UniformList(env_list_kib(
+                "EXTENT_BENCH_ENTRY_KIB",
+                &[4, 16, 64, 256, 1024],
+            )?)),
+            "log-normal" | "lognormal" => {
+                if env::var_os("EXTENT_BENCH_ENTRY_KIB").is_some() {
+                    return Err(invalid(
+                        "EXTENT_BENCH_ENTRY_KIB cannot be combined with a log-normal entry distribution",
+                    )
+                    .into());
+                }
+                let minimum = env_kib("EXTENT_BENCH_ENTRY_MIN_KIB", 1)?;
+                let median = env_kib("EXTENT_BENCH_ENTRY_MEDIAN_KIB", 64)?;
+                let p999_maximum = env_kib("EXTENT_BENCH_ENTRY_MAX_KIB", 1024)?;
+                if minimum > median {
+                    return Err(invalid("EXTENT_BENCH_ENTRY_MIN_KIB must not exceed the median").into());
+                }
+                if median >= p999_maximum {
+                    return Err(invalid("EXTENT_BENCH_ENTRY_MEDIAN_KIB must be below the maximum").into());
+                }
+                let lookup = bounded_log_normal_table(minimum, median, p999_maximum, KIB, ENTRY_SIZE_QUANTILE_BUCKETS);
+                Ok(Self::BoundedLogNormal {
+                    lookup,
+                    minimum,
+                    median,
+                    p999_maximum,
+                })
+            }
+            _ => Err(invalid("EXTENT_BENCH_ENTRY_DISTRIBUTION accepts uniform-list and log-normal").into()),
+        }
+    }
+
+    fn sample(&self, seed: u64, index: u64) -> usize {
+        let sizes = match self {
+            Self::UniformList(sizes) => sizes,
+            Self::BoundedLogNormal { lookup, .. } => lookup,
+        };
+        randomized_size(sizes, seed, STREAM_ENTRY_SIZE, index)
+    }
+
+    fn maximum(&self) -> usize {
+        match self {
+            Self::UniformList(sizes) => sizes.iter().copied().max().unwrap(),
+            Self::BoundedLogNormal { p999_maximum, .. } => *p999_maximum,
+        }
+    }
+
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::UniformList(_) => "uniform-list",
+            Self::BoundedLogNormal { .. } => "log-normal-p999-cap",
+        }
+    }
+
+    fn config(&self) -> String {
+        match self {
+            Self::UniformList(sizes) => format!("sizes_kib={}", join_sizes(sizes, KIB)),
+            Self::BoundedLogNormal {
+                minimum,
+                median,
+                p999_maximum,
+                ..
+            } => format!(
+                "minimum_kib={},median_kib={},p999_maximum_kib={},table_fingerprint={:016x}",
+                minimum / KIB,
+                median / KIB,
+                p999_maximum / KIB,
+                self.table_fingerprint(),
+            ),
+        }
+    }
+
+    fn table_fingerprint(&self) -> u64 {
+        let sizes = match self {
+            Self::UniformList(sizes) => sizes,
+            Self::BoundedLogNormal { lookup, .. } => lookup,
+        };
+        sizes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, size| {
+            (hash ^ *size as u64).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+}
+
+#[derive(Debug)]
+struct EntrySizeStats {
+    count: u64,
+    histogram: Vec<u64>,
+}
+
+impl EntrySizeStats {
+    fn new(maximum: usize) -> Self {
+        Self {
+            count: 0,
+            histogram: vec![0; maximum / KIB + 1],
+        }
+    }
+
+    fn record(&mut self, size: usize) {
+        debug_assert_eq!(size % KIB, 0);
+        self.histogram[size / KIB] += 1;
+        self.count += 1;
+    }
+
+    fn quantile(&self, numerator: u64, denominator: u64) -> usize {
+        let target = self.count.saturating_sub(1).saturating_mul(numerator) / denominator;
+        let mut seen = 0_u64;
+        for (kib, count) in self.histogram.iter().copied().enumerate() {
+            seen += count;
+            if seen > target {
+                return kib * KIB;
+            }
+        }
+        0
+    }
+
+    fn summary_kib(&self) -> String {
+        format!(
+            "p50:{},p95:{},p99:{},p999:{},max:{}",
+            self.quantile(500, 1_000) / KIB,
+            self.quantile(950, 1_000) / KIB,
+            self.quantile(990, 1_000) / KIB,
+            self.quantile(999, 1_000) / KIB,
+            self.quantile(1, 1) / KIB,
+        )
+    }
+}
+
+#[derive(Debug)]
 struct Workload {
     seed: u64,
     entries: u64,
     payload_bytes: u64,
-    entry_sizes: Vec<usize>,
+    entry_sizes: EntrySizeDistribution,
+    entry_size_stats: EntrySizeStats,
     key_sizes: Vec<usize>,
     priority: PriorityWorkload,
     write_order: WriteOrder,
@@ -269,7 +413,7 @@ struct Workload {
 impl Workload {
     fn from_env() -> AnyResult<Self> {
         let seed = env_seed("EXTENT_BENCH_SEED", DEFAULT_SCENARIO_SEED)?;
-        let entry_sizes = env_list_kib("EXTENT_BENCH_ENTRY_KIB", &[4, 16, 64, 256, 1024])?;
+        let entry_sizes = EntrySizeDistribution::from_env()?;
         let key_sizes = env_list_usize("EXTENT_BENCH_KEY_BYTES", &[32, 96, 256, 1024])?;
         if key_sizes
             .iter()
@@ -294,8 +438,8 @@ impl Workload {
         if target_payload == 0 {
             return Err(invalid("EXTENT_BENCH_PAYLOAD_MIB must be positive").into());
         }
-        let (entries, payload_bytes) = match requested_entries {
-            Some(entries) if entries > 0 => (entries, randomized_payload_bytes(entries, &entry_sizes, seed)?),
+        let (entries, payload_bytes, entry_size_stats) = match requested_entries {
+            Some(entries) if entries > 0 => randomized_payload_bytes(entries, &entry_sizes, seed)?,
             Some(_) => return Err(invalid("EXTENT_BENCH_ENTRIES must be positive").into()),
             None => entries_for_randomized_payload(target_payload, &entry_sizes, seed)?,
         };
@@ -316,6 +460,7 @@ impl Workload {
             entries,
             payload_bytes,
             entry_sizes,
+            entry_size_stats,
             key_sizes,
             priority,
             write_order,
@@ -323,7 +468,7 @@ impl Workload {
     }
 
     fn entry_size(&self, index: u64) -> usize {
-        randomized_size(&self.entry_sizes, self.seed, STREAM_ENTRY_SIZE, index)
+        self.entry_sizes.sample(self.seed, index)
     }
 
     fn key_size(&self, index: u64) -> usize {
@@ -331,7 +476,7 @@ impl Workload {
     }
 
     fn maximum_entry_size(&self) -> usize {
-        self.entry_sizes.iter().copied().max().unwrap()
+        self.entry_sizes.maximum()
     }
 
     fn write_index(&self, position: u64) -> u64 {
@@ -386,11 +531,13 @@ impl Workload {
 
     fn scenario_manifest(&self) -> String {
         format!(
-            "scenario_version={SCENARIO_VERSION}\nseed={}\nentries={}\npayload_bytes={}\nentry_bytes={}\nkey_bytes={}\npriority={}\nwrite_order={}\n",
+            "scenario_version={SCENARIO_VERSION}\nseed={}\nentries={}\npayload_bytes={}\nentry_distribution={}\nentry_distribution_config={}\nentry_observed_kib={}\nkey_bytes={}\npriority={}\nwrite_order={}\n",
             self.seed,
             self.entries,
             self.payload_bytes,
-            join_sizes(&self.entry_sizes, 1),
+            self.entry_sizes.label(),
+            self.entry_sizes.config(),
+            self.entry_size_stats.summary_kib(),
             join_sizes(&self.key_sizes, 1),
             self.priority.label(),
             self.write_order_label(),
@@ -501,7 +648,7 @@ async fn main() -> AnyResult<()> {
     fs::create_dir_all(&config.root)?;
 
     println!(
-        "foyer-engine benchmark: scenario_version={} seed={} seed_hex={:#018x} generator=counter-splitmix64-prp-v1 path={} engines={} entries={} payload_mib={:.1} capacity_mib={} memory_mib={} entry_kib={} key_bytes={} write_order={} priority_workload={} read_pattern={} read_hotset={} read_warmup={} warmup_order=random-permutation read_source={} concurrency={} (>=2x cores) put_concurrency={} io={} extent_read_priority_us={} extent_priority_floors={}/{} recover_only={} recover_write_wave={} populate_only={} rewrite_passes={}",
+        "foyer-engine benchmark: scenario_version={} seed={} seed_hex={:#018x} generator=counter-splitmix64-prp-v1 path={} engines={} entries={} payload_mib={:.1} capacity_mib={} memory_mib={} entry_distribution={} entry_size_config={} entry_size_observed_kib={} key_bytes={} write_order={} priority_workload={} read_pattern={} read_hotset={} read_warmup={} warmup_order=random-permutation read_source={} concurrency={} (>=2x cores) put_concurrency={} io={} extent_read_priority_us={} extent_priority_floors={}/{} recover_only={} recover_write_wave={} populate_only={} rewrite_passes={}",
         SCENARIO_VERSION,
         workload.seed,
         workload.seed,
@@ -516,7 +663,9 @@ async fn main() -> AnyResult<()> {
         as_mib(workload.payload_bytes),
         config.capacity_bytes / MIB,
         config.memory_bytes / MIB,
-        join_sizes(&workload.entry_sizes, KIB),
+        workload.entry_sizes.label(),
+        workload.entry_sizes.config(),
+        workload.entry_size_stats.summary_kib(),
         join_sizes(&workload.key_sizes, 1),
         workload.write_order_label(),
         workload.priority.label(),
@@ -1441,27 +1590,42 @@ fn io_measurements(cache: &BenchCache) -> IoMeasurements {
     }
 }
 
-fn entries_for_randomized_payload(target: u64, sizes: &[usize], seed: u64) -> AnyResult<(u64, u64)> {
+fn entries_for_randomized_payload(
+    target: u64,
+    distribution: &EntrySizeDistribution,
+    seed: u64,
+) -> AnyResult<(u64, u64, EntrySizeStats)> {
     let mut entries = 0_u64;
     let mut bytes = 0_u64;
+    let mut stats = EntrySizeStats::new(distribution.maximum());
     while bytes < target {
-        let size = randomized_size(sizes, seed, STREAM_ENTRY_SIZE, entries) as u64;
+        let size = distribution.sample(seed, entries);
         bytes = bytes
-            .checked_add(size)
+            .checked_add(size as u64)
             .ok_or_else(|| invalid("randomized payload size overflows u64"))?;
+        stats.record(size);
         entries = entries
             .checked_add(1)
             .ok_or_else(|| invalid("randomized payload entry count overflows u64"))?;
     }
-    Ok((entries.max(1), bytes))
+    Ok((entries.max(1), bytes, stats))
 }
 
-fn randomized_payload_bytes(entries: u64, sizes: &[usize], seed: u64) -> AnyResult<u64> {
-    Ok((0..entries).try_fold(0_u64, |bytes, index| {
-        bytes
-            .checked_add(randomized_size(sizes, seed, STREAM_ENTRY_SIZE, index) as u64)
-            .ok_or_else(|| invalid("randomized payload size overflows u64"))
-    })?)
+fn randomized_payload_bytes(
+    entries: u64,
+    distribution: &EntrySizeDistribution,
+    seed: u64,
+) -> AnyResult<(u64, u64, EntrySizeStats)> {
+    let mut bytes = 0_u64;
+    let mut stats = EntrySizeStats::new(distribution.maximum());
+    for index in 0..entries {
+        let size = distribution.sample(seed, index);
+        bytes = bytes
+            .checked_add(size as u64)
+            .ok_or_else(|| invalid("randomized payload size overflows u64"))?;
+        stats.record(size);
+    }
+    Ok((entries, bytes, stats))
 }
 
 fn randomized_size(sizes: &[usize], seed: u64, stream: u64, index: u64) -> usize {

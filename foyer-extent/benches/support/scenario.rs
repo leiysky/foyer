@@ -85,6 +85,90 @@ pub fn random_below(seed: u64, stream: u64, counter: u64, upper: u64) -> u64 {
     ((u128::from(random_word(seed, stream, counter)) * u128::from(upper)) >> 64) as u64
 }
 
+/// Build a fixed quantile table for a positive, bounded log-normal size distribution.
+///
+/// `median` is p50. `p999_maximum` is both the unbounded distribution's p99.9 and the hard cap.
+/// Values are rounded to `quantum`, which keeps the hot-path lookup deterministic and avoids
+/// architecture-specific floating-point work while the benchmark is running.
+pub fn bounded_log_normal_table(
+    minimum: usize,
+    median: usize,
+    p999_maximum: usize,
+    quantum: usize,
+    buckets: usize,
+) -> Vec<usize> {
+    assert!(minimum > 0, "minimum must be positive");
+    assert!(minimum <= median, "minimum must not exceed median");
+    assert!(median < p999_maximum, "median must be below p99.9 maximum");
+    assert!(quantum > 0, "quantum must be positive");
+    assert!(buckets > 0, "quantile table must not be empty");
+
+    let p999_z = inverse_standard_normal(0.999);
+    let sigma = ((p999_maximum as f64) / (median as f64)).ln() / p999_z;
+    (0..buckets)
+        .map(|bucket| {
+            let probability = (bucket as f64 + 0.5) / buckets as f64;
+            let value = median as f64 * (sigma * inverse_standard_normal(probability)).exp();
+            let rounded = ((value / quantum as f64).round() as usize).saturating_mul(quantum);
+            rounded.clamp(minimum, p999_maximum)
+        })
+        .collect()
+}
+
+// Peter J. Acklam's rational approximation. The benchmark quantizes its result before use, so the
+// approximation is only setup work and never appears in the measured storage hot path.
+fn inverse_standard_normal(probability: f64) -> f64 {
+    assert!((0.0..1.0).contains(&probability));
+
+    const A: [f64; 6] = [
+        -3.969_683_028_665_376e1,
+        2.209_460_984_245_205e2,
+        -2.759_285_104_469_687e2,
+        1.383_577_518_672_69e2,
+        -3.066_479_806_614_716e1,
+        2.506_628_277_459_239,
+    ];
+    const B: [f64; 5] = [
+        -5.447_609_879_822_406e1,
+        1.615_858_368_580_409e2,
+        -1.556_989_798_598_866e2,
+        6.680_131_188_771_972e1,
+        -1.328_068_155_288_572e1,
+    ];
+    const C: [f64; 6] = [
+        -7.784_894_002_430_293e-3,
+        -3.223_964_580_411_365e-1,
+        -2.400_758_277_161_838,
+        -2.549_732_539_343_734,
+        4.374_664_141_464_968,
+        2.938_163_982_698_783,
+    ];
+    const D: [f64; 4] = [
+        7.784_695_709_041_462e-3,
+        3.224_671_290_700_398e-1,
+        2.445_134_137_142_996,
+        3.754_408_661_907_416,
+    ];
+    const LOWER: f64 = 0.024_25;
+    const UPPER: f64 = 1.0 - LOWER;
+
+    if probability < LOWER {
+        let q = (-2.0 * probability.ln()).sqrt();
+        return (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0);
+    }
+    if probability > UPPER {
+        let q = (-2.0 * (1.0 - probability).ln()).sqrt();
+        return -(((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0);
+    }
+
+    let q = probability - 0.5;
+    let r = q * q;
+    (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5]) * q
+        / (((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0)
+}
+
 /// Select an unbiased-in-practice latency sample without coupling sampling to periodic key patterns.
 pub fn should_sample(operation: u64, operations: u64, target: u64, seed: u64, stream: u64) -> bool {
     operations <= target || random_below(seed, stream, operation, operations) < target

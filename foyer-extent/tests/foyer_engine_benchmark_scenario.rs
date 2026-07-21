@@ -1,7 +1,7 @@
 #[path = "../benches/support/scenario.rs"]
 mod scenario;
 
-use scenario::{Permutation, random_below, random_word, should_sample};
+use scenario::{Permutation, bounded_log_normal_table, random_below, random_word, should_sample};
 
 #[test]
 fn seeded_permutations_cover_every_position_once() {
@@ -77,4 +77,33 @@ fn latency_sampling_is_deterministic_and_near_its_target() {
         .collect::<Vec<_>>();
     assert_eq!(selected, replay);
     assert!((198_000..=202_000).contains(&selected.len()));
+}
+
+#[test]
+fn bounded_log_normal_table_has_requested_quantiles_and_cap() {
+    const KIB: usize = 1024;
+    let table = bounded_log_normal_table(KIB, 64 * KIB, 1024 * KIB, KIB, 65_536);
+
+    assert!(table.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert_eq!(table[table.len() / 2] / KIB, 64);
+    assert!((276..=284).contains(&(table[table.len() * 95 / 100] / KIB)));
+    assert!((505..=525).contains(&(table[table.len() * 99 / 100] / KIB)));
+    assert_eq!(table[table.len() * 999 / 1000] / KIB, 1024);
+    assert_eq!(table.last().copied(), Some(1024 * KIB));
+}
+
+#[test]
+fn bounded_log_normal_sampling_is_reproducible_and_seeded() {
+    const KIB: usize = 1024;
+    let table = bounded_log_normal_table(KIB, 64 * KIB, 1024 * KIB, KIB, 65_536);
+    let sample = |seed| {
+        (0..100_000)
+            .map(|index| table[random_below(seed, 37, index, table.len() as u64) as usize])
+            .collect::<Vec<_>>()
+    };
+
+    let first = sample(11);
+    assert_eq!(first, sample(11));
+    assert_ne!(first, sample(12));
+    assert!(first.iter().all(|size| (KIB..=1024 * KIB).contains(size)));
 }
