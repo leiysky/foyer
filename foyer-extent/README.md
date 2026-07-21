@@ -56,7 +56,7 @@ Each Stored Entry has one fixed directory record, and a cache extent is reused a
 Object ranges, application-specific key encoding, and remote-storage behavior belong outside the
 project.
 
-Capacity is the only production static input. The V6 format owns a 64 MiB cache extent, a 4 KiB I/O
+Capacity is the only production static input. Stable format 1 owns a 64 MiB cache extent, a 4 KiB I/O
 frame, and a 4 KiB Entry planning charge. The charge sizes planned directory and index targets; it
 neither rounds physical Entry allocations nor caps how many small Entries may be packed into an
 extent. The data file, planned directory budget, and allocator state fit the configured capacity.
@@ -87,8 +87,10 @@ discards the unstarted queue tail, and publishes one final durable checkpoint. T
 is explicitly counted. This bounds shutdown by one batch plus checkpoint work without exposing a
 partially published entry; cache writes remain best effort and the source remains authoritative.
 
-Compatibility CI reconstructs a frozen complete V3 store image and verifies that V6 rejects it and
-can recreate the expendable cache without leaving its legacy owner file behind. V6 round-trip,
+Compatibility CI reconstructs a frozen complete development-V3 store image and verifies that stable
+format 1 rejects it and can recreate the expendable cache without leaving its legacy owner file
+behind. The stable format uses a distinct family magic, so development formats V1-V6 cannot collide
+with its version numbering. Stable-format round-trip,
 tail-recovery, and process-crash tests cover the current directory, allocator, checkpoint, and
 reclaim publication paths.
 
@@ -100,7 +102,7 @@ Design documentation is organized by boundary:
   integrity;
 - [`docs/foyer-integration.md`](docs/foyer-integration.md) — Foyer engine adaptation, queues,
   lifecycle, and observability;
-- [`docs/extent-store.md`](docs/extent-store.md) — V6 physical layout, checkpoint, reclaim, and
+- [`docs/extent-store.md`](docs/extent-store.md) — stable format 1 physical layout, checkpoint, reclaim, and
   failure model; and
 - [`docs/entry-index.md`](docs/entry-index.md) — overlays, FixedRecordLSM, recovery, and index-space
   accounting.

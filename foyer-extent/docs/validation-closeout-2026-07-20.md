@@ -2,9 +2,14 @@
 
 Date: 2026-07-20; V5 upstream-port, large-value, and run-layout reruns: 2026-07-21
 
-> The original sections are the historical V3 baseline. The current implementation uses an
-> incompatible packed V5 layout. The 2026-07-21 section below repeats the random write-throughput,
-> capacity-retention, read-tail, and recovery gates after porting V5 onto upstream main. A fresh
+> Before the first stable release, the validated development-V6 layout was assigned stable format
+> 1 and a new format-family magic. The layout and I/O paths measured below did not change; the old
+> development formats remain intentionally incompatible.
+>
+> The original sections are the historical development-V3 baseline. The candidate validated below
+> used the incompatible packed development-V5 layout. The 2026-07-21 section repeats the random
+> write-throughput, capacity-retention, read-tail, and recovery gates after porting it onto upstream
+> main. A fresh
 > process-abort/power-loss campaign and long-running reclaim soak remain separate production gates.
 
 Current behavior is specified by the [architecture](architecture.md),

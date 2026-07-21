@@ -112,7 +112,9 @@ pass location, generation, value-content-digest, and complete-key checks.
 The disk format is versioned as one layout: payload representation, Entry directory, allocator
 state, and FixedRecordLSM compatibility move together. An incompatible change advances
 `EXTENT_FORMAT_VERSION`; Extent rejects the old cache and may recreate it because the authoritative
-copy remains outside the cache. There is no selectable legacy format or in-place migration path.
+copy remains outside the cache. Stable numbering starts at format 1. A distinct stable-family magic
+prevents a development format with the same numeric version from being accepted. There is no
+selectable legacy format or in-place migration path.
 
 The Foyer engine boundary is separately guarded by a compile-time API version assertion. Extent and
 the workspace-pinned Foyer fork are upgraded together.
@@ -123,7 +125,7 @@ the workspace-pinned Foyer fork are upgraded together.
   and integrity.
 - [Foyer integration](foyer-integration.md) — engine boundary, queues, read/write paths, lifecycle,
   and observability.
-- [ExtentStore design](extent-store.md) — V6 physical layout, checkpoint, reclaim, and failure
+- [ExtentStore design](extent-store.md) — stable format 1 physical layout, checkpoint, reclaim, and failure
   model.
 - [EntryIndex design](entry-index.md) — overlays, FixedRecordLSM, recovery, accounting, and rejected
   index shapes.

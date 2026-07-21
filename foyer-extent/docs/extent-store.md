@@ -133,10 +133,10 @@ under the mutation lock and releases it.
 
 The value-content digest is computed once on submission and stored in both the directory record and
 index location. A repeated key, encoded length, digest, and priority is idempotent without reading
-the old payload. The previous V4 CRC32 shortcut could suppress an update for an easily constructed
-collision; V5 introduced an 88-bit seeded XXH3 identity, retained by V6, while keeping the same
-32-byte location and 64-byte directory record sizes. The complete key is still compared on every
-returned hit.
+the old payload. The development-V4 CRC32 shortcut could suppress an update for an easily
+constructed collision; development V5 introduced an 88-bit seeded XXH3 identity, retained by
+stable format 1, while keeping the same 32-byte location and 64-byte directory record sizes. The
+complete key is still compared on every returned hit.
 
 Durable checkpoint order is:
 
@@ -213,10 +213,11 @@ accounting, and rejected index implementations are specified in
 
 ## Failure model
 
-- A frozen V3 fixture covers the former payload, owner, allocator, manifest, and WAL layout. V6 must
-  reject it and the explicit recreate path must remove legacy owned files before creating the new
-  directory layout. Current-format tests separately cover append, reopen, active-tail recovery,
-  reclaim, and process abort.
+- A frozen development-V3 fixture covers the former payload, owner, allocator, manifest, and WAL
+  layout. Stable format 1 must reject it and the explicit recreate path must remove legacy owned
+  files before creating the new directory layout. The stable family magic also rejects development
+  formats that used the same numeric version. Current-format tests separately cover append, reopen,
+  active-tail recovery, reclaim, and process abort.
 - Incomplete final WAL frames are ignored; corruption inside the durable prefix is an error.
 - The newest invalid allocator or manifest copy falls back to the older valid copy.
 - New SSTs are synced before a manifest can reference them.
@@ -229,8 +230,8 @@ accounting, and rejected index implementations are specified in
 ## Design rationale and rejected alternatives
 
 - **Fixed allocation slots** simplified alignment but imposed severe tail padding on small Entries.
-  The packed layout introduced in V5 and retained by V6 uses page alignment only for physical I/O
-  frames.
+  The packed layout prototyped in development V5 and retained by stable format 1 uses page alignment
+  only for physical I/O frames.
 - **Cross-extent Entry descriptors** would reduce boundary waste but make reads, reclaim, and crash
   recovery span multiple generations. Extent seals the current cache extent instead.
 - **Payload scanning during reclaim or recovery** would remove the Entry directory at the cost of a

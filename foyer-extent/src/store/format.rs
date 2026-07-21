@@ -12,12 +12,14 @@ pub const LOCATION_RECORD_SIZE: usize = 32;
 const STATE_ENTRY_SIZE: usize = 24;
 const STATE_HEADER_SIZE: usize = 64;
 const STATE_CHECKSUM_SIZE: usize = size_of::<u32>();
-const STATE_MAGIC: [u8; 8] = *b"SCSEGST1";
+// Stable Extent formats use their own family magic so the first stable format can start at 1
+// without colliding with any development layout that used the former SCSEGST1 magic.
+const STATE_MAGIC: [u8; 8] = *b"FOYEXT01";
 /// Compatibility identity for every persisted Extent layout and encoding choice.
 ///
 /// Bump this when changing the balanced entry charge or extent size, layout derivation, record encoding,
 /// or an incompatible format in the embedded fixed-record index.
-pub const EXTENT_FORMAT_VERSION: u32 = 6;
+pub const EXTENT_FORMAT_VERSION: u32 = 1;
 const NO_EXTENT: u32 = u32::MAX;
 const FIXED_LSM_INDEX_BYTES_PER_ENTRY: u64 = 76;
 // One steady-state copy, one atomic compaction output, and one bounded WAL/L0 write tail.
@@ -622,6 +624,17 @@ mod tests {
                 (layout.state_copy_size * 2) as u64,
             ),
             Some(layout)
+        );
+        let mut development_family = encoded.clone();
+        development_family[..8].copy_from_slice(b"SCSEGST1");
+        assert_eq!(
+            StoreLayout::discover(
+                &development_family,
+                layout.data_file_size,
+                layout.entry_directory_file_size,
+                (layout.state_copy_size * 2) as u64,
+            ),
+            None
         );
         let mut previous_version = encoded.clone();
         put_u32(&mut previous_version, 8, EXTENT_FORMAT_VERSION - 1);
