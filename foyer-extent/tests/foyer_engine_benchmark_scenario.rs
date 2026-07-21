@@ -1,7 +1,11 @@
 #[path = "../benches/support/scenario.rs"]
 mod scenario;
 
-use scenario::{Permutation, bounded_log_normal_table, random_below, random_word, should_sample};
+use std::time::Duration;
+
+use scenario::{
+    Permutation, bounded_log_normal_table, random_below, random_word, randomized_put_interval, should_sample,
+};
 
 #[test]
 fn seeded_permutations_cover_every_position_once() {
@@ -51,6 +55,24 @@ fn counter_streams_are_reproducible_and_independent() {
         .collect::<Vec<_>>();
     assert_eq!(first, replay);
     assert_ne!(first, other);
+}
+
+#[test]
+fn seeded_poisson_arrivals_are_reproducible_bounded_and_centered() {
+    let mean = Duration::from_micros(1_000);
+    let samples = (0..100_000)
+        .map(|operation| randomized_put_interval(mean, 42, 19, operation))
+        .collect::<Vec<_>>();
+    let replay = (0..100_000)
+        .map(|operation| randomized_put_interval(mean, 42, 19, operation))
+        .collect::<Vec<_>>();
+
+    assert_eq!(samples, replay);
+    assert_ne!(samples[0], randomized_put_interval(mean, 43, 19, 0));
+    assert!(samples.iter().all(|sample| *sample <= mean * 8));
+    let observed = samples.iter().map(Duration::as_nanos).sum::<u128>() as f64 / samples.len() as f64;
+    let ratio = observed / mean.as_nanos() as f64;
+    assert!((0.99..=1.01).contains(&ratio), "observed mean ratio {ratio}");
 }
 
 #[test]

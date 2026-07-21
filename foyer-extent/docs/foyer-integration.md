@@ -40,7 +40,12 @@ pending entry/byte gauges rise above their capacity gauges while this control de
 
 One worker owns write order and groups commands into physical store batches. It uses a larger idle
 batch and a smaller read-busy batch so already admitted writes make progress without monopolizing
-the device. Completion is reported to Foyer's pending-write keeper with the command generation;
+the device. Immediate draining is the default. An optional microbatch window can wait for sparse
+arrivals to join the same batch; the deadline is measured from the first command's enqueue time, so
+an already-backlogged command receives no extra delay. This can amortize data and directory
+durability fences without changing their order or delaying a batch that has already reached its
+byte/entry target. Completion is reported to
+Foyer's pending-write keeper with the command generation;
 completion of an older same-key write cannot erase a newer pending value.
 
 The first write-worker or checkpoint failure is sticky. Later submissions are shed, existing reads
@@ -119,8 +124,9 @@ reference engines and environment parsing remain outside production modules.
 
 `ExtentEngineHandle` is a read-only view over the same state used by the engine. It exposes queue
 ownership, asynchronous outcomes, publication and durable frontiers, live Entry count, physical
-I/O, reclaim activity, scheduler waits, and the first background failure. It is not a second
-control plane or a write receipt.
+I/O, per-file sync counts, immutable layout planning, sparse-directory reads, reclaim substage
+timing, frequency-sketch size, scheduler waits, and the first background failure. It is not a
+second control plane or a write receipt.
 
 The shared Foyer registry exports the corresponding counters, gauges, and latency histograms.
 Queue gauges change at reservation ownership boundaries, checkpoint gauges are refreshed after

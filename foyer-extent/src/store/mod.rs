@@ -21,7 +21,7 @@ pub use self::{
     format::EXTENT_FORMAT_VERSION,
     index::{EntryIndexReadStats, EntryIndexStats},
     io::IoSchedulerStats,
-    stats::{ExtentOccupancy, PhysicalWriteStats, ReclaimStats},
+    stats::{DirectoryReadStats, ExtentLayoutStats, ExtentOccupancy, PhysicalWriteStats, ReclaimStats},
 };
 #[cfg(test)]
 pub(crate) use self::{config::ExtentStoreOptions, core::InjectedFault};

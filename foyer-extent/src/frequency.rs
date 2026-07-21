@@ -45,6 +45,14 @@ impl FrequencySketch {
             .min()
             .unwrap_or(0)
     }
+
+    pub fn counters(&self) -> usize {
+        self.counters.len()
+    }
+
+    pub const fn sample_window(&self) -> u64 {
+        self.sample_window
+    }
 }
 
 fn indexes(hash: u64, counters: usize) -> [usize; COUNTERS_PER_ENTRY as usize] {

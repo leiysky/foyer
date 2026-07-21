@@ -100,6 +100,12 @@ observation cost and directory size cannot grow per reopen.
 
 The live-entry count is recovered from application state rather than an all-key scan.
 
+The volatile frequency sketch is sized from that recovered live count rather than the theoretical
+layout maximum. It grows at power-of-two cardinality boundaries and shrinks only after a fourfold
+drop, keeping both memory and the aging window proportional to the active set without resize
+churn. Resizing may discard temperature history; temperature is a best-effort reclaim heuristic,
+not durable state. Explicit stats report counter count, bytes, and sample window.
+
 ## Read cache and accounting
 
 The runtime index-cache limit defaults to 1 GiB and is lazy rather than eagerly allocated. One
@@ -118,7 +124,8 @@ collection.
 
 ## Capacity target
 
-The cache layout derives an EntryIndex capacity target from the maximum Entry count. The target
+The cache layout derives an EntryIndex capacity target from the planned Entry count implied by the
+4 KiB planning charge. The absolute cardinality bound remains the packed payload format. The target
 plans space for a steady-state index, atomic compaction output, and a bounded WAL/L0 tail. WAL,
 manifest, flush, and compaction reservations are all accounted against the same cumulative usage.
 

@@ -123,7 +123,7 @@ the workspace-pinned Foyer fork are upgraded together.
   and integrity.
 - [Foyer integration](foyer-integration.md) — engine boundary, queues, read/write paths, lifecycle,
   and observability.
-- [ExtentStore design](extent-store.md) — V5 physical layout, checkpoint, reclaim, and failure
+- [ExtentStore design](extent-store.md) — V6 physical layout, checkpoint, reclaim, and failure
   model.
 - [EntryIndex design](entry-index.md) — overlays, FixedRecordLSM, recovery, accounting, and rejected
   index shapes.

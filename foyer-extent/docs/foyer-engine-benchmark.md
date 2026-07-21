@@ -73,6 +73,13 @@ and values below that are rejected. Put concurrency uses the same value by defau
 `EXTENT_BENCH_PUT_CONCURRENCY` can override it for an explicit write-side control run without
 weakening concurrent read validation.
 
+`EXTENT_BENCH_PUT_MEAN_INTERVAL_US` enables a seeded Poisson arrival schedule for low-rate write
+controls. Its exponential inter-arrival samples use an independent counter stream and are truncated
+at eight times the mean, retaining more than 99.9% of the distribution while bounding one test
+pause. This mode requires `EXTENT_BENCH_PUT_CONCURRENCY=1`; keep the tested payload within one wave
+when measuring batching so an intentional wave drain does not split the arrival process. The
+default is zero (`immediate`) and adds no sleeps to throughput or large-data runs.
+
 Storage-only reads default to one full hotset warmup. Warmup uses a randomized permutation without
 replacement, so every candidate is visited before measurement; `EXTENT_BENCH_READ_WARMUP` can
 override the operation count, including zero for an explicitly cold control. The primary measured
@@ -124,8 +131,14 @@ workload and cannot establish scheduler latency benefit.
 `EXTENT_BENCH_READ_RUN_KIB` and `EXTENT_BENCH_WRITE_RUN_KIB` override Extent's runtime-only maximum
 payload I/O request sizes. They do not alter the persistent layout, so recover-only runs can compare
 multiple read-run sizes against the same image. Keep values page-aligned. The Extent write record
-reports payload, directory, index, and allocator run counts separately so a write-run experiment
-does not attribute metadata calls to payload splitting.
+reports payload, directory, index, and allocator run and sync counts separately so a write-run
+experiment does not attribute metadata calls to payload splitting. `EXTENT_BENCH_WRITE_BATCH_DELAY_US`
+controls the optional sparse-arrival microbatch window and defaults to zero; compare a nonzero
+candidate with zero under the same seeds and alternating run order before enabling it. The
+`extent_layout` record separates usable payload from planned
+directory bytes, sparse logical directory size, and the soft Index target. `extent_reclaim` reports
+directory runs/bytes and directory-versus-index lookup time, while `extent_index` reports frequency
+memory and its aging window.
 
 ## 300 GiB buffered-I/O run
 

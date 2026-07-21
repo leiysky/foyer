@@ -12,15 +12,17 @@ pub const PAGE_SIZE: usize = 4 * 1024;
 pub(crate) const CONTENT_DIGEST_SIZE: usize = 11;
 pub(crate) type ContentDigest = [u8; CONTENT_DIGEST_SIZE];
 const CONTENT_DIGEST_SEED: u64 = 0x4f1b_bcdd_94d0_49bb;
-/// The minimum capacity charge used to bound entry-directory and index cardinality.
+/// The planning charge used to size Entry-directory and index targets.
 ///
-/// Stored Entries are packed by byte inside an extent. This charge is an accounting bound, not a
-/// physical allocation unit.
+/// Stored Entries are packed by byte inside an extent. This charge is neither a physical
+/// allocation unit nor an Entry-count limit.
 pub const DEFAULT_ENTRY_CHARGE: usize = PAGE_SIZE;
 
 const STORED_ENTRY_MAGIC: [u8; 4] = *b"SCBL";
 const STORED_ENTRY_VERSION: u8 = 1;
 pub(crate) const STORED_ENTRY_HEADER_SIZE: usize = 16;
+/// Smallest valid Stored Entry: header, one-byte key, and one-byte value.
+pub(crate) const MIN_STORED_ENTRY_SIZE: usize = STORED_ENTRY_HEADER_SIZE + 2;
 
 pub(crate) fn stored_entry_len(key: &EntryKey, value: &[u8]) -> Option<usize> {
     u16::try_from(key.len()).ok()?;

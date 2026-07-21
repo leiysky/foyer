@@ -21,15 +21,17 @@ use foyer_extent::{
 #[path = "support/scenario.rs"]
 mod scenario;
 
-use scenario::{Permutation, bounded_log_normal_table, mix64, random_below, random_word, should_sample};
+use scenario::{
+    Permutation, bounded_log_normal_table, mix64, random_below, random_word, randomized_put_interval, should_sample,
+};
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
 const LATENCY_SAMPLE_TARGET: u64 = 200_000;
 const ENTRY_OVERHEAD: usize = 64;
 const DEFAULT_SCENARIO_SEED: u64 = 0x6a09_e667_f3bc_c909;
-const SCENARIO_VERSION: u32 = 4;
-const SCENARIO_MANIFEST: &str = "foyer-engine-benchmark-scenario-v4.txt";
+const SCENARIO_VERSION: u32 = 5;
+const SCENARIO_MANIFEST: &str = "foyer-engine-benchmark-scenario-v5.txt";
 const ENTRY_SIZE_QUANTILE_BUCKETS: usize = 65_536;
 
 const STREAM_ENTRY_SIZE: u64 = 0x01;
@@ -44,6 +46,7 @@ const STREAM_REWRITE_ORDER: u64 = 0x09;
 const STREAM_READ_WARMUP: u64 = 0x10;
 const STREAM_READ_PRIMARY: u64 = 0x11;
 const STREAM_READ_PAIRED: u64 = 0x12;
+const STREAM_PUT_ARRIVAL: u64 = 0x13;
 const STREAM_BURST_ORDER: u64 = 0x20;
 const STREAM_LATENCY_SAMPLE: u64 = 0x30;
 
@@ -118,10 +121,12 @@ struct Config {
     extent_io_read_priority: Duration,
     extent_read_run_bytes: usize,
     extent_write_run_bytes: usize,
+    extent_write_batch_delay: Duration,
     extent_high_capacity_percent: u8,
     extent_normal_capacity_percent: u8,
     concurrency: usize,
     put_concurrency: usize,
+    put_mean_interval: Duration,
     shards: usize,
     write_concurrency: usize,
     reads: u64,
@@ -198,6 +203,16 @@ impl Config {
         if put_concurrency == 0 {
             return Err(invalid("EXTENT_BENCH_PUT_CONCURRENCY must be positive").into());
         }
+        let put_mean_interval_us = env_optional_u64("EXTENT_BENCH_PUT_MEAN_INTERVAL_US")?.unwrap_or(0);
+        if put_mean_interval_us > 10_000_000 {
+            return Err(invalid("EXTENT_BENCH_PUT_MEAN_INTERVAL_US must be at most 10000000").into());
+        }
+        if put_mean_interval_us > 0 && put_concurrency != 1 {
+            return Err(invalid(
+                "EXTENT_BENCH_PUT_CONCURRENCY must be 1 when a randomized put arrival interval is configured",
+            )
+            .into());
+        }
 
         let reads = env_u64("EXTENT_BENCH_READS", workload.entries.saturating_mul(2))?;
         let read_hotset = env_u64("EXTENT_BENCH_READ_HOTSET", workload.entries)?;
@@ -229,10 +244,14 @@ impl Config {
             ),
             extent_read_run_bytes: env_kib("EXTENT_BENCH_READ_RUN_KIB", 2 * MIB / KIB)?,
             extent_write_run_bytes: env_kib("EXTENT_BENCH_WRITE_RUN_KIB", MIB / KIB)?,
+            extent_write_batch_delay: Duration::from_micros(
+                env_optional_u64("EXTENT_BENCH_WRITE_BATCH_DELAY_US")?.unwrap_or(0),
+            ),
             extent_high_capacity_percent,
             extent_normal_capacity_percent,
             concurrency,
             put_concurrency,
+            put_mean_interval: Duration::from_micros(put_mean_interval_us),
             shards: env_usize("EXTENT_BENCH_SHARDS", cores.next_power_of_two())?,
             write_concurrency: env_usize("EXTENT_BENCH_EXTENT_WRITE_CONCURRENCY", (cores / 2).clamp(1, 8))?,
             reads,
@@ -652,7 +671,7 @@ async fn main() -> AnyResult<()> {
     fs::create_dir_all(&config.root)?;
 
     println!(
-        "foyer-engine benchmark: scenario_version={} seed={} seed_hex={:#018x} generator=counter-splitmix64-prp-v1 path={} engines={} entries={} payload_mib={:.1} capacity_mib={} memory_mib={} entry_distribution={} entry_size_config={} entry_size_observed_kib={} key_bytes={} write_order={} priority_workload={} read_pattern={} read_hotset={} read_warmup={} warmup_order=random-permutation read_source={} concurrency={} (>=2x cores) put_concurrency={} io={} extent_read_priority_us={} extent_read_run_kib={} extent_write_run_kib={} extent_priority_floors={}/{} recover_only={} recover_write_wave={} populate_only={} rewrite_passes={}",
+        "foyer-engine benchmark: scenario_version={} seed={} seed_hex={:#018x} generator=counter-splitmix64-prp-v1 path={} engines={} entries={} payload_mib={:.1} capacity_mib={} memory_mib={} entry_distribution={} entry_size_config={} entry_size_observed_kib={} key_bytes={} write_order={} priority_workload={} read_pattern={} read_hotset={} read_warmup={} warmup_order=random-permutation read_source={} concurrency={} (>=2x cores) put_concurrency={} put_arrival={} io={} extent_read_priority_us={} extent_read_run_kib={} extent_write_run_kib={} extent_write_batch_delay_us={} extent_priority_floors={}/{} recover_only={} recover_write_wave={} populate_only={} rewrite_passes={}",
         SCENARIO_VERSION,
         workload.seed,
         workload.seed,
@@ -679,10 +698,12 @@ async fn main() -> AnyResult<()> {
         if config.storage_reads { "storage" } else { "hybrid" },
         config.concurrency,
         config.put_concurrency,
+        put_arrival_label(config.put_mean_interval),
         if config.direct_io { "direct" } else { "buffered" },
         config.extent_io_read_priority.as_micros(),
         config.extent_read_run_bytes / KIB,
         config.extent_write_run_bytes / KIB,
+        config.extent_write_batch_delay.as_micros(),
         config.extent_high_capacity_percent,
         config.extent_normal_capacity_percent,
         config.recover_only,
@@ -990,7 +1011,8 @@ async fn build_cache(
                 .with_queue_capacity_bytes(config.queue_bytes)
                 .with_queue_capacity_entries(queue_entries)
                 .with_write_batch_bytes((128 * MIB).min(config.queue_bytes))
-                .with_write_batch_entries(4_096.min(queue_entries));
+                .with_write_batch_entries(4_096.min(queue_entries))
+                .with_write_batch_delay(config.extent_write_batch_delay);
             let handle = extent.handle();
             (Box::new(extent), Some(handle))
         }
@@ -1047,10 +1069,25 @@ async fn run_write_pass(
         for worker in 0..worker_count {
             let cache = cache.clone();
             let workload = workload.clone();
+            let put_mean_interval = config.put_mean_interval;
             workers.push(tokio::task::spawn_blocking(move || {
                 let mut result = WriteMeasurements::default();
                 let mut position = start + worker as u64;
+                let arrivals_started = Instant::now();
+                let mut scheduled = Duration::ZERO;
                 while position < end {
+                    if position > start && !put_mean_interval.is_zero() {
+                        scheduled = scheduled.saturating_add(randomized_put_interval(
+                            put_mean_interval,
+                            workload.seed,
+                            STREAM_PUT_ARRIVAL ^ pass.latency_stream(),
+                            position,
+                        ));
+                        let remaining = scheduled.saturating_sub(arrivals_started.elapsed());
+                        if !remaining.is_zero() {
+                            std::thread::sleep(remaining);
+                        }
+                    }
                     let index = pass.index(&workload, position);
                     let key = make_key(index, workload.key_size(index), workload.seed);
                     let value = make_value(index, workload.entry_size(index), workload.seed);
@@ -1418,20 +1455,71 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
     let Some(handle) = handle else {
         return Ok(());
     };
+    if let Some(layout) = handle.layout_stats() {
+        let allocated = handle.allocated_size().unwrap_or_default();
+        println!(
+            "engine={} phase=extent_layout configured_mib={:.1} allocated_mib={:.1} planned_file_mib={:.1} data_file_mib={:.1} usable_payload_mib={:.1} index_soft_mib={:.1} directory_planned_mib={:.1} directory_address_space_mib={:.1} physical_extents={} usable_extents={} extent_mib={:.1} entry_charge_kib={:.1} planned_entries={} maximum_entries={}",
+            engine.label(),
+            as_mib(layout.configured_capacity_bytes),
+            as_mib(allocated),
+            as_mib(layout.planned_file_bytes),
+            as_mib(layout.data_file_bytes),
+            as_mib(layout.usable_payload_bytes),
+            as_mib(layout.index_soft_capacity_bytes),
+            as_mib(layout.directory_planned_bytes),
+            as_mib(layout.directory_logical_bytes),
+            layout.physical_extents,
+            layout.usable_extents,
+            as_mib(layout.extent_size_bytes),
+            layout.entry_charge_bytes as f64 / KIB as f64,
+            layout.planned_live_entries,
+            layout.maximum_live_entries,
+        );
+    }
     if let Some(stats) = handle.physical_write_stats() {
         println!(
-            "engine={} phase=extent_write physical_mib={:.1} physical_runs={} data_mib={:.1} data_runs={} directory_mib={:.1} directory_runs={} index_mib={:.1} index_runs={} allocator_mib={:.1} allocator_runs={}",
+            "engine={} phase=extent_write physical_mib={:.1} physical_runs={} data_mib={:.1} data_runs={} data_syncs={} directory_mib={:.1} directory_runs={} directory_syncs={} index_mib={:.1} index_runs={} index_syncs={} allocator_mib={:.1} allocator_runs={} allocator_syncs={}",
             engine.label(),
             as_mib(stats.total_bytes()),
             stats.total_runs(),
             as_mib(stats.data_bytes),
             stats.data_runs,
+            stats.data_syncs,
             as_mib(stats.entry_directory_bytes),
             stats.entry_directory_runs,
+            stats.entry_directory_syncs,
             as_mib(stats.index_bytes),
             stats.index_runs,
+            stats.index_syncs,
             as_mib(stats.allocator_bytes),
             stats.allocator_runs,
+            stats.allocator_syncs,
+        );
+    }
+    if let Some(stats) = handle.directory_read_stats() {
+        println!(
+            "engine={} phase=extent_directory_read read_mib={:.1} read_runs={}",
+            engine.label(),
+            as_mib(stats.bytes),
+            stats.runs,
+        );
+    }
+    if let Some(stats) = handle.reclaim_stats() {
+        println!(
+            "engine={} phase=extent_reclaim extents={} scanned_entries={} directory_mib={:.1} directory_runs={} index_lookups={} preparation_ms={:.3} directory_ms={:.3} index_ms={:.3} transaction_ms={:.3} promotion_ms={:.3} publication_ms={:.3} total_ms={:.3}",
+            engine.label(),
+            stats.total_reclaimed_extents(),
+            stats.scanned_entries(),
+            as_mib(stats.directory_read_bytes()),
+            stats.directory_read_runs(),
+            stats.index_lookups(),
+            stats.preparation_nanos() as f64 / 1_000_000.0,
+            stats.directory_scan_nanos() as f64 / 1_000_000.0,
+            stats.index_lookup_nanos() as f64 / 1_000_000.0,
+            stats.transaction_nanos() as f64 / 1_000_000.0,
+            stats.promotion_nanos() as f64 / 1_000_000.0,
+            stats.publication_nanos() as f64 / 1_000_000.0,
+            stats.total_nanos() as f64 / 1_000_000.0,
         );
     }
     if let Some(stats) = handle.io_scheduler_stats() {
@@ -1452,13 +1540,16 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
     }
     if let Some(index) = handle.entry_index_stats() {
         println!(
-            "engine={} phase=extent_index live_entries={} wal_mib={:.1} sst_files={} sst_mib={:.1} cache_resident_mib={:.1}",
+            "engine={} phase=extent_index live_entries={} wal_mib={:.1} sst_files={} sst_mib={:.1} cache_resident_mib={:.1} frequency_mib={:.1} frequency_counters={} frequency_sample_window={}",
             engine.label(),
             index.live_entries,
             as_mib(index.wal_bytes),
             index.sst_files,
             as_mib(index.sst_bytes),
             as_mib(index.cache_resident_bytes),
+            as_mib(index.frequency_bytes),
+            index.frequency_counters,
+            index.frequency_sample_window,
         );
     }
     if let Some(occupancy) = handle.extent_occupancy() {
@@ -1642,6 +1733,14 @@ fn randomized_payload_bytes(
 
 fn randomized_size(sizes: &[usize], seed: u64, stream: u64, index: u64) -> usize {
     sizes[random_below(seed, stream, index, sizes.len() as u64) as usize]
+}
+
+fn put_arrival_label(mean: Duration) -> String {
+    if mean.is_zero() {
+        "immediate".to_string()
+    } else {
+        format!("seeded-poisson-truncated(mean_us={},cap=8x)", mean.as_micros())
+    }
 }
 
 fn validate_scenario_manifest(path: &Path, workload: &Workload) -> AnyResult<()> {

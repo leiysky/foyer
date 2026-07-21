@@ -29,7 +29,7 @@ use crate::{
             STATE_FILE,
         },
         reclaim::{AllocationDecision, ReclaimResult, Reclaimer},
-        stats::{ExtentOccupancy, PhysicalWriteStats},
+        stats::{DirectoryReadStats, ExtentLayoutStats, ExtentOccupancy, PhysicalWriteStats},
     },
 };
 
@@ -69,7 +69,7 @@ impl ExtentStore {
         fs::create_dir_all(root).map_err(|error| Error::io("create extent store directory", error))?;
         let index = EntryIndex::create(
             root,
-            layout.max_entries,
+            layout.maximum_entries,
             layout.index_capacity_bytes,
             config.options.index_write_buffer_size,
             config.options.index_cache_size,
@@ -110,7 +110,7 @@ impl ExtentStore {
         validate_layout_options(pool.layout(), options)?;
         let index = EntryIndex::open(
             root,
-            pool.layout().max_entries,
+            pool.layout().maximum_entries,
             pool.layout().index_capacity_bytes,
             options.index_write_buffer_size,
             options.index_cache_size,
@@ -144,8 +144,8 @@ impl ExtentStore {
         })
     }
 
-    pub const fn entry_charge(&self) -> usize {
-        self.layout.entry_charge
+    pub(crate) const fn layout(&self) -> StoreLayout {
+        self.layout
     }
 
     pub const fn file_size(&self) -> u64 {
@@ -163,6 +163,28 @@ impl ExtentStore {
         let mut stats = self.pool.physical_write_stats();
         stats.merge(self.index.physical_write_stats());
         stats
+    }
+
+    pub fn directory_read_stats(&self) -> DirectoryReadStats {
+        self.pool.directory_read_stats()
+    }
+
+    pub fn layout_stats(&self, configured_capacity_bytes: u64) -> ExtentLayoutStats {
+        ExtentLayoutStats {
+            configured_capacity_bytes,
+            planned_file_bytes: self.layout.total_file_size,
+            data_file_bytes: self.layout.data_file_size,
+            usable_payload_bytes: u64::from(self.layout.extent_count - 1) * self.layout.extent_size as u64,
+            index_soft_capacity_bytes: self.layout.index_capacity_bytes,
+            directory_planned_bytes: self.layout.entry_directory_capacity_bytes,
+            directory_logical_bytes: self.layout.entry_directory_file_size,
+            extent_size_bytes: self.layout.extent_size as u64,
+            physical_extents: u64::from(self.layout.extent_count),
+            usable_extents: u64::from(self.layout.extent_count - 1),
+            entry_charge_bytes: self.layout.entry_charge as u64,
+            planned_live_entries: self.layout.planned_max_entries,
+            maximum_live_entries: self.layout.maximum_entries,
+        }
     }
 
     pub fn io_scheduler_stats(&self) -> IoSchedulerStats {
@@ -273,6 +295,7 @@ impl ExtentStore {
             let mut known: HashMap<KeyDigest, KnownInsert<'_>> = HashMap::new();
             let mut pending = Vec::new();
             let mut protected_extents = HashSet::new();
+            let mut fence_before_reclaim = false;
 
             while input_index < inserts.len() {
                 let insert = inserts[input_index];
@@ -318,6 +341,7 @@ impl ExtentStore {
                     }
                     AllocationDecision::FlushRequired(reclaimed) => {
                         reclaim.merge(reclaimed);
+                        fence_before_reclaim = true;
                         break;
                     }
                     AllocationDecision::Rejected(reclaimed) => {
@@ -391,15 +415,15 @@ impl ExtentStore {
                 .saturating_add(physical.data_bytes)
                 .saturating_add(physical.entry_directory_bytes)
                 .saturating_add(indexed.written_bytes);
+            if fence_before_reclaim {
+                self.fence_payload()?;
+            }
         }
 
         if published_bytes > 0 {
-            // Payload and directory durability is the publication fence. Checkpoint epochs therefore
-            // persist only immutable allocator/index metadata and never race fdatasync with later
-            // buffered writes to the same monolithic files.
-            self.pool.sync_payload()?;
-            #[cfg(test)]
-            crate::store::crash_if_requested("extent_after_payload_sync");
+            if self.pool.payload_is_dirty() {
+                self.fence_payload()?;
+            }
             self.checkpoints.record_publication(published_bytes)?;
         }
         let checkpoint_target = self.checkpoints.published_epoch();
@@ -417,6 +441,18 @@ impl ExtentStore {
             written_bytes: written_bytes.saturating_add(reclaim.written_bytes),
             reclaim: reclaim.stats,
         })
+    }
+
+    fn fence_payload(&self) -> Result<()> {
+        // Payload and directory durability is the publication fence. Checkpoint epochs therefore
+        // persist only immutable allocator/index metadata and never race fdatasync with later
+        // buffered writes to the same monolithic files. A store batch that fills the device
+        // fences its completed prefix before entering generation-reusing reclaim; the complete
+        // caller-visible batch still advances one publication epoch below.
+        self.pool.sync_payload()?;
+        #[cfg(test)]
+        crate::store::crash_if_requested("extent_after_payload_sync");
+        Ok(())
     }
 
     pub fn remove(&self, key: &EntryKey) -> Result<bool> {
@@ -1021,7 +1057,7 @@ mod tests {
     fn reclaim_waits_for_an_in_flight_epoch_before_generation_reuse() {
         let dir = tempdir().unwrap();
         let store = Arc::new(store(dir.path(), 2 * 1024 * 1024));
-        let entries = store.pool.layout().max_entries;
+        let entries = store.pool.layout().planned_max_entries;
         let initial = full_frame_value(7);
         for index in 0..entries - 1 {
             assert_ne!(
@@ -1109,14 +1145,20 @@ mod tests {
         assert_eq!(before_checkpoint.data_bytes, (PAGE_SIZE * 2) as u64);
         assert_eq!(before_checkpoint.entry_directory_runs, 1);
         assert_eq!(before_checkpoint.entry_directory_bytes, (ENTRY_OWNER_SIZE * 2) as u64);
+        assert_eq!(before_checkpoint.data_syncs, 1);
+        assert_eq!(before_checkpoint.entry_directory_syncs, 1);
         assert_eq!(before_checkpoint.index_runs, 0);
+        assert_eq!(before_checkpoint.index_syncs, 0);
         assert_eq!(before_checkpoint.allocator_runs, 0);
+        assert_eq!(before_checkpoint.allocator_syncs, 0);
 
         store.checkpoint().unwrap();
         let after_checkpoint = store.physical_write_stats();
         assert!(after_checkpoint.index_runs > 0);
         assert!(after_checkpoint.index_bytes > 0);
+        assert_eq!(after_checkpoint.index_syncs, 1);
         assert_eq!(after_checkpoint.allocator_runs, 1);
+        assert_eq!(after_checkpoint.allocator_syncs, 1);
         assert_eq!(
             after_checkpoint.allocator_bytes,
             store.pool.layout().state_copy_size as u64
@@ -1212,7 +1254,7 @@ mod tests {
     fn batch_larger_than_capacity_never_reuses_an_unpublished_extent() {
         let dir = tempdir().unwrap();
         let store = store(dir.path(), 2 * 1024 * 1024);
-        let inserts = store.pool.layout().max_entries as usize * 2;
+        let inserts = store.pool.layout().planned_max_entries as usize * 2;
         let values = (0..inserts)
             .map(|index| vec![(index % 251) as u8; 16])
             .collect::<Vec<_>>();
@@ -1233,10 +1275,42 @@ mod tests {
     }
 
     #[test]
+    fn reclaim_reuses_the_existing_payload_fence_without_resyncing() {
+        let dir = tempdir().unwrap();
+        let store = store(dir.path(), 2 * 1024 * 1024);
+        let entries = store.pool.layout().planned_max_entries as usize;
+        let keys = (0..entries).map(|index| key(index as u64)).collect::<Vec<_>>();
+        let value = full_frame_value(7);
+        let batch = keys
+            .iter()
+            .map(|key| EntryInsert::new(key, &value, CachePriority::Low))
+            .collect::<Vec<_>>();
+        let populated = store.insert_batch_with_stats(&batch).unwrap();
+        assert!(
+            populated
+                .outcomes
+                .iter()
+                .all(|outcome| *outcome == InsertOutcome::Inserted)
+        );
+
+        let before = store.physical_write_stats();
+        let incoming_key = key(entries as u64 + 1);
+        let result = store
+            .insert_batch_with_stats(&[EntryInsert::new(&incoming_key, &value, CachePriority::High)])
+            .unwrap();
+        assert_eq!(result.reclaim.total_reclaimed_extents(), 1);
+        assert_eq!(result.outcomes, vec![InsertOutcome::Inserted]);
+        let after = store.physical_write_stats();
+        assert_eq!(after.data_syncs - before.data_syncs, 1);
+        assert_eq!(after.entry_directory_syncs - before.entry_directory_syncs, 1);
+        assert_eq!(store.get(&incoming_key).unwrap(), Some(value));
+    }
+
+    #[test]
     fn hot_update_batch_larger_than_capacity_preserves_fifo_values() {
         let dir = tempdir().unwrap();
         let store = store(dir.path(), 512 * 1024);
-        let entries = store.pool.layout().max_entries as usize;
+        let entries = store.pool.layout().planned_max_entries as usize;
         for index in 0..entries {
             store
                 .insert(&key(index as u64), &[7; 16], CachePriority::Normal)
@@ -1271,7 +1345,7 @@ mod tests {
     fn low_priority_cannot_reclaim_protected_data() {
         let dir = tempdir().unwrap();
         let store = store(dir.path(), 2 * 1024 * 1024);
-        let entries = store.pool.layout().max_entries as usize;
+        let entries = store.pool.layout().planned_max_entries as usize;
         for index in 0..entries {
             store.insert(&key(index as u64), &[1; 16], CachePriority::High).unwrap();
         }
@@ -1366,7 +1440,8 @@ mod tests {
         let layout = store.pool.layout();
         store.insert(&key(0), &[1; 16], CachePriority::Low).unwrap();
 
-        let normal_entries = (layout.extent_count as usize - 2).saturating_mul(layout.entries_per_extent as usize);
+        let normal_entries =
+            (layout.extent_count as usize - 2).saturating_mul(layout.planned_entries_per_extent as usize);
         for index in 0..normal_entries {
             assert_ne!(
                 store
@@ -1400,7 +1475,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = store(dir.path(), 2 * 1024 * 1024);
         let layout = store.pool.layout();
-        let entries = layout.max_entries as usize;
+        let entries = layout.planned_max_entries as usize;
         for index in 0..entries {
             assert_ne!(
                 store
@@ -1423,11 +1498,11 @@ mod tests {
         assert_eq!(result.reclaim.total_promoted_bytes(), 16);
         assert_eq!(
             result.reclaim.total_evicted_entries(),
-            layout.entries_per_extent as usize - 1
+            layout.planned_entries_per_extent as usize - 1
         );
         assert_eq!(
             result.reclaim.total_evicted_bytes(),
-            (layout.entries_per_extent as usize - 1) * 16
+            (layout.planned_entries_per_extent as usize - 1) * 16
         );
         assert_eq!(store.get(&key(0)).unwrap(), Some(vec![5; 16]));
     }
@@ -1442,7 +1517,7 @@ mod tests {
                 .with_options(options().with_low_hot_frequency(15)),
         )
         .unwrap();
-        let entries = store.pool.layout().max_entries as usize;
+        let entries = store.pool.layout().planned_max_entries as usize;
         for index in 0..entries {
             assert_ne!(
                 store.insert(&key(index as u64), &[5; 16], CachePriority::Low).unwrap(),
@@ -1473,7 +1548,7 @@ mod tests {
                 .with_options(options().with_hot_frequency(15).with_low_hot_frequency(2)),
         )
         .unwrap();
-        let entries = store.pool.layout().max_entries as usize;
+        let entries = store.pool.layout().planned_max_entries as usize;
         for index in 0..entries {
             assert_ne!(
                 store.insert(&key(index as u64), &[5; 16], CachePriority::Low).unwrap(),
@@ -1498,7 +1573,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = store(dir.path(), 2 * 1024 * 1024);
         let layout = store.pool.layout();
-        let entries = layout.max_entries as usize;
+        let entries = layout.planned_max_entries as usize;
         for index in 0..entries {
             assert_ne!(
                 store
@@ -1524,11 +1599,11 @@ mod tests {
         assert_eq!(result.reclaim.total_promoted_bytes(), promoted * 16);
         assert_eq!(
             result.reclaim.total_evicted_entries(),
-            layout.entries_per_extent as usize - promoted
+            layout.planned_entries_per_extent as usize - promoted
         );
         assert_eq!(
             result.reclaim.total_evicted_bytes(),
-            (layout.entries_per_extent as usize - promoted) * 16
+            (layout.planned_entries_per_extent as usize - promoted) * 16
         );
     }
 
@@ -1536,7 +1611,7 @@ mod tests {
     fn reopen_completes_an_interrupted_reclaim_transaction() {
         let dir = tempdir().unwrap();
         let store = store(dir.path(), 2 * 1024 * 1024);
-        let entries = store.pool.layout().max_entries as usize;
+        let entries = store.pool.layout().planned_max_entries as usize;
         for index in 0..entries {
             assert_ne!(
                 store
@@ -1623,7 +1698,7 @@ mod tests {
         ] {
             let dir = tempdir().unwrap();
             let store = store(dir.path(), 2 * 1024 * 1024);
-            let entries = store.pool.layout().max_entries;
+            let entries = store.pool.layout().planned_max_entries;
             for index in 0..entries {
                 assert_ne!(
                     store.insert(&key(index), &[7; 16], CachePriority::Normal).unwrap(),
@@ -1680,7 +1755,7 @@ mod tests {
         ] {
             let dir = tempdir().unwrap();
             let store = store(dir.path(), 2 * 1024 * 1024);
-            let entries = store.pool.layout().max_entries;
+            let entries = store.pool.layout().planned_max_entries;
             for index in 0..entries {
                 assert_ne!(
                     store.insert(&key(index), &[5; 16], CachePriority::Low).unwrap(),

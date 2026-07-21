@@ -20,8 +20,8 @@ use futures_core::future::BoxFuture;
 use tokio::sync::Notify;
 
 use crate::{
-    CheckpointStats, EngineValue, EntryIndexReadStats, EntryIndexStats, Error, ExtentOccupancy, IoSchedulerStats,
-    MAX_KEY_SIZE, PhysicalWriteStats, ReclaimStats,
+    CheckpointStats, DirectoryReadStats, EngineValue, EntryIndexReadStats, EntryIndexStats, Error, ExtentLayoutStats,
+    ExtentOccupancy, IoSchedulerStats, MAX_KEY_SIZE, PhysicalWriteStats, ReclaimStats,
     format::STORED_ENTRY_HEADER_SIZE,
     model::EntryKey,
     store::{ExtentStore, ExtentStoreConfig, PreparedGet},
@@ -47,6 +47,7 @@ const DEFAULT_QUEUE_CAPACITY_ENTRIES: usize = 65_536;
 const DEFAULT_WRITE_BATCH_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_WRITE_BATCH_ENTRIES: usize = 4_096;
 const DEFAULT_READ_BUSY_WRITE_BATCH_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_WRITE_BATCH_DELAY: Duration = Duration::ZERO;
 const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 const OPEN: u8 = 0;
 const CLOSING: u8 = 1;
@@ -67,6 +68,7 @@ pub struct ExtentEngineConfig {
     write_batch_bytes: usize,
     write_batch_entries: usize,
     read_busy_write_batch_bytes: usize,
+    write_batch_delay: Duration,
     read_concurrency: usize,
     checkpoint_interval: Duration,
     throttle: Throttle,
@@ -84,6 +86,7 @@ impl ExtentEngineConfig {
             write_batch_bytes: DEFAULT_WRITE_BATCH_BYTES,
             write_batch_entries: DEFAULT_WRITE_BATCH_ENTRIES,
             read_busy_write_batch_bytes: DEFAULT_READ_BUSY_WRITE_BATCH_BYTES,
+            write_batch_delay: DEFAULT_WRITE_BATCH_DELAY,
             read_concurrency: std::thread::available_parallelism()
                 .map_or(2, |parallelism| parallelism.get().saturating_mul(2)),
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
@@ -210,6 +213,13 @@ impl ExtentEngineConfig {
         self
     }
 
+    /// Wait briefly after the first queued command so sparse arrivals can share one page frame
+    /// and payload durability fence. A zero duration restores immediate draining.
+    pub fn with_write_batch_delay(mut self, delay: Duration) -> Self {
+        self.write_batch_delay = delay;
+        self
+    }
+
     /// Set the hard number of concurrent physical cache reads.
     ///
     /// Reads above the limit return `Load::Throttled` immediately rather than queueing.
@@ -292,6 +302,15 @@ impl ExtentEngineHandle {
 
     pub fn physical_write_stats(&self) -> Option<PhysicalWriteStats> {
         self.upgrade().map(|inner| inner.store.physical_write_stats())
+    }
+
+    pub fn directory_read_stats(&self) -> Option<DirectoryReadStats> {
+        self.upgrade().map(|inner| inner.store.directory_read_stats())
+    }
+
+    pub fn layout_stats(&self) -> Option<ExtentLayoutStats> {
+        self.upgrade()
+            .map(|inner| inner.store.layout_stats(inner.capacity as u64))
     }
 
     pub fn io_scheduler_stats(&self) -> Option<IoSchedulerStats> {
@@ -485,6 +504,7 @@ impl ExtentEngine {
             config.write_batch_entries,
             config.write_batch_bytes,
             config.read_busy_write_batch_bytes,
+            config.write_batch_delay,
             config.checkpoint_interval,
             background_error.clone(),
             stats.clone(),
@@ -937,6 +957,46 @@ mod tests {
         assert_eq!(writes.accepted_commands, 1);
         assert_eq!(writes.completed_commands, 1);
         assert_eq!(handle.queue_pending_entries(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn write_batch_delay_coalesces_sparse_arrivals_into_one_durability_fence() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = ExtentEngineConfig::new(directory.path(), 16 * 1024 * 1024)
+            .with_test_layout(4 * 1024, 32 * 1024)
+            .with_index_write_buffer_size(64 * 1024)
+            .with_index_cache_size(1024 * 1024)
+            .with_queue_capacity_bytes(1024 * 1024)
+            .with_queue_capacity_entries(128)
+            .with_write_batch_bytes(128 * 1024)
+            .with_write_batch_entries(32)
+            .with_write_batch_delay(Duration::from_millis(250));
+        let handle = config.handle();
+        let cache = HybridCache::builder()
+            .with_name("extent-sparse-write-batch")
+            .with_policy(HybridCachePolicy::WriteOnInsertion)
+            .with_flush_on_close(false)
+            .memory(1024 * 1024)
+            .storage()
+            .with_engine_config(Box::new(config) as Box<dyn EngineConfig<Bytes, EngineValue, HybridCacheProperties>>)
+            .with_recover_mode(RecoverMode::None)
+            .build()
+            .await
+            .unwrap();
+
+        insert(&cache, 1);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        insert(&cache, 2);
+        cache.storage().wait().await;
+
+        let writes = handle.write_stats().unwrap();
+        assert_eq!(writes.accepted_commands, 2);
+        assert_eq!(writes.completed_commands, 2);
+        assert_eq!(writes.completed_batches, 1);
+        let physical = handle.physical_write_stats().unwrap();
+        assert_eq!(physical.data_syncs, 1);
+        assert_eq!(physical.entry_directory_syncs, 1);
+        cache.close().await.unwrap();
     }
 
     #[tokio::test]

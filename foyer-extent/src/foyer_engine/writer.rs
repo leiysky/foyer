@@ -105,6 +105,7 @@ pub struct WriteWorker {
     batch_entries: usize,
     batch_bytes: usize,
     read_busy_batch_bytes: usize,
+    batch_delay: Duration,
     checkpoint_interval: Duration,
     background_error: Arc<BackgroundError>,
     stats: Arc<EngineStats>,
@@ -121,6 +122,7 @@ impl WriteWorker {
         batch_entries: usize,
         batch_bytes: usize,
         read_busy_batch_bytes: usize,
+        batch_delay: Duration,
         checkpoint_interval: Duration,
         background_error: Arc<BackgroundError>,
         stats: Arc<EngineStats>,
@@ -134,6 +136,7 @@ impl WriteWorker {
             batch_entries,
             batch_bytes,
             read_busy_batch_bytes,
+            batch_delay,
             checkpoint_interval,
             background_error,
             stats,
@@ -207,7 +210,23 @@ impl WriteWorker {
                         bytes = bytes.saturating_add(command.charge());
                         commands.push(command);
                     }
-                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                    Err(TryRecvError::Disconnected) => break,
+                    Err(TryRecvError::Empty) => {
+                        // Bound the coalescing delay from enqueue, not from the moment the worker
+                        // finally dequeues the first command. Backlogged commands therefore never
+                        // pay an additional batching delay after already waiting in the queue.
+                        let remaining = self.batch_delay.saturating_sub(commands[0].queued_at().elapsed());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        match receiver.recv_timeout(remaining) {
+                            Ok(command) => {
+                                bytes = bytes.saturating_add(command.charge());
+                                commands.push(command);
+                            }
+                            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
                 }
             }
 

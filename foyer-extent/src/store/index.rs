@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    mem::size_of,
     path::Path,
     sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
@@ -40,6 +41,9 @@ pub struct EntryIndexStats {
     pub mutable_entries: u64,
     pub immutable_memtables: u64,
     pub cache_resident_bytes: u64,
+    pub frequency_counters: u64,
+    pub frequency_bytes: u64,
+    pub frequency_sample_window: u64,
     pub background_running: bool,
     pub background_failed: bool,
 }
@@ -101,7 +105,7 @@ pub struct EntryIndex {
     capacity_bytes: u64,
     state: RwLock<RuntimeState>,
     mutations: Mutex<()>,
-    frequency: FrequencySketch,
+    frequency: RwLock<FrequencySketch>,
 }
 
 impl EntryIndex {
@@ -153,11 +157,7 @@ impl EntryIndex {
 
     fn from_parts(database: FixedLsm, live_capacity: u64, capacity_bytes: u64) -> Self {
         let live_count = database.user_state();
-        let frequency_counters = usize::try_from(live_capacity / 4)
-            .unwrap_or(MAX_FREQUENCY_COUNTERS)
-            .clamp(MIN_FREQUENCY_COUNTERS, MAX_FREQUENCY_COUNTERS)
-            .next_power_of_two()
-            .min(MAX_FREQUENCY_COUNTERS);
+        let frequency_counters = frequency_counters_for_entries(live_count);
         Self {
             database,
             live_capacity,
@@ -167,7 +167,7 @@ impl EntryIndex {
                 ..RuntimeState::default()
             }),
             mutations: Mutex::new(()),
-            frequency: FrequencySketch::new(frequency_counters),
+            frequency: RwLock::new(FrequencySketch::new(frequency_counters)),
         }
     }
 
@@ -184,6 +184,10 @@ impl EntryIndex {
         PhysicalWriteStats {
             index_runs: stats.table_write_operations.saturating_add(stats.wal_write_operations),
             index_bytes: stats.table_write_bytes.saturating_add(stats.wal_write_bytes),
+            // Extent checkpoints always append the WAL with synchronous durability, so each WAL
+            // write operation is one foreground Index durability fence. Background SST/manifest
+            // maintenance has separate structural counters and is not folded into this number.
+            index_syncs: stats.wal_write_operations,
             ..PhysicalWriteStats::default()
         }
     }
@@ -214,6 +218,7 @@ impl EntryIndex {
     pub fn stats(&self) -> EntryIndexStats {
         let database = self.database.stats();
         let state = read_lock(&self.state);
+        let frequency = read_lock(&self.frequency);
         let pending_changes = state
             .active
             .len()
@@ -232,6 +237,9 @@ impl EntryIndex {
             mutable_entries: database.mutable_entries,
             immutable_memtables: database.immutable_memtables,
             cache_resident_bytes: database.cache_resident_bytes,
+            frequency_counters: frequency.counters() as u64,
+            frequency_bytes: (frequency.counters() * size_of::<u64>()) as u64,
+            frequency_sample_window: frequency.sample_window(),
             background_running: database.background_running,
             background_failed: database.background_failed,
         }
@@ -250,7 +258,7 @@ impl EntryIndex {
     }
 
     pub fn lookup_memory(&self, key: KeyDigest) -> Result<EntryIndexMemoryLookup> {
-        self.frequency.record(key_hash(key));
+        read_lock(&self.frequency).record(key_hash(key));
         loop {
             let base_revision = {
                 let state = read_lock(&self.state);
@@ -286,12 +294,12 @@ impl EntryIndex {
     }
 
     pub fn probe(&self, key: KeyDigest, _priority: CachePriority) -> Result<(Option<EntryLocation>, bool)> {
-        self.frequency.record(key_hash(key));
+        read_lock(&self.frequency).record(key_hash(key));
         Ok((self.lookup(key)?, true))
     }
 
     pub fn estimated_frequency(&self, key: KeyDigest) -> u8 {
-        self.frequency.estimate(key_hash(key))
+        read_lock(&self.frequency).estimate(key_hash(key))
     }
 
     fn lookup(&self, key: KeyDigest) -> Result<Option<EntryLocation>> {
@@ -327,7 +335,7 @@ impl EntryIndex {
     }
 
     pub fn insert_batch(&self, inserts: &[(KeyDigest, EntryLocation)]) -> Result<BatchInsertResult> {
-        let _mutation = mutex_lock(&self.mutations);
+        let mutation = mutex_lock(&self.mutations);
         let mut outcomes = Vec::with_capacity(inserts.len());
         for (key, location) in inserts.iter().copied() {
             let existing = self.lookup(key)?;
@@ -349,6 +357,9 @@ impl EntryIndex {
                 outcomes.push(InsertOutcome::Updated);
             }
         }
+        let live_count = read_lock(&self.state).live_count;
+        self.maybe_resize_frequency(live_count);
+        drop(mutation);
         Ok(BatchInsertResult {
             outcomes,
             ..BatchInsertResult::default()
@@ -360,7 +371,7 @@ impl EntryIndex {
     }
 
     pub fn remove_batch(&self, keys: &[KeyDigest]) -> Result<usize> {
-        let _mutation = mutex_lock(&self.mutations);
+        let mutation = mutex_lock(&self.mutations);
         let mut removed = 0;
         for key in keys.iter().copied() {
             if self.lookup(key)?.is_none() {
@@ -371,6 +382,9 @@ impl EntryIndex {
             state.live_count = state.live_count.saturating_sub(1);
             removed += 1;
         }
+        let live_count = read_lock(&self.state).live_count;
+        self.maybe_resize_frequency(live_count);
+        drop(mutation);
         Ok(removed)
     }
 
@@ -455,6 +469,30 @@ impl EntryIndex {
             state.active.entry(*key).or_insert(*mutation);
         }
     }
+
+    fn maybe_resize_frequency(&self, live_count: u64) {
+        let desired = frequency_counters_for_entries(live_count);
+        let current = read_lock(&self.frequency).counters();
+        if desired <= current && desired.saturating_mul(4) > current {
+            return;
+        }
+        let mut frequency = write_lock(&self.frequency);
+        let current = frequency.counters();
+        if desired > current || desired.saturating_mul(4) <= current {
+            // Frequency is an intentionally volatile heuristic. Resizing at power-of-two
+            // cardinality boundaries may forget history, but avoids carrying stale temperature
+            // across a radically different live set and keeps its aging window proportional.
+            *frequency = FrequencySketch::new(desired);
+        }
+    }
+}
+
+fn frequency_counters_for_entries(entries: u64) -> usize {
+    usize::try_from(entries / 4)
+        .unwrap_or(MAX_FREQUENCY_COUNTERS)
+        .clamp(MIN_FREQUENCY_COUNTERS, MAX_FREQUENCY_COUNTERS)
+        .next_power_of_two()
+        .min(MAX_FREQUENCY_COUNTERS)
 }
 
 fn decode_location(value: [u8; fixed_lsm::VALUE_SIZE]) -> Result<EntryLocation> {
@@ -540,6 +578,20 @@ mod tests {
 
     fn create(root: &Path) -> EntryIndex {
         EntryIndex::create(root, 128, 1024 * 1024, 64 * 16, 1024 * 1024).unwrap()
+    }
+
+    #[test]
+    fn frequency_sketch_tracks_live_cardinality_instead_of_layout_capacity() {
+        assert_eq!(frequency_counters_for_entries(0), MIN_FREQUENCY_COUNTERS);
+        assert_eq!(
+            frequency_counters_for_entries((MIN_FREQUENCY_COUNTERS * 4) as u64),
+            MIN_FREQUENCY_COUNTERS
+        );
+        assert_eq!(
+            frequency_counters_for_entries((MIN_FREQUENCY_COUNTERS * 4 + 4) as u64),
+            MIN_FREQUENCY_COUNTERS * 2
+        );
+        assert_eq!(frequency_counters_for_entries(u64::MAX), MAX_FREQUENCY_COUNTERS);
     }
 
     #[test]

@@ -43,8 +43,9 @@ The Foyer-facing queue, pipeline, and recovery state is also exported through it
 `foyer_storage_engine_readers`, `foyer_storage_engine_duration`,
 `foyer_storage_engine_recovery_total`, and `foyer_storage_engine_healthy`. Queue gauges are updated
 at reservation ownership changes; the worker refreshes checkpoint frontiers on every batch and
-periodic checkpoint tick. `storage_usage()` is an O(1) snapshot: preallocated extent-file usage is
-fixed by the discovered layout, while FixedRecordLSM reports its atomic disk-budget counter.
+periodic checkpoint tick. `storage_usage()` is an O(1) snapshot over a fixed file set: it combines
+allocated blocks for the preallocated data/state files and sparse directory with
+FixedRecordLSM's atomic disk-budget counter.
 The shared physical-I/O counters include both payload and index reads, including reads that finish
 as a validated cache miss, and all payload, checkpoint, and index writes. Cumulative FixedRecordLSM
 counters are reconciled exactly once so concurrent lookups cannot double-count index I/O.
@@ -55,12 +56,15 @@ Each Stored Entry has one fixed directory record, and a cache extent is reused a
 Object ranges, application-specific key encoding, and remote-storage behavior belong outside the
 project.
 
-Capacity is the only production static input. The V5 format owns a 64 MiB cache extent, a 4 KiB I/O
-frame, and a 4 KiB minimum Entry charge. The charge bounds directory and index cardinality but does
-not round physical Entry allocations. Changing these choices, layout derivation, record encoding,
-or an incompatible embedded-index format requires an `EXTENT_FORMAT_VERSION` bump. Layout
-overrides remain available only as a test and benchmark escape hatch. Runtime I/O, queue, batching,
-checkpoint, frequency, and index-memory settings can change across reopens.
+Capacity is the only production static input. The V6 format owns a 64 MiB cache extent, a 4 KiB I/O
+frame, and a 4 KiB Entry planning charge. The charge sizes planned directory and index targets; it
+neither rounds physical Entry allocations nor caps how many small Entries may be packed into an
+extent. The data file, planned directory budget, and allocator state fit the configured capacity.
+The sparse directory address space and EntryIndex target may exceed their plans and report that
+pressure without rejecting a cache write. Changing these choices, layout derivation, record
+encoding, or an incompatible embedded-index format requires an `EXTENT_FORMAT_VERSION` bump.
+Layout overrides remain available only as a test and benchmark escape hatch. Runtime I/O, queue,
+batching, checkpoint, frequency, and index-memory settings can change across reopens.
 
 The durable exact index is the workspace-private `foyer-fixed-lsm` crate. RocksDB support is gated
 behind the `rocksdb-benchmark` feature and exists only as an industrial comparison point.
@@ -83,8 +87,8 @@ discards the unstarted queue tail, and publishes one final durable checkpoint. T
 is explicitly counted. This bounds shutdown by one batch plus checkpoint work without exposing a
 partially published entry; cache writes remain best effort and the source remains authoritative.
 
-Compatibility CI reconstructs a frozen complete V3 store image and verifies that V5 rejects it and
-can recreate the expendable cache without leaving its legacy owner file behind. V5 round-trip,
+Compatibility CI reconstructs a frozen complete V3 store image and verifies that V6 rejects it and
+can recreate the expendable cache without leaving its legacy owner file behind. V6 round-trip,
 tail-recovery, and process-crash tests cover the current directory, allocator, checkpoint, and
 reclaim publication paths.
 
@@ -96,7 +100,7 @@ Design documentation is organized by boundary:
   integrity;
 - [`docs/foyer-integration.md`](docs/foyer-integration.md) — Foyer engine adaptation, queues,
   lifecycle, and observability;
-- [`docs/extent-store.md`](docs/extent-store.md) — V5 physical layout, checkpoint, reclaim, and
+- [`docs/extent-store.md`](docs/extent-store.md) — V6 physical layout, checkpoint, reclaim, and
   failure model; and
 - [`docs/entry-index.md`](docs/entry-index.md) — overlays, FixedRecordLSM, recovery, and index-space
   accounting.

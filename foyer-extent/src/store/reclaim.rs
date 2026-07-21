@@ -1,4 +1,8 @@
-use std::{cmp::Reverse, collections::HashSet};
+use std::{
+    cmp::Reverse,
+    collections::HashSet,
+    time::{Duration, Instant},
+};
 
 use crate::{
     error::Result,
@@ -105,29 +109,38 @@ impl<'a> Reclaimer<'a> {
     }
 
     fn reclaim(&self, victim: ExtentVictim, incoming: CachePriority) -> Result<ReclaimResult> {
+        let started = Instant::now();
         // Generation reuse cannot pass an immutable checkpoint that may still reference this
-        // victim. Reclaim closes the durability frontier inline while the caller holds the
-        // mutation lock. The payload fence also covers earlier pieces of the current store batch.
-        self.pool.sync_payload()?;
+        // victim. The caller has already fenced every completed physical segment; enforce that
+        // boundary before closing the metadata frontier inline under the mutation lock.
+        let preparation_started = Instant::now();
+        self.pool.ensure_payload_fenced()?;
         self.checkpoints.checkpoint_inline_locked()?;
-        let live = self.live_victims(victim)?;
+        let preparation_duration = preparation_started.elapsed();
+        let (live, mut work) = self.live_victims(victim)?;
+        work.preparation_duration = preparation_duration;
         let hot_frequency = self.frequency_threshold(victim.priority);
         if victim.priority == incoming
             && promotion_limit(self.pool.layout().extent_size) > 0
             && live.iter().any(|entry| entry.frequency >= hot_frequency)
         {
+            let transaction_started = Instant::now();
             let transaction = self.pool.begin_reclaim(victim)?;
+            work.transaction_duration = transaction_started.elapsed();
             #[cfg(test)]
             crate::store::crash_if_requested("extent_reclaim_after_begin");
-            return self.compact(transaction, live, hot_frequency);
+            return self.compact(transaction, live, hot_frequency, work, started);
         }
 
         let evicted_entries = live.len();
         let evicted_bytes = live.iter().fold(0usize, |bytes, entry| {
             bytes.saturating_add(entry.owner.value_len as usize)
         });
+        let publication_started = Instant::now();
         let keys = live.into_iter().map(|entry| entry.owner.key_digest).collect::<Vec<_>>();
         self.index.remove_batch(&keys)?;
+        // The current caller-visible store batch has not advanced its publication epoch yet.
+        // Persist its allocator positions before an Index checkpoint can expose those locations.
         self.pool.checkpoint_state()?;
         #[cfg(test)]
         crate::store::crash_if_requested("extent_evict_after_allocator_state");
@@ -139,15 +152,28 @@ impl<'a> Reclaimer<'a> {
         crate::store::crash_if_requested("extent_evict_after_release");
         let mut stats = ReclaimStats::default();
         stats.record(victim.priority, evicted_entries, 0, evicted_bytes, 0);
+        work.record(
+            &mut stats,
+            Duration::ZERO,
+            publication_started.elapsed(),
+            started.elapsed(),
+        );
         Ok(ReclaimResult {
             stats,
             ..Default::default()
         })
     }
 
-    fn live_victims(&self, victim: ExtentVictim) -> Result<Vec<LiveVictim>> {
+    fn live_victims(&self, victim: ExtentVictim) -> Result<(Vec<LiveVictim>, ReclaimWork)> {
+        let directory_before = self.pool.directory_read_stats();
+        let directory_started = Instant::now();
+        let owners = self.pool.entry_owners(victim)?;
+        let directory_duration = directory_started.elapsed();
+        let directory_after = self.pool.directory_read_stats();
+        let scanned_entries = owners.len() as u64;
+        let index_started = Instant::now();
         let mut live = Vec::new();
-        for (data_offset, owner) in self.pool.entry_owners(victim)? {
+        for (data_offset, owner) in owners {
             let Some(location) = self.index.peek(owner.key_digest)? else {
                 continue;
             };
@@ -159,7 +185,19 @@ impl<'a> Reclaimer<'a> {
                 });
             }
         }
-        Ok(live)
+        Ok((
+            live,
+            ReclaimWork {
+                scanned_entries,
+                directory_read_runs: directory_after.runs.saturating_sub(directory_before.runs),
+                directory_read_bytes: directory_after.bytes.saturating_sub(directory_before.bytes),
+                index_lookups: scanned_entries,
+                preparation_duration: Duration::ZERO,
+                directory_duration,
+                index_duration: index_started.elapsed(),
+                transaction_duration: Duration::ZERO,
+            },
+        ))
     }
 
     fn compact(
@@ -167,7 +205,10 @@ impl<'a> Reclaimer<'a> {
         transaction: ReclaimTransaction,
         mut live: Vec<LiveVictim>,
         hot_frequency: u8,
+        work: ReclaimWork,
+        started: Instant,
     ) -> Result<ReclaimResult> {
+        let promotion_started = Instant::now();
         live.sort_unstable_by_key(|entry| (Reverse(entry.frequency), Reverse(entry.owner.sequence)));
         // Retain at most the hottest eighth. That guarantees each compaction frees seven eighths
         // of its source and caps promotion write amplification at one seventh.
@@ -211,9 +252,11 @@ impl<'a> Reclaimer<'a> {
             .collect::<Vec<_>>();
         let written = self.pool.write_batch(&writes)?;
         self.pool.sync_payload()?;
+        let promotion_duration = promotion_started.elapsed();
         #[cfg(test)]
         crate::store::crash_if_requested("extent_reclaim_after_payload_sync");
 
+        let publication_started = Instant::now();
         let removed = live.iter().map(|entry| entry.owner.key_digest).collect::<Vec<_>>();
         self.index.remove_batch(&removed)?;
         let promoted = promotions
@@ -247,6 +290,12 @@ impl<'a> Reclaimer<'a> {
             promoted_entries,
             live_bytes.saturating_sub(promoted_bytes),
             promoted_bytes,
+        );
+        work.record(
+            &mut stats,
+            promotion_duration,
+            publication_started.elapsed(),
+            started.elapsed(),
         );
         Ok(ReclaimResult {
             stats,
@@ -290,6 +339,40 @@ struct LiveVictim {
     owner: EntryOwner,
     location: EntryLocation,
     frequency: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReclaimWork {
+    scanned_entries: u64,
+    directory_read_runs: u64,
+    directory_read_bytes: u64,
+    index_lookups: u64,
+    preparation_duration: Duration,
+    directory_duration: Duration,
+    index_duration: Duration,
+    transaction_duration: Duration,
+}
+
+impl ReclaimWork {
+    fn record(self, stats: &mut ReclaimStats, promotion: Duration, publication: Duration, total: Duration) {
+        stats.record_work(
+            self.scanned_entries,
+            self.directory_read_runs,
+            self.directory_read_bytes,
+            self.index_lookups,
+            duration_nanos(self.preparation_duration),
+            duration_nanos(self.directory_duration),
+            duration_nanos(self.index_duration),
+            duration_nanos(self.transaction_duration),
+            duration_nanos(promotion),
+            duration_nanos(publication),
+            duration_nanos(total),
+        );
+    }
+}
+
+fn duration_nanos(duration: Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
 #[derive(Debug)]

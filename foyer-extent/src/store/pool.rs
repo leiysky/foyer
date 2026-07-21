@@ -4,7 +4,7 @@ use std::{
     path::Path,
     sync::{
         Mutex, MutexGuard,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -12,7 +12,8 @@ use std::{
 use crate::{
     error::{Error, Result},
     file::{
-        AlignedBuffer, ensure_cache_file_reserved, open_cache_file, read_exact_at, reserve_cache_file, write_all_at,
+        AlignedBuffer, allocated_file_size, ensure_cache_file_reserved, open_cache_file, read_exact_at,
+        reserve_cache_file, write_all_at,
     },
     format::{
         ContentDigest, PAGE_SIZE, copy_stored_entry_range, decode_entry_value, decode_stored_entry,
@@ -22,7 +23,7 @@ use crate::{
     store::{
         format::{ENTRY_OWNER_SIZE, EntryLocation, EntryOwner, ExtentPoolState, ExtentRole, StoreLayout},
         io::{IoSchedulerStats, PayloadIoScheduler},
-        stats::{ExtentOccupancy, PhysicalWriteStats},
+        stats::{DirectoryReadStats, ExtentOccupancy, PhysicalWriteStats},
     },
 };
 
@@ -30,6 +31,7 @@ pub(crate) const DATA_FILE: &str = "data";
 pub(crate) const ENTRY_DIRECTORY_FILE: &str = "directory";
 pub(crate) const LEGACY_SLOT_OWNER_FILE: &str = "owners";
 pub(crate) const STATE_FILE: &str = "state";
+const DIRECTORY_READ_RECORDS: u32 = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EntryAllocation {
@@ -149,19 +151,38 @@ pub struct ExtentPool {
     write_concurrency: usize,
     read_run_size: usize,
     write_run_size: usize,
-    allocated_size: u64,
+    payload_dirty: AtomicBool,
     state: Mutex<ExtentPoolState>,
+    reads: PoolReadCounters,
     writes: PoolWriteCounters,
+}
+
+#[derive(Debug, Default)]
+struct PoolReadCounters {
+    entry_directory_runs: AtomicU64,
+    entry_directory_bytes: AtomicU64,
+}
+
+impl PoolReadCounters {
+    fn snapshot(&self) -> DirectoryReadStats {
+        DirectoryReadStats {
+            runs: self.entry_directory_runs.load(Ordering::Relaxed),
+            bytes: self.entry_directory_bytes.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 struct PoolWriteCounters {
     data_runs: AtomicU64,
     data_bytes: AtomicU64,
+    data_syncs: AtomicU64,
     entry_directory_runs: AtomicU64,
     entry_directory_bytes: AtomicU64,
+    entry_directory_syncs: AtomicU64,
     allocator_runs: AtomicU64,
     allocator_bytes: AtomicU64,
+    allocator_syncs: AtomicU64,
 }
 
 impl PoolWriteCounters {
@@ -169,10 +190,13 @@ impl PoolWriteCounters {
         PhysicalWriteStats {
             data_runs: self.data_runs.load(Ordering::Relaxed),
             data_bytes: self.data_bytes.load(Ordering::Relaxed),
+            data_syncs: self.data_syncs.load(Ordering::Relaxed),
             entry_directory_runs: self.entry_directory_runs.load(Ordering::Relaxed),
             entry_directory_bytes: self.entry_directory_bytes.load(Ordering::Relaxed),
+            entry_directory_syncs: self.entry_directory_syncs.load(Ordering::Relaxed),
             allocator_runs: self.allocator_runs.load(Ordering::Relaxed),
             allocator_bytes: self.allocator_bytes.load(Ordering::Relaxed),
+            allocator_syncs: self.allocator_syncs.load(Ordering::Relaxed),
             ..Default::default()
         }
     }
@@ -195,8 +219,18 @@ impl ExtentPool {
             .map_err(|error| Error::io("reserve extent data file", error))?;
         let entry_directory = open_cache_file(&root.join(ENTRY_DIRECTORY_FILE), true, false)
             .map_err(|error| Error::io("create extent entry directory", error))?;
-        reserve_cache_file(&entry_directory, layout.entry_directory_file_size)
-            .map_err(|error| Error::io("reserve extent entry directory", error))?;
+        write_all_at(
+            &entry_directory,
+            &[0],
+            layout
+                .entry_directory_file_size
+                .checked_sub(1)
+                .ok_or_else(|| invalid_state("extent entry-directory address space is empty"))?,
+        )
+        .map_err(|error| Error::io("size sparse extent entry directory", error))?;
+        entry_directory
+            .sync_data()
+            .map_err(|error| Error::io("sync sparse extent entry-directory size", error))?;
         let state_file = open_cache_file(&root.join(STATE_FILE), true, false)
             .map_err(|error| Error::io("create extent state file", error))?;
         let state_file_size = state_file_size(layout)?;
@@ -209,7 +243,6 @@ impl ExtentPool {
         state_file
             .sync_data()
             .map_err(|error| Error::io("sync initial extent state", error))?;
-        let allocated_size = layout_allocated_size(layout)?;
         let io = PayloadIoScheduler::new(write_concurrency, io_read_priority_duration)
             .map_err(|error| Error::io("configure extent I/O scheduler", error))?;
         Ok(Self {
@@ -222,8 +255,9 @@ impl ExtentPool {
             write_concurrency,
             read_run_size,
             write_run_size,
-            allocated_size,
+            payload_dirty: AtomicBool::new(false),
             state: Mutex::new(state),
+            reads: PoolReadCounters::default(),
             writes: PoolWriteCounters::default(),
         })
     }
@@ -289,11 +323,8 @@ impl ExtentPool {
         };
         ensure_cache_file_reserved(&data, layout.data_file_size)
             .map_err(|error| Error::io("verify extent data reservation", error))?;
-        ensure_cache_file_reserved(&entry_directory, layout.entry_directory_file_size)
-            .map_err(|error| Error::io("verify extent entry-directory reservation", error))?;
         ensure_cache_file_reserved(&state_file, state_file_size(layout)?)
             .map_err(|error| Error::io("verify extent state reservation", error))?;
-        let allocated_size = layout_allocated_size(layout)?;
         let io = PayloadIoScheduler::new(write_concurrency, io_read_priority_duration)
             .map_err(|error| Error::io("configure extent I/O scheduler", error))?;
 
@@ -307,8 +338,9 @@ impl ExtentPool {
             write_concurrency,
             read_run_size,
             write_run_size,
-            allocated_size,
+            payload_dirty: AtomicBool::new(false),
             state: Mutex::new(state),
+            reads: PoolReadCounters::default(),
             writes: PoolWriteCounters::default(),
         };
         pool.recover_current_tails()?;
@@ -320,7 +352,20 @@ impl ExtentPool {
     }
 
     pub fn allocated_size(&self) -> Result<u64> {
-        Ok(self.allocated_size)
+        [&self.data, &self.entry_directory, &self.state_file]
+            .into_iter()
+            .try_fold(0u64, |size, file| {
+                allocated_file_size(file)
+                    .map_err(|error| Error::io("read allocated extent file size", error))
+                    .and_then(|bytes| {
+                        size.checked_add(bytes)
+                            .ok_or_else(|| invalid_state("allocated extent file size overflows u64"))
+                    })
+            })
+    }
+
+    pub fn directory_read_stats(&self) -> DirectoryReadStats {
+        self.reads.snapshot()
     }
 
     pub fn physical_write_stats(&self) -> PhysicalWriteStats {
@@ -344,7 +389,7 @@ impl ExtentPool {
                 let entry_index = extent as usize;
                 let current = state.extents[entry_index];
                 let remaining = (self.layout.extent_size as u32).saturating_sub(current.used_bytes);
-                if remaining >= stored_len && current.entries < self.layout.entries_per_extent {
+                if remaining >= stored_len && current.entries < self.layout.directory_entries_per_extent {
                     let extent_offset = current.used_bytes;
                     let directory_entry = current.entries;
                     let extent_generation = state.extents[entry_index].generation;
@@ -415,7 +460,7 @@ impl ExtentPool {
                 return Err(invalid_state("extent allocation does not match the value length"));
             };
             if end as usize > self.layout.extent_size
-                || write.allocation.directory_entry >= self.layout.entries_per_extent
+                || write.allocation.directory_entry >= self.layout.directory_entries_per_extent
                 || self
                     .layout
                     .data_offset(write.allocation.extent, write.allocation.extent_offset)
@@ -461,6 +506,7 @@ impl ExtentPool {
         }
         let data_runs = data_write_runs(&order, writes, self.write_run_size)?;
         self.write_data_runs(writes, &data_runs)?;
+        self.payload_dirty.store(true, Ordering::Release);
         let entry_directory_runs = self.write_entry_directory_runs(writes)?;
         self.seal_write_frames(writes)?;
 
@@ -634,7 +680,7 @@ impl ExtentPool {
         }
         ExtentOccupancy::new(
             self.layout.extent_count.saturating_sub(1),
-            self.layout.entries_per_extent,
+            self.layout.planned_entries_per_extent,
             occupied_extents,
             used_entries,
             used_bytes,
@@ -753,7 +799,7 @@ impl ExtentPool {
             return Err(invalid_state("reclaim target changed during compaction"));
         }
         if (self.layout.extent_size as u32).saturating_sub(target.used_bytes) < stored_len
-            || target.entries >= self.layout.entries_per_extent
+            || target.entries >= self.layout.directory_entries_per_extent
         {
             return Ok(None);
         }
@@ -807,7 +853,9 @@ impl ExtentPool {
         state.reserve = transaction.source.extent;
 
         let target = &mut state.extents[transaction.target as usize];
-        if (target.used_bytes as usize) < self.layout.extent_size && target.entries < self.layout.entries_per_extent {
+        if (target.used_bytes as usize) < self.layout.extent_size
+            && target.entries < self.layout.directory_entries_per_extent
+        {
             target.role = ExtentRole::Current;
             state.current[usize::from(transaction.priority.to_byte())] = Some(transaction.target);
         } else {
@@ -817,41 +865,42 @@ impl ExtentPool {
     }
 
     pub fn entry_owners(&self, victim: ExtentVictim) -> Result<Vec<(u64, EntryOwner)>> {
-        let mut owners = Vec::new();
+        let mut owners = Vec::with_capacity(victim.entries as usize);
         let mut previous_end = 0u32;
         let mut previous_sequence = 0u64;
-        for entry in 0..victim.entries {
-            let directory_index = self
-                .layout
-                .directory_index(victim.extent, entry)
-                .expect("victim directory entry must be in the layout");
-            let owner = self
-                .read_entry_owner(directory_index)?
-                .ok_or_else(|| invalid_state("occupied extent contains an invalid entry-directory record"))?;
-            let end = owner
-                .extent_offset
-                .checked_add(owner.stored_len)
-                .ok_or_else(|| invalid_state("entry-directory range overflows u32"))?;
-            let gap = owner.extent_offset.saturating_sub(previous_end);
-            if owner.extent_generation != victim.generation
-                || owner.priority != victim.priority
-                || owner.stored_len == 0
-                || owner.value_len == 0
-                || owner.value_len >= owner.stored_len
-                || owner.extent_offset < previous_end
-                || end > victim.used_bytes
-                || owner.sequence <= previous_sequence
-                || (gap > 0 && (!(owner.extent_offset as usize).is_multiple_of(PAGE_SIZE) || gap as usize >= PAGE_SIZE))
-            {
-                return Err(invalid_state("occupied extent entry directory is inconsistent"));
+        let mut first_entry = 0u32;
+        while first_entry < victim.entries {
+            let count = (victim.entries - first_entry).min(DIRECTORY_READ_RECORDS);
+            for owner in self.read_entry_owner_chunk(victim.extent, first_entry, count)? {
+                let owner =
+                    owner.ok_or_else(|| invalid_state("occupied extent contains an invalid entry-directory record"))?;
+                let end = owner
+                    .extent_offset
+                    .checked_add(owner.stored_len)
+                    .ok_or_else(|| invalid_state("entry-directory range overflows u32"))?;
+                let gap = owner.extent_offset.saturating_sub(previous_end);
+                if owner.extent_generation != victim.generation
+                    || owner.priority != victim.priority
+                    || owner.stored_len == 0
+                    || owner.value_len == 0
+                    || owner.value_len >= owner.stored_len
+                    || owner.extent_offset < previous_end
+                    || end > victim.used_bytes
+                    || owner.sequence <= previous_sequence
+                    || (gap > 0
+                        && (!(owner.extent_offset as usize).is_multiple_of(PAGE_SIZE) || gap as usize >= PAGE_SIZE))
+                {
+                    return Err(invalid_state("occupied extent entry directory is inconsistent"));
+                }
+                let data_offset = self
+                    .layout
+                    .data_offset(victim.extent, owner.extent_offset)
+                    .ok_or_else(|| invalid_state("entry-directory offset is outside the data file"))?;
+                owners.push((data_offset, owner));
+                previous_end = end;
+                previous_sequence = owner.sequence;
             }
-            let data_offset = self
-                .layout
-                .data_offset(victim.extent, owner.extent_offset)
-                .ok_or_else(|| invalid_state("entry-directory offset is outside the data file"))?;
-            owners.push((data_offset, owner));
-            previous_end = end;
-            previous_sequence = owner.sequence;
+            first_entry += count;
         }
         Ok(owners)
     }
@@ -882,9 +931,26 @@ impl ExtentPool {
         self.io
             .write(|| self.data.sync_data())
             .map_err(|error| Error::io("sync extent data", error))?;
+        self.writes.data_syncs.fetch_add(1, Ordering::Relaxed);
         self.io
             .write(|| self.entry_directory.sync_data())
-            .map_err(|error| Error::io("sync extent entry directory", error))
+            .map_err(|error| Error::io("sync extent entry directory", error))?;
+        self.writes.entry_directory_syncs.fetch_add(1, Ordering::Relaxed);
+        self.payload_dirty.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn ensure_payload_fenced(&self) -> Result<()> {
+        if self.payload_dirty.load(Ordering::Acquire) {
+            return Err(invalid_state(
+                "reclaim cannot reuse a generation with unfenced payload writes",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn payload_is_dirty(&self) -> bool {
+        self.payload_dirty.load(Ordering::Acquire)
     }
 
     pub fn checkpoint_state(&self) -> Result<()> {
@@ -924,6 +990,7 @@ impl ExtentPool {
         self.state_file
             .sync_data()
             .map_err(|error| Error::io("sync allocator state", error))?;
+        self.writes.allocator_syncs.fetch_add(1, Ordering::Relaxed);
 
         let mut state = mutex_lock(&self.state);
         if state.state_generation != checkpoint.base_state_generation || state.active_page != checkpoint.base_page {
@@ -976,36 +1043,42 @@ impl ExtentPool {
             let mut recovered_entries = start_entry;
             let mut recovered_used = state.extents[entry_index].used_bytes;
             let mut previous_sequence = recovery_sequence_floor.saturating_sub(1);
-            for entry in start_entry..self.layout.entries_per_extent {
-                let directory_index = self
-                    .layout
-                    .directory_index(extent, entry)
-                    .expect("current extent directory entry must be in the layout");
-                let Some(owner) = self.read_entry_owner(directory_index)? else {
-                    break;
-                };
-                let Some(end) = owner.extent_offset.checked_add(owner.stored_len) else {
-                    break;
-                };
-                let gap = owner.extent_offset.saturating_sub(recovered_used);
-                if owner.extent_generation != generation
-                    || owner.priority != priority
-                    || owner.stored_len == 0
-                    || owner.value_len == 0
-                    || owner.value_len >= owner.stored_len
-                    || owner.stored_len as usize > self.layout.extent_size
-                    || owner.extent_offset < recovered_used
-                    || end as usize > self.layout.extent_size
-                    || owner.sequence <= previous_sequence
-                    || (gap > 0
-                        && (!(owner.extent_offset as usize).is_multiple_of(PAGE_SIZE) || gap as usize >= PAGE_SIZE))
+            let mut first_entry = start_entry;
+            'tail: while first_entry < self.layout.directory_entries_per_extent {
+                let count = (self.layout.directory_entries_per_extent - first_entry).min(DIRECTORY_READ_RECORDS);
+                for (offset, owner) in self
+                    .read_entry_owner_chunk(extent, first_entry, count)?
+                    .into_iter()
+                    .enumerate()
                 {
-                    break;
+                    let entry = first_entry + offset as u32;
+                    let Some(owner) = owner else {
+                        break 'tail;
+                    };
+                    let Some(end) = owner.extent_offset.checked_add(owner.stored_len) else {
+                        break 'tail;
+                    };
+                    let gap = owner.extent_offset.saturating_sub(recovered_used);
+                    if owner.extent_generation != generation
+                        || owner.priority != priority
+                        || owner.stored_len == 0
+                        || owner.value_len == 0
+                        || owner.value_len >= owner.stored_len
+                        || owner.stored_len as usize > self.layout.extent_size
+                        || owner.extent_offset < recovered_used
+                        || end as usize > self.layout.extent_size
+                        || owner.sequence <= previous_sequence
+                        || (gap > 0
+                            && (!(owner.extent_offset as usize).is_multiple_of(PAGE_SIZE) || gap as usize >= PAGE_SIZE))
+                    {
+                        break 'tail;
+                    }
+                    recovered_used = end;
+                    recovered_entries = entry + 1;
+                    previous_sequence = owner.sequence;
+                    next_sequence = next_sequence.max(owner.sequence.saturating_add(1));
                 }
-                recovered_used = end;
-                recovered_entries = entry + 1;
-                previous_sequence = owner.sequence;
-                next_sequence = next_sequence.max(owner.sequence.saturating_add(1));
+                first_entry += count;
             }
             if recovered_entries > start_entry {
                 recovered_used = u32::try_from(
@@ -1022,14 +1095,33 @@ impl ExtentPool {
         Ok(())
     }
 
-    fn read_entry_owner(&self, directory_index: u64) -> Result<Option<EntryOwner>> {
+    fn read_entry_owner_chunk(&self, extent: u32, first_entry: u32, count: u32) -> Result<Vec<Option<EntryOwner>>> {
+        if count == 0
+            || first_entry
+                .checked_add(count)
+                .is_none_or(|end| end > self.layout.directory_entries_per_extent)
+        {
+            return Err(invalid_state("extent entry-directory read range is invalid"));
+        }
+        let directory_index = self
+            .layout
+            .directory_index(extent, first_entry)
+            .ok_or_else(|| invalid_state("extent entry-directory read starts outside the layout"))?;
         let offset = directory_index
             .checked_mul(ENTRY_OWNER_SIZE as u64)
             .ok_or_else(|| invalid_state("extent entry-directory offset overflows u64"))?;
-        let mut input = [0; ENTRY_OWNER_SIZE];
+        let bytes = usize::try_from(count)
+            .ok()
+            .and_then(|count| count.checked_mul(ENTRY_OWNER_SIZE))
+            .ok_or_else(|| invalid_state("extent entry-directory read size overflows usize"))?;
+        let mut input = vec![0; bytes];
         read_exact_at(&self.entry_directory, &mut input, offset)
             .map_err(|error| Error::io("read extent entry directory", error))?;
-        Ok(EntryOwner::decode(&input))
+        self.reads.entry_directory_runs.fetch_add(1, Ordering::Relaxed);
+        self.reads
+            .entry_directory_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        Ok(input.chunks_exact(ENTRY_OWNER_SIZE).map(EntryOwner::decode).collect())
     }
 
     fn write_data_runs(&self, writes: &[EntryWrite<'_>], runs: &[DataWriteRun]) -> Result<()> {
@@ -1174,6 +1266,7 @@ impl ExtentPool {
         self.state_file
             .sync_data()
             .map_err(|error| Error::io("sync allocator state", error))?;
+        self.writes.allocator_syncs.fetch_add(1, Ordering::Relaxed);
         *state = next;
         Ok(())
     }
@@ -1274,13 +1367,6 @@ fn state_file_size(layout: StoreLayout) -> Result<u64> {
         .ok_or_else(|| invalid_state("extent state file size overflows u64"))
 }
 
-fn layout_allocated_size(layout: StoreLayout) -> Result<u64> {
-    layout
-        .total_file_size
-        .checked_sub(layout.index_capacity_bytes)
-        .ok_or_else(|| invalid_state("extent file allocation underflows total layout size"))
-}
-
 fn invalid_state(message: &str) -> Error {
     Error::InvalidSuperblock(format!("extent state: {message}"))
 }
@@ -1300,9 +1386,13 @@ mod tests {
     };
 
     fn create_pool(root: &Path) -> ExtentPool {
-        let options = ExtentStoreOptions::default().with_extent_size(PAGE_SIZE * 8);
+        create_pool_with_extent(root, PAGE_SIZE * 8, 4 * 1024 * 1024)
+    }
+
+    fn create_pool_with_extent(root: &Path, extent_size: usize, capacity: u64) -> ExtentPool {
+        let options = ExtentStoreOptions::default().with_extent_size(extent_size);
         let layout = StoreLayout::create(
-            ExtentStoreConfig::new(4 * 1024 * 1024)
+            ExtentStoreConfig::new(capacity)
                 .with_entry_charge(PAGE_SIZE)
                 .with_options(options),
         )
@@ -1327,6 +1417,10 @@ mod tests {
     fn batch_write_read_checkpoint_and_reopen() {
         let dir = tempdir().unwrap();
         let pool = create_pool(dir.path());
+        assert_eq!(
+            fs::metadata(dir.path().join(ENTRY_DIRECTORY_FILE)).unwrap().len(),
+            pool.layout().entry_directory_file_size
+        );
         let values = (0..12).map(|index| vec![index as u8; 100 + index]).collect::<Vec<_>>();
         let keys = (0..values.len()).map(|index| key(index as u64)).collect::<Vec<_>>();
         let allocations = values
@@ -1351,10 +1445,22 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let result = pool.write_batch(&writes).unwrap();
-        assert_eq!(result.data_runs, 2);
-        assert_eq!(result.data_bytes, PAGE_SIZE * 2);
+        assert!(writes.len() > pool.layout().planned_entries_per_extent as usize);
+        assert_eq!(result.data_runs, 1);
+        assert_eq!(result.data_bytes, PAGE_SIZE);
         assert_eq!(result.entry_directory_runs, 1);
         assert_eq!(result.entry_directory_bytes, values.len() * ENTRY_OWNER_SIZE);
+        assert!(pool.payload_is_dirty());
+        assert!(pool.ensure_payload_fenced().is_err());
+        let (victim, _) = pool.reclaim_candidates().oldest(CachePriority::Normal).unwrap();
+        assert_eq!(pool.entry_owners(victim).unwrap().len(), values.len());
+        assert_eq!(
+            pool.directory_read_stats(),
+            DirectoryReadStats {
+                runs: 1,
+                bytes: (values.len() * ENTRY_OWNER_SIZE) as u64,
+            }
+        );
         for (index, location) in result.locations.iter().enumerate() {
             assert_eq!(
                 pool.read_entry(&keys[index], *location).unwrap(),
@@ -1367,6 +1473,8 @@ mod tests {
             );
         }
         pool.sync_payload().unwrap();
+        assert!(!pool.payload_is_dirty());
+        pool.ensure_payload_fenced().unwrap();
         pool.checkpoint_state().unwrap();
         let layout = pool.layout();
         drop(pool);
@@ -1384,6 +1492,55 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn directory_reads_are_chunked_after_random_small_entries_exceed_the_planning_charge() {
+        let dir = tempdir().unwrap();
+        let pool = create_pool_with_extent(dir.path(), PAGE_SIZE * 64, 16 * 1024 * 1024);
+        let entry_count = DIRECTORY_READ_RECORDS as usize + 76;
+        let keys = (0..entry_count).map(|index| key(index as u64)).collect::<Vec<_>>();
+        let values = (0..entry_count)
+            .map(|index| {
+                let mixed = (index as u64)
+                    .wrapping_add(0x9e37_79b9_7f4a_7c15)
+                    .wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                vec![mixed as u8; 1 + (mixed as usize % 128)]
+            })
+            .collect::<Vec<_>>();
+        let allocations = values
+            .iter()
+            .zip(&keys)
+            .map(|(value, key)| {
+                allocated(
+                    pool.allocate(CachePriority::Normal, stored_entry_len(key, value).unwrap())
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let writes = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| EntryWrite {
+                allocation: allocations[index],
+                key: &keys[index],
+                key_digest: KeyDigest::for_key(&keys[index]),
+                value,
+                content_digest: value_digest(value),
+            })
+            .collect::<Vec<_>>();
+        pool.write_batch(&writes).unwrap();
+        assert!(entry_count > pool.layout().planned_entries_per_extent as usize);
+
+        let (victim, _) = pool.reclaim_candidates().oldest(CachePriority::Normal).unwrap();
+        assert_eq!(pool.entry_owners(victim).unwrap().len(), entry_count);
+        assert_eq!(
+            pool.directory_read_stats(),
+            DirectoryReadStats {
+                runs: 2,
+                bytes: (entry_count * ENTRY_OWNER_SIZE) as u64,
+            }
+        );
     }
 
     #[test]
@@ -1577,5 +1734,36 @@ mod tests {
 
         let reopened = ExtentPool::open(dir.path(), false, 1, Duration::ZERO, PAGE_SIZE * 4, PAGE_SIZE * 4).unwrap();
         assert!(reopened.state_snapshot().state_generation < state.state_generation);
+    }
+
+    #[test]
+    fn open_rejects_directory_truncation_below_the_durable_allocator_frontier() {
+        let dir = tempdir().unwrap();
+        let pool = create_pool(dir.path());
+        let key = key(1);
+        let value = vec![0x5a; 128];
+        let allocation = allocated(
+            pool.allocate(CachePriority::Normal, stored_entry_len(&key, &value).unwrap())
+                .unwrap(),
+        );
+        pool.write_batch(&[EntryWrite {
+            allocation,
+            key: &key,
+            key_digest: KeyDigest::for_key(&key),
+            value: &value,
+            content_digest: value_digest(&value),
+        }])
+        .unwrap();
+        pool.sync_payload().unwrap();
+        pool.checkpoint_state().unwrap();
+        pool.checkpoint_state().unwrap();
+        drop(pool);
+
+        let directory = open_cache_file(&dir.path().join(ENTRY_DIRECTORY_FILE), false, false).unwrap();
+        directory.set_len(0).unwrap();
+        directory.sync_data().unwrap();
+        drop(directory);
+
+        assert!(ExtentPool::open(dir.path(), false, 1, Duration::ZERO, PAGE_SIZE * 4, PAGE_SIZE * 4).is_err());
     }
 }

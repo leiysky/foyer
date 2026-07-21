@@ -2,7 +2,7 @@ use crc_fast::{CrcAlgorithm, Digest};
 
 use crate::{
     error::{Error, Result},
-    format::{CONTENT_DIGEST_SIZE, ContentDigest, PAGE_SIZE},
+    format::{CONTENT_DIGEST_SIZE, ContentDigest, MIN_STORED_ENTRY_SIZE, PAGE_SIZE},
     model::{CachePriority, KeyDigest},
     store::config::ExtentStoreConfig,
 };
@@ -17,7 +17,7 @@ const STATE_MAGIC: [u8; 8] = *b"SCSEGST1";
 ///
 /// Bump this when changing the balanced entry charge or extent size, layout derivation, record encoding,
 /// or an incompatible format in the embedded fixed-record index.
-pub const EXTENT_FORMAT_VERSION: u32 = 5;
+pub const EXTENT_FORMAT_VERSION: u32 = 6;
 const NO_EXTENT: u32 = u32::MAX;
 const FIXED_LSM_INDEX_BYTES_PER_ENTRY: u64 = 76;
 // One steady-state copy, one atomic compaction output, and one bounded WAL/L0 write tail.
@@ -32,13 +32,23 @@ const FIXED_LSM_INDEX_MAXIMUM_OVERHEAD: u64 = 16 * 1024 * 1024;
 pub struct StoreLayout {
     pub entry_charge: usize,
     pub extent_size: usize,
-    pub entries_per_extent: u32,
+    /// Entry count planned for directory and index capacity accounting.
+    pub planned_entries_per_extent: u32,
+    /// Maximum directory positions addressable inside one extent.
+    pub directory_entries_per_extent: u32,
     pub extent_count: u32,
-    pub max_entries: u64,
+    /// Planned live cardinality used only to derive soft metadata targets.
+    pub planned_max_entries: u64,
+    /// Absolute live cardinality bound implied by the Stored Entry format.
+    pub maximum_entries: u64,
     pub index_capacity_bytes: u64,
     pub data_file_size: u64,
+    /// Sparse logical size of the Entry directory.
     pub entry_directory_file_size: u64,
+    /// Planned physical directory budget included in configured cache capacity.
+    pub entry_directory_capacity_bytes: u64,
     pub state_copy_size: usize,
+    /// Planned hard allocation excluding the soft EntryIndex target.
     pub total_file_size: u64,
 }
 
@@ -61,39 +71,53 @@ impl StoreLayout {
                 "extent_size and entry charge must fit u32".to_string(),
             ));
         }
-        let entries_per_extent = extent_size / entry_charge;
-        let entries_per_extent = u32::try_from(entries_per_extent).map_err(|_| {
-            Error::InvalidConfig("extent contains more directory entries than u32 can represent".to_string())
-        })?;
+        let planned_entries_per_extent = extent_size / entry_charge;
+        let planned_entries_per_extent = u32::try_from(planned_entries_per_extent)
+            .map_err(|_| Error::InvalidConfig("extent planned entry count does not fit u32".to_string()))?;
+        let directory_entries_per_extent = extent_size / MIN_STORED_ENTRY_SIZE;
+        let directory_entries_per_extent = u32::try_from(directory_entries_per_extent)
+            .map_err(|_| Error::InvalidConfig("extent directory address space does not fit u32".to_string()))?;
         let maximum_extents = config.capacity_bytes / extent_size as u64;
         let maximum_extents = u32::try_from(maximum_extents).unwrap_or(u32::MAX);
 
         for extent_count in (5..=maximum_extents).rev() {
-            let physical_entry_records = u64::from(extent_count) * u64::from(entries_per_extent);
-            let max_entries = physical_entry_records - u64::from(entries_per_extent);
-            let index_capacity_bytes = index_capacity_for_entries(max_entries)?;
+            let planned_physical_entry_records = u64::from(extent_count) * u64::from(planned_entries_per_extent);
+            let planned_max_entries = planned_physical_entry_records - u64::from(planned_entries_per_extent);
+            let maximum_entries = u64::from(extent_count - 1)
+                .checked_mul(u64::from(directory_entries_per_extent))
+                .ok_or_else(|| invalid_layout("maximum Entry count overflows u64"))?;
+            let index_capacity_bytes = index_capacity_for_entries(planned_max_entries)?;
             let data_file_size = u64::from(extent_count)
                 .checked_mul(extent_size as u64)
                 .ok_or_else(|| invalid_layout("extent data file size overflows u64"))?;
-            let entry_directory_file_size = physical_entry_records
-                .checked_mul(ENTRY_OWNER_SIZE as u64)
+            let entry_directory_file_size = u64::from(extent_count)
+                .checked_mul(u64::from(directory_entries_per_extent))
+                .and_then(|entries| entries.checked_mul(ENTRY_OWNER_SIZE as u64))
                 .ok_or_else(|| invalid_layout("extent entry-directory file size overflows u64"))?;
+            let entry_directory_capacity_bytes = planned_physical_entry_records
+                .checked_mul(ENTRY_OWNER_SIZE as u64)
+                .ok_or_else(|| invalid_layout("planned entry-directory capacity overflows u64"))?;
             let state_copy_size = state_copy_size(extent_count)?;
-            let total_file_size = index_capacity_bytes
-                .checked_add(data_file_size)
-                .and_then(|size| size.checked_add(entry_directory_file_size))
+            // The EntryIndex capacity is a soft planning target. It is deliberately excluded here:
+            // FixedRecordLSM may overcommit it and cache payload must not be reduced as if the
+            // worst-case index were already allocated.
+            let total_file_size = data_file_size
+                .checked_add(entry_directory_capacity_bytes)
                 .and_then(|size| size.checked_add((state_copy_size * 2) as u64))
                 .ok_or_else(|| invalid_layout("extent store file size overflows u64"))?;
             if total_file_size <= config.capacity_bytes {
                 return Ok(Self {
                     entry_charge,
                     extent_size,
-                    entries_per_extent,
+                    planned_entries_per_extent,
+                    directory_entries_per_extent,
                     extent_count,
-                    max_entries,
+                    planned_max_entries,
+                    maximum_entries,
                     index_capacity_bytes,
                     data_file_size,
                     entry_directory_file_size,
+                    entry_directory_capacity_bytes,
                     state_copy_size,
                     total_file_size,
                 });
@@ -101,7 +125,7 @@ impl StoreLayout {
         }
 
         Err(Error::InvalidConfig(format!(
-            "extent store capacity must fit at least five {extent_size}-byte extents and their persistent index"
+            "extent store capacity must fit at least five {extent_size}-byte extents and their planned directory metadata"
         )))
     }
 
@@ -117,8 +141,8 @@ impl StoreLayout {
     }
 
     pub fn directory_index(self, extent: u32, entry: u32) -> Option<u64> {
-        (extent < self.extent_count && entry < self.entries_per_extent)
-            .then(|| u64::from(extent) * u64::from(self.entries_per_extent) + u64::from(entry))
+        (extent < self.extent_count && entry < self.directory_entries_per_extent)
+            .then(|| u64::from(extent) * u64::from(self.directory_entries_per_extent) + u64::from(entry))
     }
 
     pub fn discover(
@@ -134,24 +158,30 @@ impl StoreLayout {
             return None;
         }
         let extent_count = get_u32(state_copy, 12);
-        let entries_per_extent = get_u32(state_copy, 16);
+        let planned_entries_per_extent = get_u32(state_copy, 16);
         let entry_charge = usize::try_from(get_u32(state_copy, 20)).ok()?;
         let extent_size = usize::try_from(get_u64(state_copy, 56)).ok()?;
         if extent_count < 5
-            || entries_per_extent == 0
+            || planned_entries_per_extent == 0
             || entry_charge < PAGE_SIZE
             || !entry_charge.is_multiple_of(PAGE_SIZE)
-            || extent_size != entry_charge.checked_mul(entries_per_extent as usize)?
+            || extent_size != entry_charge.checked_mul(planned_entries_per_extent as usize)?
             || u32::try_from(extent_size).is_err()
         {
             return None;
         }
 
-        let physical_entry_records = u64::from(extent_count) * u64::from(entries_per_extent);
-        let max_entries = physical_entry_records.checked_sub(u64::from(entries_per_extent))?;
-        let expected_index = index_capacity_for_entries(max_entries).ok()?;
+        let directory_entries_per_extent = u32::try_from(extent_size / MIN_STORED_ENTRY_SIZE).ok()?;
+        let planned_physical_entry_records =
+            u64::from(extent_count).checked_mul(u64::from(planned_entries_per_extent))?;
+        let planned_max_entries = planned_physical_entry_records.checked_sub(u64::from(planned_entries_per_extent))?;
+        let maximum_entries = u64::from(extent_count - 1).checked_mul(u64::from(directory_entries_per_extent))?;
+        let expected_index = index_capacity_for_entries(planned_max_entries).ok()?;
         let expected_data = u64::from(extent_count).checked_mul(extent_size as u64)?;
-        let expected_directory = physical_entry_records.checked_mul(ENTRY_OWNER_SIZE as u64)?;
+        let expected_directory = u64::from(extent_count)
+            .checked_mul(u64::from(directory_entries_per_extent))?
+            .checked_mul(ENTRY_OWNER_SIZE as u64)?;
+        let entry_directory_capacity_bytes = planned_physical_entry_records.checked_mul(ENTRY_OWNER_SIZE as u64)?;
         let state_copy_size = state_copy_size(extent_count).ok()?;
         let expected_state = u64::try_from(state_copy_size.checked_mul(2)?).ok()?;
         if data_file_size != expected_data
@@ -161,19 +191,21 @@ impl StoreLayout {
         {
             return None;
         }
-        let total_file_size = expected_index
-            .checked_add(expected_data)?
-            .checked_add(expected_directory)?
+        let total_file_size = expected_data
+            .checked_add(entry_directory_capacity_bytes)?
             .checked_add(expected_state)?;
         Some(Self {
             entry_charge,
             extent_size,
-            entries_per_extent,
+            planned_entries_per_extent,
+            directory_entries_per_extent,
             extent_count,
-            max_entries,
+            planned_max_entries,
+            maximum_entries,
             index_capacity_bytes: expected_index,
             data_file_size: expected_data,
             entry_directory_file_size: expected_directory,
+            entry_directory_capacity_bytes,
             state_copy_size,
             total_file_size,
         })
@@ -284,7 +316,7 @@ impl ExtentPoolState {
         output[..8].copy_from_slice(&STATE_MAGIC);
         put_u32(&mut output, 8, EXTENT_FORMAT_VERSION);
         put_u32(&mut output, 12, layout.extent_count);
-        put_u32(&mut output, 16, layout.entries_per_extent);
+        put_u32(&mut output, 16, layout.planned_entries_per_extent);
         put_u32(
             &mut output,
             20,
@@ -322,7 +354,7 @@ impl ExtentPoolState {
         }
         if get_u32(input, 8) != EXTENT_FORMAT_VERSION
             || get_u32(input, 12) != layout.extent_count
-            || get_u32(input, 16) != layout.entries_per_extent
+            || get_u32(input, 16) != layout.planned_entries_per_extent
             || get_u32(input, 20) as usize != layout.entry_charge
             || get_u64(input, 56) != layout.extent_size as u64
         {
@@ -372,7 +404,7 @@ impl ExtentPoolState {
             if state.generation == 0
                 || state.used_bytes as usize > layout.extent_size
                 || !(state.used_bytes as usize).is_multiple_of(PAGE_SIZE)
-                || state.entries > layout.entries_per_extent
+                || state.entries > layout.directory_entries_per_extent
             {
                 return Err(invalid_layout("extent allocator entry is invalid"));
             }
@@ -540,16 +572,32 @@ mod tests {
     fn layout_reserves_one_extent_and_fits_the_capacity() {
         let layout = layout();
         assert!(layout.extent_count >= 5);
-        assert_eq!(layout.entries_per_extent, 64);
-        assert_eq!(layout.max_entries, u64::from(layout.extent_count - 1) * 64);
+        assert_eq!(layout.planned_entries_per_extent, 64);
+        assert_eq!(
+            layout.directory_entries_per_extent,
+            u32::try_from(layout.extent_size / MIN_STORED_ENTRY_SIZE).unwrap()
+        );
+        assert_eq!(layout.planned_max_entries, u64::from(layout.extent_count - 1) * 64);
+        assert_eq!(
+            layout.maximum_entries,
+            u64::from(layout.extent_count - 1) * u64::from(layout.directory_entries_per_extent)
+        );
         assert!(layout.total_file_size <= 16 * 1024 * 1024);
         assert_eq!(
+            layout.total_file_size,
+            layout.data_file_size + layout.entry_directory_capacity_bytes + (layout.state_copy_size * 2) as u64
+        );
+        assert!(layout.total_file_size + layout.index_capacity_bytes > 16 * 1024 * 1024);
+        assert_eq!(
             layout.index_capacity_bytes,
-            index_capacity_for_entries(layout.max_entries).unwrap()
+            index_capacity_for_entries(layout.planned_max_entries).unwrap()
         );
         assert_eq!(layout.locate_data_offset((PAGE_SIZE * 64 + 1) as u64), Some((1, 1)));
         assert_eq!(layout.data_offset(1, 1), Some((PAGE_SIZE * 64 + 1) as u64));
-        assert_eq!(layout.directory_index(1, 1), Some(65));
+        assert_eq!(
+            layout.directory_index(1, 1),
+            Some(u64::from(layout.directory_entries_per_extent) + 1)
+        );
     }
 
     #[test]
@@ -575,7 +623,6 @@ mod tests {
             ),
             Some(layout)
         );
-
         let mut previous_version = encoded.clone();
         put_u32(&mut previous_version, 8, EXTENT_FORMAT_VERSION - 1);
         assert_eq!(

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 const GOLDEN_RATIO: u64 = 0x9e37_79b9_7f4a_7c15;
 
 /// A reproducible, allocation-free pseudorandom permutation of `0..len`.
@@ -83,6 +85,18 @@ pub const fn random_word(seed: u64, stream: u64, counter: u64) -> u64 {
 pub fn random_below(seed: u64, stream: u64, counter: u64, upper: u64) -> u64 {
     assert!(upper > 0, "random upper bound must be positive");
     ((u128::from(random_word(seed, stream, counter)) * u128::from(upper)) >> 64) as u64
+}
+
+/// Sample one deterministic exponential inter-arrival and cap it at eight times the mean.
+pub fn randomized_put_interval(mean: Duration, seed: u64, stream: u64, operation: u64) -> Duration {
+    assert!(!mean.is_zero(), "put arrival mean must be positive");
+    // Use the high 53 random bits to construct an open-interval uniform variate. Exponential
+    // inter-arrivals form a Poisson process; the 8x cap bounds a single test pause while retaining
+    // more than 99.9% of the unbounded distribution.
+    let mantissa = random_word(seed, stream, operation) >> 11;
+    let unit = (mantissa as f64 + 0.5) / (1_u64 << 53) as f64;
+    let multiple = (-(1.0 - unit).ln()).min(8.0);
+    Duration::from_secs_f64(mean.as_secs_f64() * multiple)
 }
 
 /// Build a fixed quantile table for a positive, bounded log-normal size distribution.

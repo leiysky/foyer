@@ -1,5 +1,34 @@
 use crate::model::CachePriority;
 
+/// Cumulative buffered reads issued against the sparse Entry directory.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DirectoryReadStats {
+    pub runs: u64,
+    pub bytes: u64,
+}
+
+/// Immutable capacity and cardinality decisions for one Extent layout.
+///
+/// `planned_file_bytes` is the hard space planned inside the configured cache capacity. The
+/// EntryIndex target and directory address space are deliberately reported separately because
+/// both may overcommit their planning targets without rejecting a cache write.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ExtentLayoutStats {
+    pub configured_capacity_bytes: u64,
+    pub planned_file_bytes: u64,
+    pub data_file_bytes: u64,
+    pub usable_payload_bytes: u64,
+    pub index_soft_capacity_bytes: u64,
+    pub directory_planned_bytes: u64,
+    pub directory_logical_bytes: u64,
+    pub extent_size_bytes: u64,
+    pub physical_extents: u64,
+    pub usable_extents: u64,
+    pub entry_charge_bytes: u64,
+    pub planned_live_entries: u64,
+    pub maximum_live_entries: u64,
+}
+
 /// A point-in-time view of physical extent ownership by cache priority.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ExtentOccupancy {
@@ -67,12 +96,16 @@ impl ExtentOccupancy {
 pub struct PhysicalWriteStats {
     pub data_runs: u64,
     pub data_bytes: u64,
+    pub data_syncs: u64,
     pub entry_directory_runs: u64,
     pub entry_directory_bytes: u64,
+    pub entry_directory_syncs: u64,
     pub index_runs: u64,
     pub index_bytes: u64,
+    pub index_syncs: u64,
     pub allocator_runs: u64,
     pub allocator_bytes: u64,
+    pub allocator_syncs: u64,
 }
 
 impl PhysicalWriteStats {
@@ -93,12 +126,16 @@ impl PhysicalWriteStats {
     pub(crate) fn merge(&mut self, other: Self) {
         self.data_runs = self.data_runs.saturating_add(other.data_runs);
         self.data_bytes = self.data_bytes.saturating_add(other.data_bytes);
+        self.data_syncs = self.data_syncs.saturating_add(other.data_syncs);
         self.entry_directory_runs = self.entry_directory_runs.saturating_add(other.entry_directory_runs);
         self.entry_directory_bytes = self.entry_directory_bytes.saturating_add(other.entry_directory_bytes);
+        self.entry_directory_syncs = self.entry_directory_syncs.saturating_add(other.entry_directory_syncs);
         self.index_runs = self.index_runs.saturating_add(other.index_runs);
         self.index_bytes = self.index_bytes.saturating_add(other.index_bytes);
+        self.index_syncs = self.index_syncs.saturating_add(other.index_syncs);
         self.allocator_runs = self.allocator_runs.saturating_add(other.allocator_runs);
         self.allocator_bytes = self.allocator_bytes.saturating_add(other.allocator_bytes);
+        self.allocator_syncs = self.allocator_syncs.saturating_add(other.allocator_syncs);
     }
 }
 
@@ -109,6 +146,17 @@ pub struct ReclaimStats {
     promoted_entries: [usize; 3],
     evicted_bytes: [usize; 3],
     promoted_bytes: [usize; 3],
+    scanned_entries: u64,
+    directory_read_runs: u64,
+    directory_read_bytes: u64,
+    index_lookups: u64,
+    preparation_nanos: u64,
+    directory_scan_nanos: u64,
+    index_lookup_nanos: u64,
+    transaction_nanos: u64,
+    promotion_nanos: u64,
+    publication_nanos: u64,
+    total_nanos: u64,
 }
 
 impl ReclaimStats {
@@ -152,6 +200,50 @@ impl ReclaimStats {
         sum_priority_counts(self.promoted_bytes)
     }
 
+    pub const fn scanned_entries(self) -> u64 {
+        self.scanned_entries
+    }
+
+    pub const fn directory_read_runs(self) -> u64 {
+        self.directory_read_runs
+    }
+
+    pub const fn directory_read_bytes(self) -> u64 {
+        self.directory_read_bytes
+    }
+
+    pub const fn index_lookups(self) -> u64 {
+        self.index_lookups
+    }
+
+    pub const fn directory_scan_nanos(self) -> u64 {
+        self.directory_scan_nanos
+    }
+
+    pub const fn preparation_nanos(self) -> u64 {
+        self.preparation_nanos
+    }
+
+    pub const fn index_lookup_nanos(self) -> u64 {
+        self.index_lookup_nanos
+    }
+
+    pub const fn transaction_nanos(self) -> u64 {
+        self.transaction_nanos
+    }
+
+    pub const fn promotion_nanos(self) -> u64 {
+        self.promotion_nanos
+    }
+
+    pub const fn publication_nanos(self) -> u64 {
+        self.publication_nanos
+    }
+
+    pub const fn total_nanos(self) -> u64 {
+        self.total_nanos
+    }
+
     pub(crate) fn record(
         &mut self,
         priority: CachePriority,
@@ -168,6 +260,33 @@ impl ReclaimStats {
         self.promoted_bytes[priority] = self.promoted_bytes[priority].saturating_add(promoted_bytes);
     }
 
+    pub(crate) fn record_work(
+        &mut self,
+        scanned_entries: u64,
+        directory_read_runs: u64,
+        directory_read_bytes: u64,
+        index_lookups: u64,
+        preparation_nanos: u64,
+        directory_scan_nanos: u64,
+        index_lookup_nanos: u64,
+        transaction_nanos: u64,
+        promotion_nanos: u64,
+        publication_nanos: u64,
+        total_nanos: u64,
+    ) {
+        self.scanned_entries = self.scanned_entries.saturating_add(scanned_entries);
+        self.directory_read_runs = self.directory_read_runs.saturating_add(directory_read_runs);
+        self.directory_read_bytes = self.directory_read_bytes.saturating_add(directory_read_bytes);
+        self.index_lookups = self.index_lookups.saturating_add(index_lookups);
+        self.preparation_nanos = self.preparation_nanos.saturating_add(preparation_nanos);
+        self.directory_scan_nanos = self.directory_scan_nanos.saturating_add(directory_scan_nanos);
+        self.index_lookup_nanos = self.index_lookup_nanos.saturating_add(index_lookup_nanos);
+        self.transaction_nanos = self.transaction_nanos.saturating_add(transaction_nanos);
+        self.promotion_nanos = self.promotion_nanos.saturating_add(promotion_nanos);
+        self.publication_nanos = self.publication_nanos.saturating_add(publication_nanos);
+        self.total_nanos = self.total_nanos.saturating_add(total_nanos);
+    }
+
     pub(crate) fn merge(&mut self, other: Self) {
         for priority in 0..3 {
             self.reclaimed_extents[priority] =
@@ -180,6 +299,17 @@ impl ReclaimStats {
             self.promoted_bytes[priority] =
                 self.promoted_bytes[priority].saturating_add(other.promoted_bytes[priority]);
         }
+        self.scanned_entries = self.scanned_entries.saturating_add(other.scanned_entries);
+        self.directory_read_runs = self.directory_read_runs.saturating_add(other.directory_read_runs);
+        self.directory_read_bytes = self.directory_read_bytes.saturating_add(other.directory_read_bytes);
+        self.index_lookups = self.index_lookups.saturating_add(other.index_lookups);
+        self.preparation_nanos = self.preparation_nanos.saturating_add(other.preparation_nanos);
+        self.directory_scan_nanos = self.directory_scan_nanos.saturating_add(other.directory_scan_nanos);
+        self.index_lookup_nanos = self.index_lookup_nanos.saturating_add(other.index_lookup_nanos);
+        self.transaction_nanos = self.transaction_nanos.saturating_add(other.transaction_nanos);
+        self.promotion_nanos = self.promotion_nanos.saturating_add(other.promotion_nanos);
+        self.publication_nanos = self.publication_nanos.saturating_add(other.publication_nanos);
+        self.total_nanos = self.total_nanos.saturating_add(other.total_nanos);
     }
 }
 

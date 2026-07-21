@@ -27,7 +27,7 @@ Stored Entry
   -> contiguous byte allocation
   -> page-aligned publication frame
   -> cache extent (append and reclaim unit)
-  -> preallocated data/directory files
+  -> preallocated data file plus sparse Entry directory
 ```
 
 Range parsing and application-level assembly belong above this store. One Entry always has one
@@ -41,7 +41,7 @@ The store directory contains:
 | Path | Role |
 | --- | --- |
 | `data` | Preallocated packed Stored Entry bytes |
-| `directory` | One fixed directory record per Entry allocation |
+| `directory` | Sparse address space with one fixed record per Entry allocation |
 | `state` | Two alternating checksummed allocator-state copies |
 | `index-lsm/` | FixedRecordLSM WAL, manifests, and SSTs |
 
@@ -50,16 +50,24 @@ value length, 88-bit value-content digest, sequence, and priority. The record it
 Reclaim enumerates this compact sidecar instead of reading the entire payload extent. Exact key
 validation remains in the Stored Entry.
 
-The capacity calculation includes all four components. One extent is excluded from usable
-capacity as reclaim headroom, and fewer than five physical extents are rejected. Allocation is
-bounded by both packed payload bytes and directory entries. The 4 KiB minimum Entry charge derives
-the maximum Entry count without rounding physical allocations. The index capacity target is derived
-from that count and plans for three regions: one steady-state index copy, one atomic compaction
-output copy, and one WAL/L0 write tail. WAL append, manifest replacement, flush output, and
-compaction output remain fully accounted, but this target is soft: transient or sustained
-overcommit is reported as pressure and never by itself rejects a cache write. Obsolete bytes are
-released only after unlink and directory sync, preserving exact usage without turning an estimate
-into a cache-health boundary.
+The hard layout calculation includes the preallocated data file, a directory budget based on the
+4 KiB Entry planning charge, and both allocator-state copies. One extent is excluded from usable
+payload capacity as reclaim headroom, and fewer than five physical extents are rejected. The
+EntryIndex capacity target is deliberately excluded from this hard calculation: it plans one
+steady-state index copy, one atomic compaction output copy, and one WAL/L0 write tail, but remains a
+soft target.
+
+Physical allocation is bounded by packed payload bytes, not by the planning charge. The directory
+therefore uses a sparse logical address space large enough for the theoretical maximum number of
+valid Stored Entries (header plus a one-byte key and one-byte value). Small Entries may exceed the
+planned cardinality without being rejected; only the directory blocks actually written consume
+space. Creation establishes the complete logical address space with one sentinel positional write
+at its final byte rather than `ftruncate`; this preserves holes on filesystems that otherwise
+allocate an extended range eagerly. Directory and EntryIndex usage can consequently exceed their
+planning targets, and that overcommit is reported as pressure rather than converted into a
+cache-health boundary. The host
+filesystem remains the real allocation limit. Index reservations include transient overlap and
+release obsolete bytes only after unlink and directory sync, preserving exact usage accounting.
 
 ## Lookup
 
@@ -80,6 +88,10 @@ read Entry-directory metadata, so a hot index lookup does not add a sidecar I/O.
 Directory records exist for reclaim and tail recovery, not foreground lookup. Any stale, torn, or
 mismatched location is a miss/error boundary, never an unverified hit. There is deliberately no
 second batch-read implementation beside Foyer's point-load interface.
+
+Reclaim and tail recovery read directory records in bounded 64 KiB runs and decode them in memory.
+The run bound prevents a high-cardinality extent from allocating an unbounded buffer while avoiding
+the former one-`pread`-per-Entry syscall pattern.
 
 Run limits are runtime syscall-batching controls, not persistent-layout boundaries. A point read
 allocates only the covering range for that Entry, capped per syscall; setting a 2 MiB maximum does
@@ -122,8 +134,9 @@ under the mutation lock and releases it.
 The value-content digest is computed once on submission and stored in both the directory record and
 index location. A repeated key, encoded length, digest, and priority is idempotent without reading
 the old payload. The previous V4 CRC32 shortcut could suppress an update for an easily constructed
-collision; V5 uses an 88-bit seeded XXH3 identity while retaining the same 32-byte location and
-64-byte directory record sizes. The complete key is still compared on every returned hit.
+collision; V5 introduced an 88-bit seeded XXH3 identity, retained by V6, while keeping the same
+32-byte location and 64-byte directory record sizes. The complete key is still compared on every
+returned hit.
 
 Durable checkpoint order is:
 
@@ -200,7 +213,7 @@ accounting, and rejected index implementations are specified in
 
 ## Failure model
 
-- A frozen V3 fixture covers the former payload, owner, allocator, manifest, and WAL layout. V5 must
+- A frozen V3 fixture covers the former payload, owner, allocator, manifest, and WAL layout. V6 must
   reject it and the explicit recreate path must remove legacy owned files before creating the new
   directory layout. Current-format tests separately cover append, reopen, active-tail recovery,
   reclaim, and process abort.
@@ -216,14 +229,15 @@ accounting, and rejected index implementations are specified in
 ## Design rationale and rejected alternatives
 
 - **Fixed allocation slots** simplified alignment but imposed severe tail padding on small Entries.
-  V5 packs exact byte ranges and uses page alignment only for physical I/O frames.
+  The packed layout introduced in V5 and retained by V6 uses page alignment only for physical I/O
+  frames.
 - **Cross-extent Entry descriptors** would reduce boundary waste but make reads, reclaim, and crash
   recovery span multiple generations. Extent seals the current cache extent instead.
 - **Payload scanning during reclaim or recovery** would remove the Entry directory at the cost of a
   full payload read. The compact sidecar keeps these paths bounded without entering foreground
   lookup.
 - **One directory record per page or slot** duplicates Entry identity and inflates index cardinality.
-  V5 stores one directory record and one EntryIndex location per complete Entry.
+  The packed layout stores one directory record and one EntryIndex location per complete Entry.
 - **Fixed priority partitions** strand capacity when one class is idle. Borrowable floors preserve
   minimum residency while allowing repayment under later demand.
 - **An independent background reclaimer** would race the total mutation order and generation
