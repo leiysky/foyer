@@ -1,6 +1,6 @@
 # ExtentEngine storage validation closeout
 
-Date: 2026-07-20; V5 upstream-port rerun: 2026-07-21
+Date: 2026-07-20; V5 upstream-port and large-value reruns: 2026-07-21
 
 > The original sections are the historical V3 baseline. The current implementation uses an
 > incompatible packed V5 layout. The 2026-07-21 section below repeats the random write-throughput,
@@ -11,10 +11,11 @@ Current behavior is specified by the [architecture](architecture.md),
 [ExtentStore](extent-store.md), and [EntryIndex](entry-index.md) design documents. This report is
 dated evidence and does not override them.
 
-The original V3 result closed the synthetic development-host performance phase. The V5 rerun below
-confirms the main performance and retention conclusions on the upstream-based port. ExtentEngine
-has enough evidence to enter an opt-in ScopeDB production canary with BlockEngine as the rollback
-path. It is not yet evidence for making ExtentEngine the unconditional default.
+The original V3 result closed the synthetic development-host performance phase. The V5 small-value
+rerun below confirms the main performance and retention conclusions on the upstream-based port; the
+200 GiB large-value rerun bounds where those conclusions apply. ExtentEngine has enough evidence to
+enter an opt-in ScopeDB production canary with BlockEngine as the rollback path. It is not yet
+evidence for making ExtentEngine the unconditional default.
 
 ## V5 upstream-main port validation (2026-07-21)
 
@@ -132,14 +133,90 @@ using 47.6% less peak RSS over the complete write/read process. Production evalu
 recovery latency and recovery RSS as separate metrics rather than assuming that one predicts the
 other.
 
+### 200 GiB bounded log-normal large-value validation
+
+The second V5 campaign tested whether the small-value result survives a ScopeDB-like large-value
+tail. A symmetric Gaussian is not a well-defined size model from only a median and maximum, and it
+admits negative samples. The benchmark therefore used a positive bounded log-normal distribution:
+minimum 1 KiB, p50 64 KiB, unbounded p99.9 mapped to 1 MiB, and a hard 1 MiB maximum. Its 65,536
+entry quantile table is deterministic and fingerprinted as `3f1fa85d4f9ce725`.
+
+- Candidate: `a1fb70a`; the binary SHA-256 was
+  `3ccdb8e3c8035c92235b729e3d935e0487601017e27b8b7d57f96571facfee78`.
+- Each run offered 200 GiB into a 128 GiB cache, retaining the 256 MiB memory budget, 512 MiB write
+  queue, 64 MiB write wave, direct I/O, key-size distribution, priority mix, concurrency, random
+  permutation, warmup, and measured-read count from the smaller campaign.
+- The same three seeds produced 2,197,844, 2,201,993, and 2,200,252 entries. Observed
+  p50/p95/p99/p99.9/max sizes were 64/280/514-517/1024/1024 KiB.
+- Engine order alternated for the first two seeds. The third seed ran Block and Extent in separate
+  processes so their full-run high-water RSS values would be independent. The page cache was
+  dropped before every independent full run and every cold-recovery trial.
+
+Write medians show that Extent's advantage is workload-dependent:
+
+| Metric | Block | Extent | Extent delta |
+| --- | ---: | ---: | ---: |
+| Foreground time | 10.698 s | 9.850 s | -7.9% |
+| Drain time | 521.465 s | 525.667 s | +0.8% |
+| End-to-end time | 532.163 s | 535.249 s | +0.6% |
+| End-to-end throughput | 384.8 MiB/s | 382.6 MiB/s | -0.6% |
+| Physical write traffic | 210,268.0 MiB | 211,302.6 MiB | +0.5% |
+| Write amplification | 1.027 | 1.032 | +0.5% |
+| Physical write operations | 41,127 | 264,701 | +543.6% |
+| Allocated footprint | 130,433.2 MiB | 124,415.0 MiB | -4.6% |
+| Independent full-run peak RSS (`a409`) | 1,692 MiB | 861 MiB | -49.1% |
+
+The result does not indicate a capacity-limit rejection bug: all three Extent runs accepted and
+completed every initial put with zero dropped, shutdown-dropped, shed, storage-rejected, or failed
+batches. Large values instead amortize Block's fixed per-record overhead. Extent's median directory,
+index, and allocator traffic totals only 860.7 MiB, or 0.42% of offered payload, but its physical
+write shape is much finer. Block averaged 5.11 MiB per write operation; Extent averaged 0.80 MiB
+and issued 6.44 times as many operations. On this NVMe device that produces a small 0.6%
+end-to-end regression rather than the small-value workload's 34% gain.
+
+Retention remains the architectural advantage, while the large-value read path exposes a new gate:
+
+| Metric | Block | Extent | Extent delta |
+| --- | ---: | ---: | ---: |
+| Overall hit ratio | 51.6% | 59.5% | +7.9 percentage points |
+| Low-priority hit ratio | 51.7% | 32.2% | -19.5 percentage points |
+| Normal-priority hit ratio | 51.5% | 100.0% | +48.5 percentage points |
+| High-priority hit ratio | 51.8% | 100.0% | +48.2 percentage points |
+| Hit-payload throughput | 489.5 MiB/s | 481.7 MiB/s | -1.6% |
+| Storage-hit p50 | 666 us | 555 us | -16.7% |
+| Storage-hit p95 | 1,540 us | 1,993 us | +29.4% |
+| Storage-hit p99 | 2,247 us | 3,488 us | +55.2% |
+| Storage-hit p99.9 | 2,986 us | 6,624 us | +121.8% |
+| Physical read operations | 258,135 | 601,857 | +133.2% |
+
+Extent performed about 2.02 payload runs and 24.8 data-frame reads per hit, while Block issued one
+physical read per hit. Extent's index read only about 7.4 MiB in 941 operations at the median and
+its false-positive rate was 0.049%, so the index is not the source of the tail. The payload
+split/read-run layout is the leading explanation. A ScopeDB canary must therefore record latency by
+value-size bucket and the payload-run/frame counts per hit; if production resembles this
+distribution, p95/p99/p99.9 read latency is a blocker for making Extent the default until the read
+layout is coalesced or otherwise bounded.
+
+Three cold opens per engine and seed had global medians of 1.703 seconds and 197 MiB for Block,
+versus 0.021 seconds and 68 MiB for Extent. Extent was about 81.1 times faster and used 65.5% less
+recovery RSS at this scale. All measured reads returned zero errors and zero invalid values.
+
+The generated images were deliberately deleted after the recovery trials. Raw logs, deterministic
+scenario metadata, and checksums are retained outside the repository at:
+
+```text
+/Users/leiysky/.codex/archives/extent-engine/2026-07-21-lognormal-200g
+```
+
 ### V5 port decision
 
-The upstream-based port passes the synthetic write, capacity-retention, read-tail, and bounded
-recovery gates. The performance gap is not an unexplained benchmark artifact: it comes primarily
-from 25.1% less physical write traffic and priority-aware retention. The Block #1296 recovery patch
-should be retained during rebase. Extent remains an opt-in canary candidate rather than an
-unconditional default until the port has fresh process-abort coverage, a long reclaim soak, and a
-production-shaped hit-only read comparison.
+The upstream-based port passes the synthetic correctness, capacity-retention, and bounded-recovery
+gates. Its write result is not universal: Extent is 34.0% faster for the 4/8/16 KiB workload and
+0.6% slower for the bounded large-value workload. Priority-aware retention remains valuable, but
+the latter workload's p95 and higher read tail does not pass an unconditional default gate. The
+Block #1296 recovery patch should be retained during rebase. Extent remains an opt-in canary
+candidate until production value-size-weighted metrics pass, the large-value payload-read layout is
+bounded, and the port has fresh process-abort coverage and a long reclaim soak.
 
 Raw logs and checksums are intentionally outside the repository at:
 
