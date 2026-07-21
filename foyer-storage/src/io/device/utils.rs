@@ -22,8 +22,6 @@ pub fn get_dev_capacity(path: impl AsRef<std::path::Path>) -> foyer_common::erro
 
 #[cfg(target_os = "linux")]
 fn get_dev_capacity_fd(fd: std::os::fd::RawFd) -> foyer_common::error::Result<usize> {
-    use foyer_common::error::{Error, ErrorKind};
-
     const BLKGETSIZE64: libc::c_ulong = 0x80081272;
 
     let mut size: u64 = 0;
