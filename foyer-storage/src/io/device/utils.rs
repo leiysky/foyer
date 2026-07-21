@@ -14,51 +14,101 @@
 
 #[cfg(unix)]
 pub fn get_dev_capacity(path: impl AsRef<std::path::Path>) -> foyer_common::error::Result<usize> {
-    use foyer_common::error::Error;
-
-    const BLKGETSIZE64: u64 = 0x80081272;
-    const DIOCGMEDIASIZE: u64 = 0x40086481;
-    const DKIOCGETBLOCKSIZE: u64 = 0x40046418;
-    const DKIOCGETBLOCKCOUNT: u64 = 0x40046419;
-
     use std::{fs::File, os::fd::AsRawFd};
 
     let file = File::open(path.as_ref())?;
-    let fd = file.as_raw_fd();
+    get_dev_capacity_fd(file.as_raw_fd())
+}
 
-    if cfg!(target_os = "linux") {
-        let mut size: u64 = 0;
-        let res = unsafe { libc::ioctl(fd, BLKGETSIZE64, &mut size) };
-        if res != 0 {
-            return Err(std::io::Error::from_raw_os_error(res).into());
-        }
-        Ok(size as usize)
-    } else if cfg!(target_os = "freebsd") {
-        let mut size: u32 = 0;
-        let res = unsafe { libc::ioctl(fd, DIOCGMEDIASIZE, &mut size) };
-        if res != 0 {
-            return Err(std::io::Error::from_raw_os_error(res).into());
-        }
-        Ok(size as usize)
-    } else if cfg!(target_os = "macos") {
-        let mut block_size: u64 = 0;
-        let mut block_count: u64 = 0;
-        let res = unsafe { libc::ioctl(fd, DKIOCGETBLOCKSIZE, &mut block_size) };
-        if res != 0 {
-            return Err(std::io::Error::from_raw_os_error(res).into());
-        }
-        let res = unsafe { libc::ioctl(fd, DKIOCGETBLOCKCOUNT, &mut block_count) };
-        if res != 0 {
-            return Err(std::io::Error::from_raw_os_error(res).into());
-        }
-        let size = block_size * block_count;
-        Ok(size as usize)
-    } else {
-        use foyer_common::error::ErrorKind;
+#[cfg(target_os = "linux")]
+fn get_dev_capacity_fd(fd: std::os::fd::RawFd) -> foyer_common::error::Result<usize> {
+    use foyer_common::error::{Error, ErrorKind};
 
-        Err(Error::new(
-            ErrorKind::Unsupported,
-            "get_dev_capacity() is not supported on this platform".to_string(),
-        ))
+    const BLKGETSIZE64: libc::c_ulong = 0x80081272;
+
+    let mut size: u64 = 0;
+    let res = unsafe { libc::ioctl(fd, BLKGETSIZE64, &mut size) };
+    if res == -1 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    capacity_to_usize(size)
+}
+
+#[cfg(target_os = "freebsd")]
+fn get_dev_capacity_fd(fd: std::os::fd::RawFd) -> foyer_common::error::Result<usize> {
+    use foyer_common::error::{Error, ErrorKind};
+
+    const DIOCGMEDIASIZE: libc::c_ulong = 0x40086481;
+
+    let mut size: libc::off_t = 0;
+    let res = unsafe { libc::ioctl(fd, DIOCGMEDIASIZE, &mut size) };
+    if res == -1 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let size = u64::try_from(size)
+        .map_err(|_| Error::new(ErrorKind::OutOfRange, format!("device capacity {size} is negative")))?;
+    capacity_to_usize(size)
+}
+
+#[cfg(target_os = "macos")]
+fn get_dev_capacity_fd(fd: std::os::fd::RawFd) -> foyer_common::error::Result<usize> {
+    use foyer_common::error::{Error, ErrorKind};
+
+    const DKIOCGETBLOCKSIZE: libc::c_ulong = 0x40046418;
+    const DKIOCGETBLOCKCOUNT: libc::c_ulong = 0x40086419;
+
+    let mut block_size: u32 = 0;
+    let mut block_count: u64 = 0;
+    let res = unsafe { libc::ioctl(fd, DKIOCGETBLOCKSIZE, &mut block_size) };
+    if res == -1 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let res = unsafe { libc::ioctl(fd, DKIOCGETBLOCKCOUNT, &mut block_count) };
+    if res == -1 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let size = u64::from(block_size).checked_mul(block_count).ok_or_else(|| {
+        Error::new(
+            ErrorKind::OutOfRange,
+            format!("device geometry {block_size} * {block_count} overflows u64"),
+        )
+    })?;
+    capacity_to_usize(size)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))))]
+fn get_dev_capacity_fd(_: std::os::fd::RawFd) -> foyer_common::error::Result<usize> {
+    use foyer_common::error::{Error, ErrorKind};
+
+    Err(Error::new(
+        ErrorKind::Unsupported,
+        "get_dev_capacity() is not supported on this platform".to_string(),
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+fn capacity_to_usize(size: u64) -> foyer_common::error::Result<usize> {
+    use foyer_common::error::{Error, ErrorKind};
+
+    usize::try_from(size).map_err(|_| {
+        Error::new(
+            ErrorKind::OutOfRange,
+            format!("device capacity {size} does not fit in usize"),
+        )
+    })
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
+mod tests {
+    use foyer_common::error::ErrorKind;
+
+    use super::*;
+
+    #[test]
+    fn regular_file_reports_the_ioctl_error() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let error = get_dev_capacity(file.path()).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::Io);
     }
 }

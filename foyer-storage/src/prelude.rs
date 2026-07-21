@@ -17,7 +17,7 @@ pub use crate::io::engine::uring::{UringIoEngine, UringIoEngineConfig};
 pub use crate::{
     compress::Compression,
     engine::{
-        Engine, EngineBuildContext, EngineConfig, Load, Populated, RecoverMode,
+        Engine, EngineBuildContext, EngineConfig, Load, Populated, RecoverMode, StorageUsage,
         block::{
             engine::BlockEngineConfig,
             eviction::{EvictionInfo, EvictionPicker, FifoPicker, InvalidRatioPicker},
@@ -29,6 +29,7 @@ pub use crate::{
         conditions::{AdmitAll, EstimatedSize, RejectAll},
     },
     io::{
+        control::IoControl,
         device::{
             Device, DeviceBuilder, RawFile,
             combined::CombinedDeviceBuilder,
@@ -45,5 +46,6 @@ pub use crate::{
             psync::{PsyncIoEngine, PsyncIoEngineConfig},
         },
     },
+    keeper::PieceRef,
     store::{Store, StoreBuilder},
 };

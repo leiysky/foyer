@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod bytes;
+pub mod control;
 pub mod device;
 pub mod engine;
 

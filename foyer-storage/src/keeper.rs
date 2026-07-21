@@ -12,20 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{fmt::Debug, hash::Hash, ops::Deref, sync::Arc};
+use std::{
+    fmt::Debug,
+    hash::Hash,
+    ops::Deref,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use foyer_common::code::StorageKey;
 use foyer_memory::Piece;
 use hashbrown::hash_table::{Entry as HashTableEntry, HashTable};
 use parking_lot::RwLock;
 
-type Shard<K, V, P> = HashTable<Piece<K, V, P>>;
+struct KeptPiece<K, V, P> {
+    piece: Piece<K, V, P>,
+    generation: u64,
+}
+
+type Shard<K, V, P> = HashTable<KeptPiece<K, V, P>>;
 
 struct Inner<K, V, P>
 where
     K: StorageKey,
 {
     shards: Vec<Arc<RwLock<Shard<K, V, P>>>>,
+    next_generation: AtomicU64,
 }
 
 pub struct Keeper<K, V, P>
@@ -53,28 +67,45 @@ where
     pub fn new(shards: usize) -> Self {
         let shards = (0..shards).map(|_| Arc::new(RwLock::new(Shard::default()))).collect();
         Self {
-            inner: Arc::new(Inner { shards }),
+            inner: Arc::new(Inner {
+                shards,
+                next_generation: AtomicU64::new(1),
+            }),
         }
     }
 
     pub fn insert(&self, piece: Piece<K, V, P>) -> PieceRef<K, V, P> {
         let shard = self.shard(piece.hash());
+        let generation = self
+            .inner
+            .next_generation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
+                generation.checked_add(1)
+            })
+            .expect("pending-write keeper generation is exhausted");
 
         match shard
             .write()
-            .entry(piece.hash(), |p| piece.key() == p.key(), |p| p.hash())
+            .entry(piece.hash(), |p| piece.key() == p.piece.key(), |p| p.piece.hash())
         {
             HashTableEntry::Occupied(mut o) => {
-                *o.get_mut() = piece.clone();
+                *o.get_mut() = KeptPiece {
+                    piece: piece.clone(),
+                    generation,
+                };
             }
             HashTableEntry::Vacant(v) => {
-                v.insert(piece.clone());
+                v.insert(KeptPiece {
+                    piece: piece.clone(),
+                    generation,
+                });
             }
         }
 
         PieceRef {
             piece,
             shard: Some(shard),
+            generation,
         }
     }
 
@@ -84,7 +115,9 @@ where
     {
         let shard = self.shard(hash);
         let shard = shard.read();
-        shard.find(hash, |p| key.equivalent(p.key())).cloned()
+        shard
+            .find(hash, |p| key.equivalent(p.piece.key()))
+            .map(|p| p.piece.clone())
     }
 
     fn shard(&self, hash: u64) -> Arc<RwLock<Shard<K, V, P>>> {
@@ -93,6 +126,9 @@ where
     }
 }
 
+/// A retained cache piece submitted to a disk engine.
+///
+/// Dropping this reference removes the piece from the pending-write keeper.
 pub struct PieceRef<K, V, P>
 where
     K: StorageKey,
@@ -100,6 +136,7 @@ where
     piece: Piece<K, V, P>,
     // TODO(MrCroxx): Remove `Option`?
     shard: Option<Arc<RwLock<Shard<K, V, P>>>>,
+    generation: u64,
 }
 
 impl<K, V, P> Debug for PieceRef<K, V, P>
@@ -127,7 +164,11 @@ where
     K: StorageKey,
 {
     fn from(piece: Piece<K, V, P>) -> Self {
-        PieceRef { piece, shard: None }
+        PieceRef {
+            piece,
+            shard: None,
+            generation: 0,
+        }
     }
 }
 
@@ -138,12 +179,52 @@ where
     fn drop(&mut self) {
         if let Some(shard) = self.shard.take() {
             let mut shard = shard.write();
-            match shard.entry(self.hash(), |p| self.key() == p.key(), |p| p.hash()) {
-                HashTableEntry::Occupied(o) => {
+            match shard.entry(self.hash(), |p| self.key() == p.piece.key(), |p| p.piece.hash()) {
+                HashTableEntry::Occupied(o) if o.get().generation == self.generation => {
                     o.remove();
                 }
-                HashTableEntry::Vacant(_) => {}
+                HashTableEntry::Occupied(_) | HashTableEntry::Vacant(_) => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use foyer_memory::{Cache, CacheBuilder};
+
+    use super::*;
+
+    #[test]
+    fn older_reference_does_not_remove_a_newer_value() {
+        let memory: Cache<u64, u64> = CacheBuilder::new(16).build();
+        let keeper = Keeper::new(memory.shards());
+
+        let older = memory.insert(7, 11).piece();
+        let hash = older.hash();
+        let older = keeper.insert(older);
+        let newer = keeper.insert(memory.insert(7, 22).piece());
+
+        drop(older);
+        assert_eq!(*keeper.get(hash, &7).unwrap().value(), 22);
+
+        drop(newer);
+        assert!(keeper.get(hash, &7).is_none());
+    }
+
+    #[test]
+    fn repeated_submission_has_an_independent_lifetime() {
+        let memory: Cache<u64, u64> = CacheBuilder::new(16).build();
+        let keeper = Keeper::new(memory.shards());
+        let piece = memory.insert(7, 11).piece();
+        let hash = piece.hash();
+
+        let first = keeper.insert(piece.clone());
+        let second = keeper.insert(piece);
+        drop(first);
+        assert!(keeper.get(hash, &7).is_some());
+
+        drop(second);
+        assert!(keeper.get(hash, &7).is_none());
     }
 }

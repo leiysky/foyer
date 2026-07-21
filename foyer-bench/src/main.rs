@@ -631,6 +631,7 @@ async fn benchmark(args: Args) {
 
     let engine_config: Box<dyn EngineConfig<u64, Value, HybridCacheProperties>> = {
         let mut builder = BlockEngineConfig::new(device)
+            .with_io_engine_config(io_engine_builder)
             .with_block_size(args.block_size.as_u64() as _)
             .with_indexer_shards(args.shards)
             .with_recover_concurrency(args.recover_concurrency)
@@ -652,7 +653,6 @@ async fn benchmark(args: Args) {
     let mut builder = builder
         .with_weighter(|_: &u64, value: &Value| u64::BITS as usize / 8 + value.len())
         .storage()
-        .with_io_engine_config(io_engine_builder)
         .with_engine_config(engine_config);
 
     builder = builder

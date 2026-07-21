@@ -48,9 +48,9 @@ async fn main() -> anyhow::Result<()> {
         .with_weighter(|_key, value: &String| value.len())
         .with_filter(|_, _| true)
         .storage()
-        .with_io_engine_config(PsyncIoEngineConfig::new())
         .with_engine_config(
             BlockEngineConfig::new(device)
+                .with_io_engine_config(PsyncIoEngineConfig::new())
                 .with_block_size(16 * 1024 * 1024)
                 .with_indexer_shards(64)
                 .with_recover_concurrency(8)

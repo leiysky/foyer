@@ -1,0 +1,196 @@
+use std::{borrow::Cow, sync::Arc};
+
+use bytes::Bytes;
+use foyer::{
+    Hint, HybridCache, HybridCachePolicy, HybridCacheProperties, RecoverMode, Spawner, Statistics, StorageUsage,
+};
+
+use crate::{
+    CachePriority, EngineValue, Entry, Error, ExtentEngineConfig, ExtentEngineHandle, Result, model::EntryKey,
+};
+
+const CACHE_ENTRY_META_SIZE: usize = 64;
+
+/// The public hybrid Extent cache.
+#[derive(Debug, Clone)]
+pub struct Cache {
+    inner: HybridCache<Bytes, EngineValue>,
+    engine_handle: ExtentEngineHandle,
+}
+
+impl Cache {
+    pub fn builder(memory_capacity: usize, engine: ExtentEngineConfig) -> CacheBuilder {
+        CacheBuilder::new(memory_capacity, engine)
+    }
+
+    /// Offer an entry to the cache without waiting for disk admission or persistence.
+    pub fn put(&self, entry: Entry) {
+        let priority = entry.priority();
+        let (key, value) = entry.into_engine();
+        let hint = match priority {
+            CachePriority::Low => Hint::Low,
+            CachePriority::Normal | CachePriority::High => Hint::Normal,
+        };
+        let properties = HybridCacheProperties::default().with_hint(hint);
+        self.inner.insert_with_properties(key, value, properties);
+    }
+
+    /// Look up a complete entry.
+    ///
+    /// Storage errors and throttling are cache misses at this best-effort boundary.
+    pub async fn get(&self, key: &[u8]) -> Option<Entry> {
+        if EntryKey::validate(key).is_err() {
+            return None;
+        }
+        let key = Bytes::copy_from_slice(key);
+        self.inner
+            .get(&key)
+            .await
+            .ok()
+            .flatten()
+            .map(|entry| Entry::from_engine(entry.key().clone(), entry.value().clone()))
+    }
+
+    /// Offer a best-effort deletion without waiting for the disk engine.
+    pub fn delete(&self, key: &[u8]) {
+        if EntryKey::validate(key).is_err() {
+            return;
+        }
+        self.inner.remove(&Bytes::copy_from_slice(key));
+    }
+
+    /// Wait for currently queued disk work to complete and publish a durable checkpoint.
+    ///
+    /// A put remains best effort until selected by the engine. Call `wait` before `close` when the
+    /// caller needs every accepted command ahead of this barrier to finish rather than using the
+    /// bounded shutdown policy.
+    pub async fn wait(&self) {
+        self.inner.storage().wait().await;
+    }
+
+    /// Close the cache using the bounded best-effort shutdown policy.
+    ///
+    /// Close completes an already executing atomic batch and may discard the unstarted queue tail.
+    /// Call [`Self::wait`] first when a durable barrier is required.
+    pub async fn close(&self) -> Result<()> {
+        self.inner
+            .close()
+            .await
+            .map_err(|source| Error::foyer("close Extent cache", source))
+    }
+
+    /// Return a read-only handle to the attached disk engine.
+    pub fn engine_handle(&self) -> ExtentEngineHandle {
+        self.engine_handle.clone()
+    }
+
+    /// Return an O(1) snapshot of the disk capacity governed by the engine.
+    pub fn storage_usage(&self) -> StorageUsage {
+        self.inner.storage().storage_usage()
+    }
+
+    /// Return the shared Foyer physical I/O statistics.
+    pub fn statistics(&self) -> &Arc<Statistics> {
+        self.inner.statistics()
+    }
+
+    /// Estimate the number of distinct entries visible from the hybrid cache.
+    ///
+    /// Memory entries normally overlap disk entries, so the larger tier count is a more stable
+    /// telemetry estimate than their sum. The estimate can undercount disjoint memory-only and
+    /// disk-only entries during write bursts and must not be used for correctness decisions.
+    pub fn estimated_entry_count(&self) -> u64 {
+        let memory_entries = u64::try_from(self.inner.memory().entries()).unwrap_or(u64::MAX);
+        let disk_entries = self
+            .engine_handle
+            .entry_index_stats()
+            .map_or(0, |stats| stats.live_entries);
+        memory_entries.max(disk_entries)
+    }
+}
+
+/// Builder for the public hybrid Extent cache.
+#[derive(Debug)]
+pub struct CacheBuilder {
+    name: Cow<'static, str>,
+    memory_capacity: usize,
+    memory_shards: Option<usize>,
+    recover_mode: RecoverMode,
+    spawner: Option<Spawner>,
+    engine: ExtentEngineConfig,
+}
+
+impl CacheBuilder {
+    pub fn new(memory_capacity: usize, engine: ExtentEngineConfig) -> Self {
+        Self {
+            name: "extent".into(),
+            memory_capacity,
+            memory_shards: None,
+            recover_mode: RecoverMode::Quiet,
+            spawner: None,
+            engine,
+        }
+    }
+
+    pub fn with_name(mut self, name: impl Into<Cow<'static, str>>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    pub fn with_memory_shards(mut self, shards: usize) -> Self {
+        self.memory_shards = Some(shards);
+        self
+    }
+
+    pub fn with_recover_mode(mut self, recover_mode: RecoverMode) -> Self {
+        self.recover_mode = recover_mode;
+        self
+    }
+
+    pub fn with_spawner(mut self, spawner: Spawner) -> Self {
+        self.spawner = Some(spawner);
+        self
+    }
+
+    pub async fn build(self) -> Result<Cache> {
+        if self.memory_capacity == 0 {
+            return Err(Error::InvalidConfig(
+                "memory cache capacity must be positive".to_string(),
+            ));
+        }
+        if self.memory_shards == Some(0) {
+            return Err(Error::InvalidConfig(
+                "memory cache shard count must be positive".to_string(),
+            ));
+        }
+
+        let engine_handle = self.engine.handle();
+        let mut memory = HybridCache::builder()
+            .with_name(self.name)
+            .with_flush_on_close(false)
+            .with_policy(HybridCachePolicy::WriteOnInsertion)
+            .memory(self.memory_capacity)
+            .with_weighter(|key: &Bytes, value: &EngineValue| {
+                key.len()
+                    .saturating_add(value.value().len())
+                    .saturating_add(CACHE_ENTRY_META_SIZE)
+            });
+        if let Some(shards) = self.memory_shards {
+            memory = memory.with_shards(shards);
+        }
+        let mut storage = memory
+            .storage()
+            .with_recover_mode(self.recover_mode)
+            .with_engine_config(
+                Box::new(self.engine) as Box<dyn foyer::EngineConfig<Bytes, EngineValue, HybridCacheProperties>>
+            );
+        if let Some(spawner) = self.spawner {
+            storage = storage.with_spawner(spawner);
+        }
+        let inner = storage
+            .build()
+            .await
+            .map_err(|source| Error::foyer("open Extent cache", source))?;
+        Ok(Cache { inner, engine_handle })
+    }
+}

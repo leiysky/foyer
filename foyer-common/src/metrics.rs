@@ -53,6 +53,45 @@ pub struct Metrics {
     pub storage_queue_buffer_overflow: BoxedCounter,
     pub storage_queue_channel_overflow: BoxedCounter,
 
+    pub storage_engine_command_accepted: BoxedCounter,
+    pub storage_engine_command_dropped: BoxedCounter,
+    pub storage_engine_command_completed: BoxedCounter,
+    pub storage_engine_command_rejected: BoxedCounter,
+    pub storage_engine_command_shutdown_dropped: BoxedCounter,
+    pub storage_engine_command_shed_low: BoxedCounter,
+    pub storage_engine_command_shed_normal: BoxedCounter,
+    pub storage_engine_command_shed_high: BoxedCounter,
+    pub storage_engine_batch_completed: BoxedCounter,
+    pub storage_engine_batch_failed: BoxedCounter,
+
+    pub storage_engine_read_rejected: BoxedCounter,
+    pub storage_engine_read_active: BoxedGauge,
+    pub storage_engine_read_limit: BoxedGauge,
+
+    pub storage_engine_batch_duration: BoxedHistogram,
+    pub storage_engine_publication_duration: BoxedHistogram,
+    pub storage_engine_recovery_duration: BoxedHistogram,
+    pub storage_engine_shutdown_duration: BoxedHistogram,
+
+    pub storage_engine_recovery_created: BoxedCounter,
+    pub storage_engine_recovery_recovered: BoxedCounter,
+    pub storage_engine_recovery_recreated: BoxedCounter,
+
+    pub storage_engine_queue_pending_entries: BoxedGauge,
+    pub storage_engine_queue_pending_bytes: BoxedGauge,
+    pub storage_engine_queue_capacity_entries: BoxedGauge,
+    pub storage_engine_queue_capacity_bytes: BoxedGauge,
+
+    pub storage_engine_checkpoint_published: BoxedGauge,
+    pub storage_engine_checkpoint_requested: BoxedGauge,
+    pub storage_engine_checkpoint_durable: BoxedGauge,
+    pub storage_engine_checkpoint_in_flight: BoxedGauge,
+    pub storage_engine_checkpoint_dirty: BoxedGauge,
+    pub storage_engine_priority_extents: [BoxedGauge; 3],
+    pub storage_engine_priority_floor_extents: [BoxedGauge; 3],
+    pub storage_engine_priority_allocated_bytes: [BoxedGauge; 3],
+    pub storage_engine_healthy: BoxedGauge,
+
     pub storage_disk_write: BoxedCounter,
     pub storage_disk_read: BoxedCounter,
     pub storage_disk_flush: BoxedCounter,
@@ -166,6 +205,69 @@ impl Metrics {
             Buckets::exponential(0.000_001, 2.0, 25),
         );
 
+        let foyer_storage_engine_command_total = registry.register_counter_vec(
+            "foyer_storage_engine_command_total".into(),
+            "foyer disk engine asynchronous command state transitions".into(),
+            &["name", "state"],
+        );
+        let foyer_storage_engine_batch_total = registry.register_counter_vec(
+            "foyer_storage_engine_batch_total".into(),
+            "foyer disk engine asynchronous batch outcomes".into(),
+            &["name", "outcome"],
+        );
+        let foyer_storage_engine_read_total = registry.register_counter_vec(
+            "foyer_storage_engine_read_total".into(),
+            "foyer disk engine read admission outcomes".into(),
+            &["name", "outcome"],
+        );
+        let foyer_storage_engine_readers = registry.register_gauge_vec(
+            "foyer_storage_engine_readers".into(),
+            "foyer disk engine active and permitted readers".into(),
+            &["name", "state"],
+        );
+        let foyer_storage_engine_duration = registry.register_histogram_vec_with_buckets(
+            "foyer_storage_engine_duration".into(),
+            "foyer disk engine operation durations".into(),
+            &["name", "operation"],
+            // 1us ~ 1024s
+            Buckets::exponential(0.000_001, 2.0, 31),
+        );
+        let foyer_storage_engine_recovery_total = registry.register_counter_vec(
+            "foyer_storage_engine_recovery_total".into(),
+            "foyer disk engine recovery outcomes".into(),
+            &["name", "outcome"],
+        );
+        let foyer_storage_engine_queue_entries = registry.register_gauge_vec(
+            "foyer_storage_engine_queue_entries".into(),
+            "foyer disk engine queue entries".into(),
+            &["name", "state"],
+        );
+        let foyer_storage_engine_queue_bytes = registry.register_gauge_vec(
+            "foyer_storage_engine_queue_bytes".into(),
+            "foyer disk engine queue bytes".into(),
+            &["name", "state"],
+        );
+        let foyer_storage_engine_checkpoint = registry.register_gauge_vec(
+            "foyer_storage_engine_checkpoint".into(),
+            "foyer disk engine checkpoint frontiers and dirty work".into(),
+            &["name", "measure"],
+        );
+        let foyer_storage_engine_priority_extents = registry.register_gauge_vec(
+            "foyer_storage_engine_priority_extents".into(),
+            "foyer disk engine occupied and protected-floor extents by cache priority".into(),
+            &["name", "priority", "state"],
+        );
+        let foyer_storage_engine_priority_allocated_bytes = registry.register_gauge_vec(
+            "foyer_storage_engine_priority_allocated_bytes".into(),
+            "foyer disk engine physically allocated payload bytes by cache priority".into(),
+            &["name", "priority"],
+        );
+        let foyer_storage_engine_healthy = registry.register_gauge_vec(
+            "foyer_storage_engine_healthy".into(),
+            "whether the foyer disk engine background pipeline is healthy".into(),
+            &["name"],
+        );
+
         let foyer_storage_disk_io_total = registry.register_counter_vec(
             "foyer_storage_disk_io_total".into(),
             "foyer disk cache disk operations".into(),
@@ -247,6 +349,75 @@ impl Metrics {
 
         let storage_queue_rotate_duration =
             foyer_storage_inner_op_duration.histogram(&[name.clone(), "queue_rotate".into()]);
+
+        let storage_engine_command_accepted =
+            foyer_storage_engine_command_total.counter(&[name.clone(), "accepted".into()]);
+        let storage_engine_command_dropped =
+            foyer_storage_engine_command_total.counter(&[name.clone(), "dropped".into()]);
+        let storage_engine_command_completed =
+            foyer_storage_engine_command_total.counter(&[name.clone(), "completed".into()]);
+        let storage_engine_command_rejected =
+            foyer_storage_engine_command_total.counter(&[name.clone(), "storage_rejected".into()]);
+        let storage_engine_command_shutdown_dropped =
+            foyer_storage_engine_command_total.counter(&[name.clone(), "shutdown_dropped".into()]);
+        let storage_engine_command_shed_low =
+            foyer_storage_engine_command_total.counter(&[name.clone(), "shed_low".into()]);
+        let storage_engine_command_shed_normal =
+            foyer_storage_engine_command_total.counter(&[name.clone(), "shed_normal".into()]);
+        let storage_engine_command_shed_high =
+            foyer_storage_engine_command_total.counter(&[name.clone(), "shed_high".into()]);
+        let storage_engine_batch_completed =
+            foyer_storage_engine_batch_total.counter(&[name.clone(), "completed".into()]);
+        let storage_engine_batch_failed = foyer_storage_engine_batch_total.counter(&[name.clone(), "failed".into()]);
+
+        let storage_engine_read_rejected = foyer_storage_engine_read_total.counter(&[name.clone(), "rejected".into()]);
+        let storage_engine_read_active = foyer_storage_engine_readers.gauge(&[name.clone(), "active".into()]);
+        let storage_engine_read_limit = foyer_storage_engine_readers.gauge(&[name.clone(), "limit".into()]);
+        let storage_engine_batch_duration = foyer_storage_engine_duration.histogram(&[name.clone(), "batch".into()]);
+        let storage_engine_publication_duration =
+            foyer_storage_engine_duration.histogram(&[name.clone(), "publication".into()]);
+        let storage_engine_recovery_duration =
+            foyer_storage_engine_duration.histogram(&[name.clone(), "recovery".into()]);
+        let storage_engine_shutdown_duration =
+            foyer_storage_engine_duration.histogram(&[name.clone(), "shutdown".into()]);
+        let storage_engine_recovery_created =
+            foyer_storage_engine_recovery_total.counter(&[name.clone(), "created".into()]);
+        let storage_engine_recovery_recovered =
+            foyer_storage_engine_recovery_total.counter(&[name.clone(), "recovered".into()]);
+        let storage_engine_recovery_recreated =
+            foyer_storage_engine_recovery_total.counter(&[name.clone(), "recreated".into()]);
+
+        let storage_engine_queue_pending_entries =
+            foyer_storage_engine_queue_entries.gauge(&[name.clone(), "pending".into()]);
+        let storage_engine_queue_pending_bytes =
+            foyer_storage_engine_queue_bytes.gauge(&[name.clone(), "pending".into()]);
+        let storage_engine_queue_capacity_entries =
+            foyer_storage_engine_queue_entries.gauge(&[name.clone(), "capacity".into()]);
+        let storage_engine_queue_capacity_bytes =
+            foyer_storage_engine_queue_bytes.gauge(&[name.clone(), "capacity".into()]);
+
+        let storage_engine_checkpoint_published =
+            foyer_storage_engine_checkpoint.gauge(&[name.clone(), "published_epoch".into()]);
+        let storage_engine_checkpoint_requested =
+            foyer_storage_engine_checkpoint.gauge(&[name.clone(), "requested_epoch".into()]);
+        let storage_engine_checkpoint_durable =
+            foyer_storage_engine_checkpoint.gauge(&[name.clone(), "durable_epoch".into()]);
+        let storage_engine_checkpoint_in_flight =
+            foyer_storage_engine_checkpoint.gauge(&[name.clone(), "in_flight_epoch".into()]);
+        let storage_engine_checkpoint_dirty =
+            foyer_storage_engine_checkpoint.gauge(&[name.clone(), "dirty_bytes".into()]);
+        let priorities = ["low", "normal", "high"];
+        let storage_engine_priority_extents = std::array::from_fn(|priority| {
+            foyer_storage_engine_priority_extents.gauge(&[name.clone(), priorities[priority].into(), "occupied".into()])
+        });
+        let storage_engine_priority_floor_extents = std::array::from_fn(|priority| {
+            foyer_storage_engine_priority_extents.gauge(&[name.clone(), priorities[priority].into(), "floor".into()])
+        });
+        let storage_engine_priority_allocated_bytes = std::array::from_fn(|priority| {
+            foyer_storage_engine_priority_allocated_bytes.gauge(&[name.clone(), priorities[priority].into()])
+        });
+        let storage_engine_healthy = foyer_storage_engine_healthy.gauge(std::slice::from_ref(&name));
+        storage_engine_healthy.absolute(1);
 
         let storage_disk_write = foyer_storage_disk_io_total.counter(&[name.clone(), "write".into()]);
         let storage_disk_read = foyer_storage_disk_io_total.counter(&[name.clone(), "read".into()]);
@@ -341,6 +512,39 @@ impl Metrics {
             storage_queue_rotate_duration,
             storage_queue_buffer_overflow,
             storage_queue_channel_overflow,
+            storage_engine_command_accepted,
+            storage_engine_command_dropped,
+            storage_engine_command_completed,
+            storage_engine_command_rejected,
+            storage_engine_command_shutdown_dropped,
+            storage_engine_command_shed_low,
+            storage_engine_command_shed_normal,
+            storage_engine_command_shed_high,
+            storage_engine_batch_completed,
+            storage_engine_batch_failed,
+            storage_engine_read_rejected,
+            storage_engine_read_active,
+            storage_engine_read_limit,
+            storage_engine_batch_duration,
+            storage_engine_publication_duration,
+            storage_engine_recovery_duration,
+            storage_engine_shutdown_duration,
+            storage_engine_recovery_created,
+            storage_engine_recovery_recovered,
+            storage_engine_recovery_recreated,
+            storage_engine_queue_pending_entries,
+            storage_engine_queue_pending_bytes,
+            storage_engine_queue_capacity_entries,
+            storage_engine_queue_capacity_bytes,
+            storage_engine_checkpoint_published,
+            storage_engine_checkpoint_requested,
+            storage_engine_checkpoint_durable,
+            storage_engine_checkpoint_in_flight,
+            storage_engine_checkpoint_dirty,
+            storage_engine_priority_extents,
+            storage_engine_priority_floor_extents,
+            storage_engine_priority_allocated_bytes,
+            storage_engine_healthy,
             storage_disk_write,
             storage_disk_read,
             storage_disk_flush,

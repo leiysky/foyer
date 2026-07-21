@@ -29,7 +29,48 @@ use futures_util::FutureExt;
 use mea::oneshot;
 use parking_lot::Mutex;
 
-use crate::{StorageFilterCondition, StorageFilterResult, io::device::statistics::Statistics};
+use crate::{
+    StorageFilterCondition, StorageFilterResult,
+    engine::block::indexer::{EntryAddress, HashedEntryAddress, Indexer},
+    io::device::statistics::Statistics,
+};
+
+/// A benchmark-only wrapper around the block engine's in-memory index.
+#[derive(Debug, Clone)]
+pub struct BenchBlockIndexer {
+    inner: Indexer,
+}
+
+impl BenchBlockIndexer {
+    /// Create an empty benchmark index with the requested shard count.
+    pub fn new(shards: usize) -> Self {
+        Self {
+            inner: Indexer::new(shards),
+        }
+    }
+
+    /// Insert `(hash, sequence)` pairs with representative block addresses.
+    pub fn insert_batch(&self, entries: Vec<(u64, u64)>) {
+        let entries = entries
+            .into_iter()
+            .map(|(hash, sequence)| HashedEntryAddress {
+                hash,
+                address: EntryAddress {
+                    block: u32::try_from(sequence / 16_384).unwrap_or(u32::MAX),
+                    offset: ((sequence % 16_384) * 4_096) as u32,
+                    len: 4_096,
+                    sequence,
+                },
+            })
+            .collect();
+        self.inner.insert_batch(entries);
+    }
+
+    /// Return whether an address is present for `hash`.
+    pub fn contains(&self, hash: u64) -> bool {
+        self.inner.get(hash).is_some()
+    }
+}
 
 /// A picker that only admits hash from the given list.
 #[derive(Debug)]

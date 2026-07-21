@@ -243,9 +243,7 @@ where
         let store = self.store.clone();
         Box::pin(async move {
             store.wait().await;
-            let device = store.device();
-            let throttler = device
-                .statistics()
+            let throttler = store
                 .throttle()
                 .write_throughput
                 .map(|v| RateLimiter::new(v.get() as _));
@@ -325,6 +323,10 @@ where
             let bytes = memory.usage();
             tracing::info!(bytes, "[hybrid]: flush all in-memory cached entries to disk on close");
             memory.flush().await;
+            // `memory.flush` only waits for work that preceded the flush before enqueueing the
+            // memory entries. Drain those newly enqueued entries before an engine with bounded
+            // shutdown semantics is allowed to discard its unstarted queue tail.
+            storage.wait().await;
         }
         storage.close().await?;
 
@@ -351,6 +353,11 @@ where
     S: HashBuilder + Debug,
 {
     fn drop(&mut self) {
+        // An explicit close already drained and closed storage. Avoid retaining another storage
+        // clone in a redundant asynchronous close, which can delay an immediate reopen.
+        if self.closed.load(Ordering::Relaxed) {
+            return;
+        }
         let name = self.name.clone();
         let closed = self.closed.clone();
         let memory = self.memory.clone();
@@ -574,7 +581,7 @@ where
     /// Remove a cached entry with the given key from the hybrid cache.
     pub fn remove<Q>(&self, key: &Q)
     where
-        Q: Hash + Equivalent<K> + ?Sized + Send + Sync + 'static,
+        Q: Hash + Equivalent<K> + ToOwned<Owned = K> + ?Sized + Send + Sync + 'static,
     {
         root_span!(self, span, "foyer::hybrid::cache::remove");
 
@@ -1073,8 +1080,7 @@ mod tests {
             .with_hash_builder(ModHasher::default())
             // TODO(MrCroxx): Test with `Engine::Mixed`.
             .storage()
-            .with_io_engine_config(PsyncIoEngineConfig::new())
-            .with_engine_config(block_engine_builder)
+            .with_engine_config(block_engine_builder.with_io_engine_config(PsyncIoEngineConfig::new()))
             .build()
             .await
             .unwrap()
@@ -1468,9 +1474,9 @@ mod tests {
                 .with_policy(HybridCachePolicy::WriteOnInsertion)
                 .memory(4 * MB)
                 .storage()
-                .with_io_engine_config(PsyncIoEngineConfig::new())
                 .with_engine_config(
                     BlockEngineConfig::new(FsDeviceBuilder::new(dir).with_capacity(16 * MB).build().unwrap())
+                        .with_io_engine_config(PsyncIoEngineConfig::new())
                         .with_block_size(64 * KB),
                 )
                 .build()

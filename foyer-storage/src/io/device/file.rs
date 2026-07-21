@@ -80,27 +80,11 @@ impl DeviceBuilder for FileDeviceBuilder {
         // Normalize configurations.
 
         let align_v = |value: usize, align: usize| value - (value % align);
-
-        let capacity = self.capacity.unwrap_or_else(|| {
-            // Try to get the capacity if `path` refer to a raw block device.
-            #[cfg(unix)]
-            if let Ok(metadata) = std::fs::metadata(&self.path) {
-                let file_type = metadata.file_type();
-
-                use std::os::unix::fs::FileTypeExt;
-                if file_type.is_block_device() {
-                    return super::utils::get_dev_capacity(&self.path).unwrap();
-                }
-            }
-
-            // Create an empty directory if needed before to get free space.
-            let dir = self.path.parent().expect("path must point to a file").to_path_buf();
-            create_dir_all(&dir).unwrap();
-            free_space(&dir).unwrap() as usize / 10 * 8
-        });
+        let capacity = match self.capacity {
+            Some(capacity) => capacity,
+            None => default_capacity(&self.path)?,
+        };
         let capacity = align_v(capacity, PAGE);
-
-        println!("==========> {capacity}");
 
         // Build device.
 
@@ -136,6 +120,27 @@ impl DeviceBuilder for FileDeviceBuilder {
         let device: Arc<dyn Device> = Arc::new(device);
         Ok(device)
     }
+}
+
+fn default_capacity(path: &Path) -> Result<usize> {
+    // Try to get the capacity if `path` refers to a raw block device.
+    #[cfg(unix)]
+    if let Ok(metadata) = std::fs::metadata(path) {
+        use std::os::unix::fs::FileTypeExt;
+
+        if metadata.file_type().is_block_device() {
+            return super::utils::get_dev_capacity(path);
+        }
+    }
+
+    // Create an empty directory if needed before getting free space. A relative file such as
+    // `cache.data` has an empty parent, which means the current directory.
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    create_dir_all(dir).map_err(Error::io_error)?;
+    Ok(free_space(dir).map_err(Error::io_error)? as usize / 10 * 8)
 }
 
 /// A device upon a single file or a raw block device.

@@ -52,7 +52,7 @@ use crate::{
     Device, Load, RejectAll, StorageFilter, StorageFilterResult,
     compress::Compression,
     engine::{
-        Engine, EngineBuildContext, EngineConfig, Populated,
+        Engine, EngineBuildContext, EngineConfig, Populated, StorageUsage,
         block::{
             eviction::{EvictionPicker, FifoPicker, InvalidRatioPicker},
             manager::{BlockId, BlockManager},
@@ -62,7 +62,12 @@ use crate::{
         },
     },
     filter::conditions::IoThrottle,
-    io::{PAGE, bytes::IoSliceMut},
+    io::{
+        PAGE,
+        bytes::IoSliceMut,
+        control::IoControl,
+        engine::{IoEngineBuildContext, IoEngineConfig, monitor::MonitoredIoEngine, psync::PsyncIoEngineConfig},
+    },
     keeper::PieceRef,
     serde::EntryDeserializer,
 };
@@ -82,6 +87,7 @@ where
     P: Properties,
 {
     device: Arc<dyn Device>,
+    io_engine_config: Box<dyn IoEngineConfig>,
     block_size: usize,
     compression: Compression,
     indexer_shards: usize,
@@ -112,6 +118,7 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BlockEngineConfig")
             .field("device", &self.device)
+            .field("io_engine_config", &self.io_engine_config)
             .field("block_size", &self.block_size)
             .field("compression", &self.compression)
             .field("indexer_shards", &self.indexer_shards)
@@ -140,6 +147,7 @@ where
     pub fn new(device: Arc<dyn Device>) -> Self {
         Self {
             device,
+            io_engine_config: PsyncIoEngineConfig::new().boxed(),
             block_size: 16 * 1024 * 1024, // 16 MiB
             compression: Compression::default(),
             indexer_shards: 64,
@@ -160,6 +168,14 @@ where
             load_holder: Holder::default(),
             marker: PhantomData,
         }
+    }
+
+    /// Set the I/O engine used by this block engine.
+    ///
+    /// Default: [`PsyncIoEngineConfig`].
+    pub fn with_io_engine_config(mut self, config: impl Into<Box<dyn IoEngineConfig>>) -> Self {
+        self.io_engine_config = config.into();
+        self
     }
 
     /// Set the block size for the block-based disk cache engine.
@@ -324,13 +340,20 @@ where
     pub async fn build(
         self: Box<Self>,
         EngineBuildContext {
-            io_engine,
             metrics,
             spawner: runtime,
             recover_mode,
         }: EngineBuildContext,
     ) -> Result<Arc<BlockEngine<K, V, P>>> {
+        let io_engine = self
+            .io_engine_config
+            .build(IoEngineBuildContext {
+                spawner: runtime.clone(),
+            })
+            .await?;
+        let io_engine = MonitoredIoEngine::new(io_engine, metrics.clone());
         let device = self.device;
+        let io_control = IoControl::from_statistics(device.statistics().clone());
         let block_size = self.block_size;
 
         let mut tombstones = vec![];
@@ -340,12 +363,7 @@ where
             let mut partitions = vec![];
 
             let max_entries = device.capacity() / PAGE;
-            let pages = max_entries / TombstoneLog::SLOTS_PER_PAGE
-                + if max_entries.is_multiple_of(TombstoneLog::SLOTS_PER_PAGE) {
-                    0
-                } else {
-                    1
-                };
+            let pages = max_entries.div_ceil(TombstoneLog::SLOTS_PER_PAGE);
             let partition = device.create_partition(pages * PAGE)?;
             partitions.push(partition);
 
@@ -433,6 +451,7 @@ where
         let inner = BlockEngineInner {
             admission_filter,
             device,
+            io_control,
             indexer,
             block_manager,
             flushers,
@@ -506,6 +525,7 @@ where
     admission_filter: StorageFilter,
 
     device: Arc<dyn Device>,
+    io_control: IoControl,
 
     indexer: Indexer,
     block_manager: BlockManager,
@@ -549,6 +569,11 @@ where
     V: StorageValue,
     P: Properties,
 {
+    /// Get the device used by this block engine.
+    pub fn device(&self) -> &Arc<dyn Device> {
+        &self.inner.device
+    }
+
     fn wait(&self) -> impl Future<Output = ()> + Send + 'static {
         let flushers = self.inner.flushers.clone();
         let block_manager = self.inner.block_manager.clone();
@@ -803,8 +828,12 @@ where
     V: StorageValue,
     P: Properties,
 {
-    fn device(&self) -> &Arc<dyn Device> {
-        &self.inner.device
+    fn storage_usage(&self) -> StorageUsage {
+        StorageUsage::new(self.inner.device.capacity(), self.inner.device.allocated())
+    }
+
+    fn io_control(&self) -> &IoControl {
+        &self.inner.io_control
     }
 
     fn filter(&self, hash: u64, estimated_size: usize) -> StorageFilterResult {
@@ -817,12 +846,12 @@ where
         self.enqueue(piece, estimated_size);
     }
 
-    fn load(&self, hash: u64) -> BoxFuture<'static, Result<Load<K, V, P>>> {
+    fn load(&self, _key: K, hash: u64) -> BoxFuture<'static, Result<Load<K, V, P>>> {
         // TODO(MrCroxx): refactor this.
         self.load(hash).boxed()
     }
 
-    fn delete(&self, hash: u64) {
+    fn delete(&self, _key: &K, hash: u64) {
         self.delete(hash);
     }
 
@@ -858,10 +887,7 @@ mod tests {
     use crate::{
         PsyncIoEngineConfig, RejectAll,
         engine::RecoverMode,
-        io::{
-            device::{DeviceBuilder, combined::CombinedDeviceBuilder, fs::FsDeviceBuilder},
-            engine::{IoEngine, IoEngineBuildContext, IoEngineConfig},
-        },
+        io::device::{DeviceBuilder, combined::CombinedDeviceBuilder, fs::FsDeviceBuilder},
         serde::EntrySerializer,
         test_utils::Biased,
     };
@@ -874,15 +900,6 @@ mod tests {
             .with_eviction_config(FifoConfig::default())
             .with_hash_builder(ModHasher::default())
             .build()
-    }
-
-    async fn io_engine_for_test(spawner: Spawner) -> Arc<dyn IoEngine> {
-        // TODO(MrCroxx): Test with other io engines.
-        PsyncIoEngineConfig::new()
-            .boxed()
-            .build(IoEngineBuildContext { spawner })
-            .await
-            .unwrap()
     }
 
     /// 4 files, fifo eviction, 16 KiB block, 64 KiB capacity.
@@ -899,10 +916,10 @@ mod tests {
             .build()
             .unwrap();
         let spawner = Spawner::current();
-        let io_engine = io_engine_for_test(spawner.clone()).await;
         let metrics = Arc::new(Metrics::noop());
         let builder = BlockEngineConfig {
             device,
+            io_engine_config: PsyncIoEngineConfig::new().boxed(),
             block_size: 16 * 1024,
             compression: Compression::None,
             indexer_shards: 4,
@@ -925,7 +942,6 @@ mod tests {
         let builder = Box::new(builder);
         builder
             .build(EngineBuildContext {
-                io_engine,
                 metrics,
                 spawner,
                 recover_mode: RecoverMode::Strict,
@@ -942,10 +958,10 @@ mod tests {
             .build()
             .unwrap();
         let spawner = Spawner::current();
-        let io_engine = io_engine_for_test(spawner.clone()).await;
         let metrics = Arc::new(Metrics::noop());
         let builder = BlockEngineConfig {
             device,
+            io_engine_config: PsyncIoEngineConfig::new().boxed(),
             block_size: 16 * 1024,
             compression: Compression::None,
             indexer_shards: 4,
@@ -967,7 +983,6 @@ mod tests {
         let builder = Box::new(builder);
         builder
             .build(EngineBuildContext {
-                io_engine,
                 metrics,
                 spawner,
                 recover_mode: RecoverMode::Strict,
@@ -1370,8 +1385,6 @@ mod tests {
         const MB: usize = 1024 * 1024;
 
         let spawner = Spawner::current();
-        let io_engine = io_engine_for_test(spawner.clone()).await;
-
         let d1 = FsDeviceBuilder::new(dir.path().join("dev1"))
             .with_capacity(MB)
             .build()
@@ -1394,7 +1407,6 @@ mod tests {
             .with_block_size(64 * KB)
             .boxed()
             .build(EngineBuildContext {
-                io_engine,
                 metrics: Arc::new(Metrics::noop()),
                 spawner,
                 recover_mode: RecoverMode::None,
