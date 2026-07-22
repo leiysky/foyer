@@ -138,9 +138,9 @@ reference engines and environment parsing remain outside production modules.
 ownership, asynchronous outcomes, publication and durable frontiers, physical-record occupancy and
 the indexed-cardinality upper bound, physical
 I/O, per-file sync counts, separate index WAL/SST/manifest writes and syncs, index flush/compaction
-bytes, lazy stale-location checks/discards, immutable layout planning, the inert Format 1 directory,
-checkpoint-wait and generation-invalidation reclaim timing, scheduler waits, and the first background failure. It is not a
-second control plane or a write receipt.
+bytes, lazy stale-location checks/discards, immutable layout planning, checkpoint-wait and
+generation-invalidation reclaim timing, scheduler waits, and the first background failure. It is
+not a second control plane or a write receipt.
 
 The shared Foyer registry exports the corresponding counters, gauges, and latency histograms.
 Queue gauges change at reservation ownership boundaries, checkpoint gauges are refreshed after

@@ -13,7 +13,7 @@ use crate::{
         ExtentStore, ExtentStoreOptions,
         index::INDEX_DIRECTORY,
         operation::InsertOutcome,
-        pool::{DATA_FILE, ENTRY_DIRECTORY_FILE, LEGACY_SLOT_OWNER_FILE, STATE_FILE},
+        pool::{DATA_FILE, LEGACY_ENTRY_DIRECTORY_FILE, LEGACY_SLOT_OWNER_FILE, STATE_FILE},
     },
 };
 
@@ -161,9 +161,10 @@ fn rejects_and_recreates_the_frozen_v3_store_fixture() {
     let dir = tempdir().unwrap();
     install_v3_fixture(dir.path());
     assert!(ExtentStore::open_with_options(dir.path(), options()).is_err());
+    fs::write(dir.path().join(LEGACY_ENTRY_DIRECTORY_FILE), b"legacy").unwrap();
     let store = ExtentStore::recreate(dir.path(), config()).unwrap();
     assert!(!dir.path().join(LEGACY_SLOT_OWNER_FILE).exists());
-    assert!(dir.path().join(ENTRY_DIRECTORY_FILE).exists());
+    assert!(!dir.path().join(LEGACY_ENTRY_DIRECTORY_FILE).exists());
     let next_key = key(99);
     assert_eq!(
         store

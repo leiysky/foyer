@@ -23,11 +23,11 @@ use crate::{
         io::IoSchedulerStats,
         operation::{BatchInsertResult, EntryInsert, GetResult, InsertOutcome},
         pool::{
-            DATA_FILE, ENTRY_DIRECTORY_FILE, EntryAllocation, EntryWrite, ExtentPool, LEGACY_SLOT_OWNER_FILE,
+            DATA_FILE, EntryAllocation, EntryWrite, ExtentPool, LEGACY_ENTRY_DIRECTORY_FILE, LEGACY_SLOT_OWNER_FILE,
             STATE_FILE,
         },
         reclaim::{AllocationDecision, ReclaimResult, Reclaimer},
-        stats::{DirectoryReadStats, ExtentLayoutStats, ExtentOccupancy, PhysicalWriteStats},
+        stats::{ExtentLayoutStats, ExtentOccupancy, PhysicalWriteStats},
     },
 };
 
@@ -87,7 +87,12 @@ impl ExtentStore {
         let root = path.as_ref();
         fs::create_dir_all(root).map_err(|error| Error::io("create extent store directory", error))?;
         remove_owned_directory(&root.join(INDEX_DIRECTORY))?;
-        for file in [DATA_FILE, ENTRY_DIRECTORY_FILE, LEGACY_SLOT_OWNER_FILE, STATE_FILE] {
+        for file in [
+            DATA_FILE,
+            LEGACY_ENTRY_DIRECTORY_FILE,
+            LEGACY_SLOT_OWNER_FILE,
+            STATE_FILE,
+        ] {
             remove_owned_file(&root.join(file))?;
         }
         Self::create(root, config)
@@ -96,6 +101,11 @@ impl ExtentStore {
     pub fn open_with_options(path: impl AsRef<Path>, options: ExtentStoreOptions) -> Result<Self> {
         validate_options(options)?;
         let root = path.as_ref();
+        if root.join(LEGACY_ENTRY_DIRECTORY_FILE).exists() {
+            return Err(Error::InvalidSuperblock(
+                "Extent cache contains the obsolete pre-release Format 1 directory file".to_string(),
+            ));
+        }
         let pool = ExtentPool::open(
             root,
             options.direct_io,
@@ -157,10 +167,6 @@ impl ExtentStore {
         stats
     }
 
-    pub fn directory_read_stats(&self) -> DirectoryReadStats {
-        self.pool.directory_read_stats()
-    }
-
     pub fn layout_stats(&self, configured_capacity_bytes: u64) -> ExtentLayoutStats {
         ExtentLayoutStats {
             configured_capacity_bytes,
@@ -168,8 +174,6 @@ impl ExtentStore {
             data_file_bytes: self.layout.data_file_size,
             usable_payload_bytes: u64::from(self.layout.extent_count - 1) * self.layout.extent_size as u64,
             index_soft_capacity_bytes: self.layout.index_capacity_bytes,
-            directory_planned_bytes: self.layout.entry_directory_capacity_bytes,
-            directory_logical_bytes: self.layout.entry_directory_file_size,
             extent_size_bytes: self.layout.extent_size as u64,
             physical_extents: u64::from(self.layout.extent_count),
             usable_extents: u64::from(self.layout.extent_count - 1),
@@ -408,11 +412,9 @@ impl ExtentStore {
             }
             write_runs = write_runs
                 .saturating_add(physical.data_runs)
-                .saturating_add(physical.entry_directory_runs)
                 .saturating_add(indexed.write_runs);
             written_bytes = written_bytes
                 .saturating_add(physical.data_bytes)
-                .saturating_add(physical.entry_directory_bytes)
                 .saturating_add(indexed.written_bytes);
         }
 
@@ -786,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn allocated_size_tracks_index_budget_without_directory_scans() {
+    fn allocated_size_tracks_index_budget_without_file_scans() {
         let dir = tempdir().unwrap();
         let store = store(dir.path(), 4 * 1024 * 1024);
         let before = store.allocated_size().unwrap();
@@ -872,7 +874,6 @@ mod tests {
         );
         let stats = store.physical_write_stats();
         assert_eq!(stats.data_bytes, (PAGE_SIZE * 4) as u64);
-        assert_eq!(stats.entry_directory_bytes, 0);
         let read = store.get_with_stats(&key(7)).unwrap();
         assert_eq!(read.value, Some(value.clone()));
         assert_eq!(read.data_frames, 4);
@@ -906,8 +907,6 @@ mod tests {
         let writes = store.physical_write_stats();
         assert_eq!(writes.data_runs, 1);
         assert_eq!(writes.data_bytes, PAGE_SIZE as u64);
-        assert_eq!(writes.entry_directory_runs, 0);
-        assert_eq!(writes.entry_directory_bytes, 0);
         let occupancy = store.extent_occupancy();
         assert_eq!(occupancy.used_entries(CachePriority::Normal), keys.len() as u64);
         assert_eq!(occupancy.used_bytes(CachePriority::Normal), PAGE_SIZE as u64);
@@ -1114,10 +1113,7 @@ mod tests {
         let before_checkpoint = store.physical_write_stats();
         assert_eq!(before_checkpoint.data_runs, 1);
         assert_eq!(before_checkpoint.data_bytes, (PAGE_SIZE * 2) as u64);
-        assert_eq!(before_checkpoint.entry_directory_runs, 0);
-        assert_eq!(before_checkpoint.entry_directory_bytes, 0);
         assert_eq!(before_checkpoint.data_syncs, 0);
-        assert_eq!(before_checkpoint.entry_directory_syncs, 0);
         assert_eq!(before_checkpoint.index_runs, 0);
         assert_eq!(before_checkpoint.index_syncs, 0);
         assert_eq!(before_checkpoint.allocator_runs, 0);
@@ -1141,13 +1137,9 @@ mod tests {
         );
         assert_eq!(
             after_checkpoint.total_bytes(),
-            after_checkpoint.data_bytes
-                + after_checkpoint.entry_directory_bytes
-                + after_checkpoint.index_bytes
-                + after_checkpoint.allocator_bytes
+            after_checkpoint.data_bytes + after_checkpoint.index_bytes + after_checkpoint.allocator_bytes
         );
         assert_eq!(after_checkpoint.data_syncs, 1);
-        assert_eq!(after_checkpoint.entry_directory_syncs, 0);
         assert_eq!(after_checkpoint.total_syncs(), 3);
     }
 
@@ -1311,12 +1303,10 @@ mod tests {
         assert_eq!(result.outcomes, vec![InsertOutcome::Inserted]);
         let after = store.physical_write_stats();
         assert_eq!(after.data_syncs - before.data_syncs, 0);
-        assert_eq!(after.entry_directory_syncs - before.entry_directory_syncs, 0);
         assert_eq!(store.get(&incoming_key).unwrap(), Some(value));
         store.checkpoint().unwrap();
         let checkpointed = store.physical_write_stats();
         assert_eq!(checkpointed.data_syncs - after.data_syncs, 1);
-        assert_eq!(checkpointed.entry_directory_syncs, 0);
     }
 
     #[test]
@@ -1597,14 +1587,12 @@ mod tests {
             assert_eq!(store.get(&key(0)).unwrap(), Some(vec![5; 16]));
         }
 
-        let directory_before = store.directory_read_stats();
         let index_reads_before = store.entry_index_io_read_stats();
         let writes_before = store.physical_write_stats();
         let incoming = key(entries as u64);
         let result = store
             .insert_batch_with_stats(&[EntryInsert::new(&incoming, &[6; 16], CachePriority::Normal)])
             .unwrap();
-        let directory_after = store.directory_read_stats();
         let index_reads_after = store.entry_index_io_read_stats();
         let writes_after = store.physical_write_stats();
 
@@ -1615,7 +1603,6 @@ mod tests {
             layout.planned_entries_per_extent as usize
         );
         assert_eq!(result.reclaim.total_invalidated_bytes(), layout.extent_size);
-        assert_eq!(directory_after, directory_before);
         assert_eq!(index_reads_after, index_reads_before);
         assert_eq!(writes_after.allocator_runs - writes_before.allocator_runs, 1);
         assert_eq!(writes_after.allocator_syncs - writes_before.allocator_syncs, 1);

@@ -1,19 +1,10 @@
 use crate::model::CachePriority;
 
-/// Compatibility counters for the inert Format 1 Entry directory.
-///
-/// Runtime values are expected to remain zero; nonzero values indicate a regression.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct DirectoryReadStats {
-    pub runs: u64,
-    pub bytes: u64,
-}
-
 /// Immutable capacity and cardinality decisions for one Extent layout.
 ///
 /// `planned_file_bytes` is the hard space planned inside the configured cache capacity. The
-/// The EntryIndex target and compatibility-directory address space are reported separately. The
-/// index target is soft and may be overcommitted without rejecting a cache write.
+/// EntryIndex target is reported separately because it is soft and may be overcommitted without
+/// rejecting a cache write.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ExtentLayoutStats {
     pub configured_capacity_bytes: u64,
@@ -21,8 +12,6 @@ pub struct ExtentLayoutStats {
     pub data_file_bytes: u64,
     pub usable_payload_bytes: u64,
     pub index_soft_capacity_bytes: u64,
-    pub directory_planned_bytes: u64,
-    pub directory_logical_bytes: u64,
     pub extent_size_bytes: u64,
     pub physical_extents: u64,
     pub usable_extents: u64,
@@ -99,9 +88,6 @@ pub struct PhysicalWriteStats {
     pub data_runs: u64,
     pub data_bytes: u64,
     pub data_syncs: u64,
-    pub entry_directory_runs: u64,
-    pub entry_directory_bytes: u64,
-    pub entry_directory_syncs: u64,
     pub index_runs: u64,
     pub index_bytes: u64,
     pub index_syncs: u64,
@@ -126,21 +112,18 @@ pub struct PhysicalWriteStats {
 impl PhysicalWriteStats {
     pub const fn total_runs(self) -> u64 {
         self.data_runs
-            .saturating_add(self.entry_directory_runs)
             .saturating_add(self.index_runs)
             .saturating_add(self.allocator_runs)
     }
 
     pub const fn total_bytes(self) -> u64 {
         self.data_bytes
-            .saturating_add(self.entry_directory_bytes)
             .saturating_add(self.index_bytes)
             .saturating_add(self.allocator_bytes)
     }
 
     pub const fn total_syncs(self) -> u64 {
         self.data_syncs
-            .saturating_add(self.entry_directory_syncs)
             .saturating_add(self.index_syncs)
             .saturating_add(self.allocator_syncs)
     }
@@ -149,9 +132,6 @@ impl PhysicalWriteStats {
         self.data_runs = self.data_runs.saturating_add(other.data_runs);
         self.data_bytes = self.data_bytes.saturating_add(other.data_bytes);
         self.data_syncs = self.data_syncs.saturating_add(other.data_syncs);
-        self.entry_directory_runs = self.entry_directory_runs.saturating_add(other.entry_directory_runs);
-        self.entry_directory_bytes = self.entry_directory_bytes.saturating_add(other.entry_directory_bytes);
-        self.entry_directory_syncs = self.entry_directory_syncs.saturating_add(other.entry_directory_syncs);
         self.index_runs = self.index_runs.saturating_add(other.index_runs);
         self.index_bytes = self.index_bytes.saturating_add(other.index_bytes);
         self.index_syncs = self.index_syncs.saturating_add(other.index_syncs);

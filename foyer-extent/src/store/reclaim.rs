@@ -12,7 +12,7 @@ use crate::{
 
 /// Coordinates allocation pressure and whole-extent generation invalidation.
 ///
-/// The caller owns the store mutation lock. Reclaim never scans Entry owners, probes the key
+/// The caller owns the store mutation lock. Reclaim never scans victim Entries, probes the key
 /// index, or copies payloads. Cache priority controls physical placement and victim selection;
 /// generation validation makes every old location miss before payload I/O after an extent is
 /// released.
@@ -68,9 +68,9 @@ impl<'a> Reclaimer<'a> {
         }
     }
 
-    /// Completes a legacy Format 1 reclaim transaction left by an older process without scanning
-    /// its source. The persisted target cursor remains authoritative, and source locations become
-    /// generation-invalid cache misses.
+    /// Completes an interrupted Format 1 reclaim transaction left by an older process without
+    /// scanning its source. The persisted target cursor remains authoritative, and source
+    /// locations become generation-invalid cache misses.
     pub fn recover_pending(&self) -> Result<()> {
         let Some(transaction) = self.pool.pending_reclaim() else {
             return Ok(());

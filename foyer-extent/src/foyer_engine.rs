@@ -20,8 +20,8 @@ use futures_core::future::BoxFuture;
 use tokio::sync::Notify;
 
 use crate::{
-    CheckpointStats, DirectoryReadStats, EngineValue, EntryIndexReadStats, EntryIndexStats, Error, ExtentLayoutStats,
-    ExtentOccupancy, IoSchedulerStats, MAX_KEY_SIZE, PhysicalWriteStats, ReclaimStats,
+    CheckpointStats, EngineValue, EntryIndexReadStats, EntryIndexStats, Error, ExtentLayoutStats, ExtentOccupancy,
+    IoSchedulerStats, MAX_KEY_SIZE, PhysicalWriteStats, ReclaimStats,
     format::STORED_ENTRY_HEADER_SIZE,
     model::EntryKey,
     store::{ExtentStore, ExtentStoreConfig, PreparedGet},
@@ -291,10 +291,6 @@ impl ExtentEngineHandle {
 
     pub fn physical_write_stats(&self) -> Option<PhysicalWriteStats> {
         self.upgrade().map(|inner| inner.store.physical_write_stats())
-    }
-
-    pub fn directory_read_stats(&self) -> Option<DirectoryReadStats> {
-        self.upgrade().map(|inner| inner.store.directory_read_stats())
     }
 
     pub fn layout_stats(&self) -> Option<ExtentLayoutStats> {
@@ -1019,7 +1015,6 @@ mod tests {
         assert_eq!(writes.completed_batches, 1);
         let physical = handle.physical_write_stats().unwrap();
         assert_eq!(physical.data_syncs, 1);
-        assert_eq!(physical.entry_directory_syncs, 0);
         cache.close().await.unwrap();
     }
 
@@ -1072,8 +1067,6 @@ mod tests {
         assert_eq!(writes.completed_batches, 1);
         let physical = handle.physical_write_stats().unwrap();
         assert_eq!(physical.data_syncs, 1);
-        assert_eq!(physical.entry_directory_syncs, 0);
-        assert_eq!(physical.entry_directory_bytes, 0);
 
         cache.close().await.unwrap();
         drop(cache);

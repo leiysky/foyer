@@ -21,10 +21,10 @@ pub use self::{
     format::EXTENT_FORMAT_VERSION,
     index::{EntryIndexReadStats, EntryIndexStats},
     io::IoSchedulerStats,
-    stats::{DirectoryReadStats, ExtentLayoutStats, ExtentOccupancy, PhysicalWriteStats, ReclaimStats},
+    stats::{ExtentLayoutStats, ExtentOccupancy, PhysicalWriteStats, ReclaimStats},
 };
 #[cfg(test)]
-pub(crate) use self::{config::ExtentStoreOptions, core::InjectedFault};
+pub(crate) use self::{config::ExtentStoreOptions, core::InjectedFault, pool::LEGACY_ENTRY_DIRECTORY_FILE};
 pub(crate) use self::{
     config::PriorityCapacityFloors,
     core::PreparedGet,

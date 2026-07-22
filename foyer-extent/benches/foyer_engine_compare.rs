@@ -1458,7 +1458,7 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
     if let Some(layout) = handle.layout_stats() {
         let allocated = handle.allocated_size().unwrap_or_default();
         println!(
-            "engine={} phase=extent_layout configured_mib={:.1} allocated_mib={:.1} planned_file_mib={:.1} data_file_mib={:.1} usable_payload_mib={:.1} index_soft_mib={:.1} directory_planned_mib={:.1} directory_address_space_mib={:.1} physical_extents={} usable_extents={} extent_mib={:.1} entry_charge_kib={:.1} planned_entries={} maximum_entries={}",
+            "engine={} phase=extent_layout configured_mib={:.1} allocated_mib={:.1} planned_file_mib={:.1} data_file_mib={:.1} usable_payload_mib={:.1} index_soft_mib={:.1} physical_extents={} usable_extents={} extent_mib={:.1} entry_charge_kib={:.1} planned_entries={} maximum_entries={}",
             engine.label(),
             as_mib(layout.configured_capacity_bytes),
             as_mib(allocated),
@@ -1466,8 +1466,6 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
             as_mib(layout.data_file_bytes),
             as_mib(layout.usable_payload_bytes),
             as_mib(layout.index_soft_capacity_bytes),
-            as_mib(layout.directory_planned_bytes),
-            as_mib(layout.directory_logical_bytes),
             layout.physical_extents,
             layout.usable_extents,
             as_mib(layout.extent_size_bytes),
@@ -1478,7 +1476,7 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
     }
     if let Some(stats) = handle.physical_write_stats() {
         println!(
-            "engine={} phase=extent_write physical_mib={:.1} physical_runs={} physical_syncs={} data_mib={:.1} data_runs={} data_syncs={} directory_mib={:.1} directory_runs={} directory_syncs={} index_mib={:.1} index_runs={} index_syncs={} index_wal_mib={:.1} index_wal_runs={} index_wal_syncs={} index_sst_mib={:.1} index_sst_runs={} index_sst_syncs={} index_manifest_kib={:.1} index_manifest_runs={} index_manifest_syncs={} index_flushes={} index_compactions={} index_compaction_input_mib={:.1} index_compaction_output_mib={:.1} allocator_mib={:.1} allocator_runs={} allocator_syncs={}",
+            "engine={} phase=extent_write physical_mib={:.1} physical_runs={} physical_syncs={} data_mib={:.1} data_runs={} data_syncs={} index_mib={:.1} index_runs={} index_syncs={} index_wal_mib={:.1} index_wal_runs={} index_wal_syncs={} index_sst_mib={:.1} index_sst_runs={} index_sst_syncs={} index_manifest_kib={:.1} index_manifest_runs={} index_manifest_syncs={} index_flushes={} index_compactions={} index_compaction_input_mib={:.1} index_compaction_output_mib={:.1} allocator_mib={:.1} allocator_runs={} allocator_syncs={}",
             engine.label(),
             as_mib(stats.total_bytes()),
             stats.total_runs(),
@@ -1486,9 +1484,6 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
             as_mib(stats.data_bytes),
             stats.data_runs,
             stats.data_syncs,
-            as_mib(stats.entry_directory_bytes),
-            stats.entry_directory_runs,
-            stats.entry_directory_syncs,
             as_mib(stats.index_bytes),
             stats.index_runs,
             stats.index_syncs,
@@ -1508,14 +1503,6 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
             as_mib(stats.allocator_bytes),
             stats.allocator_runs,
             stats.allocator_syncs,
-        );
-    }
-    if let Some(stats) = handle.directory_read_stats() {
-        println!(
-            "engine={} phase=extent_directory_read read_mib={:.1} read_runs={}",
-            engine.label(),
-            as_mib(stats.bytes),
-            stats.runs,
         );
     }
     if let Some(stats) = handle.reclaim_stats() {

@@ -12,7 +12,7 @@ pub const PAGE_SIZE: usize = 4 * 1024;
 pub(crate) const CONTENT_DIGEST_SIZE: usize = 11;
 pub(crate) type ContentDigest = [u8; CONTENT_DIGEST_SIZE];
 const CONTENT_DIGEST_SEED: u64 = 0x4f1b_bcdd_94d0_49bb;
-/// The planning charge used to size the Format 1 compatibility directory and index targets.
+/// The planning charge used to size the Format 1 index target.
 ///
 /// Stored Entries are packed by byte inside an extent. This charge is neither a physical
 /// allocation unit nor an Entry-count limit.

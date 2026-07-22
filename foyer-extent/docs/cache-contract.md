@@ -38,8 +38,8 @@ The result owns its lifetime independently of cache locks, pages, and engine buf
 may retain, clone, or slice it without copying the underlying contents. The same type is returned
 for memory-tier and disk-tier hits.
 
-`Entry` is a logical cache value. It is never reused as an index record, directory record, physical
-allocation, or persistence acknowledgement.
+`Entry` is a logical cache value. It is never reused as an index record, physical allocation, or
+persistence acknowledgement.
 
 ## Operation semantics
 

@@ -18,7 +18,7 @@ pub use self::{
     model::{CachePriority, MAX_KEY_SIZE},
     store::{
         CheckpointStats, DEFAULT_EXTENT_SIZE, DEFAULT_HIGH_PRIORITY_CAPACITY_PERCENT,
-        DEFAULT_NORMAL_PRIORITY_CAPACITY_PERCENT, DirectoryReadStats, EXTENT_FORMAT_VERSION, EntryIndexReadStats,
-        EntryIndexStats, ExtentLayoutStats, ExtentOccupancy, IoSchedulerStats, PhysicalWriteStats, ReclaimStats,
+        DEFAULT_NORMAL_PRIORITY_CAPACITY_PERCENT, EXTENT_FORMAT_VERSION, EntryIndexReadStats, EntryIndexStats,
+        ExtentLayoutStats, ExtentOccupancy, IoSchedulerStats, PhysicalWriteStats, ReclaimStats,
     },
 };

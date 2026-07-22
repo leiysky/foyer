@@ -46,8 +46,8 @@ Cache API
    lifecycle translation, periodic checkpoint requests, and Foyer metrics.
 3. **ExtentStore** — owns ordered disk publication, checkpoint frontiers, EntryIndex coordination,
    and invocation of the concrete Reclaimer.
-4. **Persistence** — `ExtentPool` owns payload and allocator files plus the inert Format 1
-   directory placeholder. `EntryIndex` owns digest-to-location lookup through FixedRecordLSM.
+4. **Persistence** — `ExtentPool` owns the payload and allocator files. `EntryIndex` owns
+   digest-to-location lookup through FixedRecordLSM.
    Neither component knows about public API semantics or application key structure.
 
 These are concrete module boundaries rather than interchangeable backend traits. A new abstraction
@@ -84,8 +84,7 @@ overlay without issuing `fdatasync`. It then advances the published epoch. A che
 mutation order long enough to synchronize all dirty payload once and capture matching allocator
 and index images; allocator and index metadata persistence continues after the lock is released.
 This groups sparse-write durability, retains one total mutation order, and deliberately permits
-recovery to discard the uncheckpointed tail. The Format 1 directory file remains in the layout for
-compatibility but is neither written nor read by the runtime.
+recovery to discard the uncheckpointed tail without a per-Entry ownership sidecar.
 
 ### Keep the durable index narrow
 
@@ -116,17 +115,18 @@ every hit must pass location, generation, value-content-digest, and complete-key
 - Completion of an older same-key command cannot remove a newer pending value.
 - The first background write or checkpoint error is sticky and visible to later mutation and close.
 - Cumulative physical-I/O counters are reconciled exactly once; observability must not introduce
-  directory scans or full-stat collection into foreground reads.
+  filesystem scans or full-stat collection into foreground reads.
 - Test-only fault injection and benchmark configuration do not enter production modules.
 
 ## Compatibility policy
 
-The disk format is versioned as one layout: payload representation, Entry directory, allocator
-state, and FixedRecordLSM compatibility move together. An incompatible change advances
-`EXTENT_FORMAT_VERSION`; Extent rejects the old cache and may recreate it because the authoritative
-copy remains outside the cache. Stable numbering starts at format 1. A distinct stable-family magic
-prevents a development format with the same numeric version from being accepted. There is no
-selectable legacy format or in-place migration path.
+The disk format is versioned as one layout: payload representation, allocator state, and
+FixedRecordLSM compatibility move together. Format 1 may be replaced in place before its first
+production freeze because development cache images are expendable. After that freeze, an
+incompatible change advances `EXTENT_FORMAT_VERSION`; Extent rejects the old cache and may recreate
+it because the authoritative copy remains outside the cache. Stable numbering starts at format 1.
+A distinct stable-family magic prevents a development format with the same numeric version from
+being accepted. There is no selectable legacy format or in-place migration path.
 
 The Foyer engine boundary is separately guarded by a compile-time API version assertion. Extent and
 the workspace-pinned Foyer fork are upgraded together.

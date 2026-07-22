@@ -131,18 +131,16 @@ workload and cannot establish scheduler latency benefit.
 `EXTENT_BENCH_READ_RUN_KIB` and `EXTENT_BENCH_WRITE_RUN_KIB` override Extent's runtime-only maximum
 payload I/O request sizes. They do not alter the persistent layout, so recover-only runs can compare
 multiple read-run sizes against the same image. Keep values page-aligned. The Extent write record
-reports payload, directory, index, and allocator run and sync counts separately so a write-run
-experiment does not attribute metadata calls to payload splitting. Format 1 directory counters must
-remain zero after creation; any nonzero runtime value is a regression. `EXTENT_BENCH_WRITE_BATCH_DELAY_US`
+reports payload, index, and allocator run and sync counts separately so a write-run experiment does
+not attribute metadata calls to payload splitting. `EXTENT_BENCH_WRITE_BATCH_DELAY_US`
 controls the optional sparse-arrival data-write microbatch window and defaults to zero; compare a
 nonzero candidate with zero under the same seeds and alternating run order before enabling it. The
-`extent_layout` record separates usable payload from planned
-directory bytes, sparse logical directory size, and the soft Index target. The write record also
+`extent_layout` record separates usable payload from the soft Index target. The write record also
 splits index WAL, SST, and manifest calls/bytes/syncs and reports compaction input/output bytes;
 these counters describe userspace and FixedRecordLSM operations rather than device-internal write
 amplification. `extent_reclaim` reports invalidated extents/bytes, time waiting for an already
 captured checkpoint, generation-invalidation time, and total time. A correct normal reclaim shows no
-increase in `extent_directory_read` or index reads/writes beyond unrelated background maintenance.
+increase in index reads/writes beyond unrelated background maintenance.
 `extent_index` reports its indexed-cardinality upper bound and the cumulative number of stale
 locations checked and discarded by ordinary compaction. Checkpoint-time stale-overlay tombstones do
 not require a compaction and are validated by churn/reopen correctness tests.

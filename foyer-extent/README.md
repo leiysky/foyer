@@ -50,8 +50,8 @@ The Foyer-facing queue, pipeline, and recovery state is also exported through it
 `foyer_storage_engine_recovery_total`, and `foyer_storage_engine_healthy`. Queue gauges are updated
 at reservation ownership changes; the worker refreshes checkpoint frontiers on every batch and
 periodic checkpoint tick. `storage_usage()` is an O(1) snapshot over a fixed file set: it combines
-allocated blocks for the preallocated data/state files and sparse directory with
-FixedRecordLSM's atomic disk-budget counter.
+allocated blocks for the preallocated data/state files with FixedRecordLSM's atomic disk-budget
+counter.
 The shared physical-I/O counters include both payload and index reads, including reads that finish
 as a validated cache miss, and all payload, checkpoint, and index writes. Index counters split WAL,
 SST, and manifest writes/syncs and report flush and compaction bytes. Cumulative FixedRecordLSM
@@ -59,19 +59,18 @@ counters are reconciled exactly once so concurrent lookups cannot double-count i
 
 Stored Entries occupy contiguous byte ranges packed within cache extents. Adjacent allocations in
 one publication batch share page-aligned I/O frames; an I/O frame is not a capacity or reclaim unit.
-The sparse Format 1 directory is an inert compatibility placeholder; Stored Entries are indexed
-directly by location, and a cache extent is reused as one generation.
+Stored Entries are indexed directly by location, and a cache extent is reused as one generation.
 Object ranges, application-specific key encoding, and remote-storage behavior belong outside the
 project.
 
 Capacity is the only production static input. Stable format 1 owns a 64 MiB cache extent, a 4 KiB I/O
-frame, and a 4 KiB Entry planning charge. The charge sizes planned directory and index targets; it
-neither rounds physical Entry allocations nor caps how many small Entries may be packed into an
-extent. The data file, planned directory budget, and allocator state fit the configured capacity.
-The sparse directory address space remains logical-only, while the EntryIndex target may exceed its
-plan and report that pressure without rejecting a cache write. Changing these choices, layout
-derivation, record encoding, or an incompatible embedded-index format requires an
-`EXTENT_FORMAT_VERSION` bump.
+frame, and a 4 KiB Entry planning charge. The charge sizes the soft index target; it neither rounds
+physical Entry allocations nor caps how many small Entries may be packed into an extent. The data
+file and both allocator-state copies fit the configured capacity. The EntryIndex target may exceed
+its plan and report that pressure without rejecting a cache write. Changing these choices, layout
+derivation, record encoding, or an incompatible embedded-index format after the first production
+freeze requires an `EXTENT_FORMAT_VERSION` bump. Before that freeze, Format 1 may be replaced in
+place and development cache images remain expendable.
 Layout overrides remain available only as a test and benchmark escape hatch. Runtime I/O, queue,
 batching, checkpoint, priority-floor, and index-memory settings can change across reopens.
 
@@ -96,11 +95,12 @@ discards the unstarted queue tail, and publishes one final durable checkpoint. T
 is explicitly counted. This bounds shutdown by one batch plus checkpoint work without exposing a
 partially published entry; cache writes remain best effort and the source remains authoritative.
 
-Compatibility CI reconstructs a frozen complete development-V3 store image and verifies that stable
-format 1 rejects it and can recreate the expendable cache without leaving its legacy owner file
-behind. The stable format uses a distinct family magic, so development formats V1-V6 cannot collide
-with its version numbering. Stable-format round-trip, checkpoint-tail-discard, and process-crash
-tests cover the current directory, allocator, checkpoint, and reclaim publication paths.
+Compatibility CI reconstructs a frozen complete development-V3 store image and verifies that Format
+1 rejects it and can recreate the expendable cache without leaving legacy owner or directory files
+behind. A pre-release Format 1 image carrying the removed `directory` file is rejected by Strict
+recovery and recreated by Quiet recovery. The stable-family magic prevents development formats
+V1-V6 from colliding with its version numbering. Current-format round-trip, checkpoint-tail-discard,
+and process-crash tests cover the payload, allocator, checkpoint, and reclaim publication paths.
 
 Design documentation is organized by boundary:
 

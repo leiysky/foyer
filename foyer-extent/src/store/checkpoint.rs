@@ -250,9 +250,9 @@ impl Drop for CheckpointCoordinator {
 
 impl CheckpointShared {
     fn prepare_epoch(&self, epoch: u64) -> Result<CheckpointEpoch> {
-        // One checkpoint fence covers every data write in the captured publication range. The
-        // Format 1 directory file is retained for layout compatibility but is no longer written:
-        // recovery deliberately discards an uncheckpointed tail instead of paying per-put I/O.
+        // One checkpoint fence covers every data write in the captured publication range.
+        // Recovery deliberately discards an uncheckpointed tail instead of paying per-put
+        // ownership-metadata I/O.
         self.pool.sync_payload()?;
         #[cfg(test)]
         crate::store::crash_if_requested("extent_after_payload_sync");
