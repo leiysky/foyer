@@ -35,7 +35,7 @@ mod writer;
 
 pub use self::stats::{EngineReadStats, EngineWriteStats};
 use self::{
-    queue::{QueueReservation, SubmissionQueue},
+    queue::SubmissionQueue,
     read::ReadLimiter,
     recovery::{RecoveryOutcome, open_store},
     stats::EngineStats,
@@ -46,7 +46,6 @@ const DEFAULT_QUEUE_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_QUEUE_CAPACITY_ENTRIES: usize = 65_536;
 const DEFAULT_WRITE_BATCH_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_WRITE_BATCH_ENTRIES: usize = 4_096;
-const DEFAULT_READ_BUSY_WRITE_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_WRITE_BATCH_DELAY: Duration = Duration::ZERO;
 const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_DEFAULT_READ_CONCURRENCY: usize = 64;
@@ -74,7 +73,6 @@ pub struct ExtentEngineTestTuning {
     pub queue_capacity_entries: Option<usize>,
     pub write_batch_bytes: Option<usize>,
     pub write_batch_entries: Option<usize>,
-    pub read_busy_write_batch_bytes: Option<usize>,
     pub write_batch_delay: Option<Duration>,
 }
 
@@ -100,7 +98,6 @@ pub struct ExtentEngineConfig {
     queue_capacity_entries: usize,
     write_batch_bytes: usize,
     write_batch_entries: usize,
-    read_busy_write_batch_bytes: usize,
     write_batch_delay: Duration,
     read_concurrency: usize,
     checkpoint_interval: Duration,
@@ -118,7 +115,6 @@ impl ExtentEngineConfig {
             queue_capacity_entries: DEFAULT_QUEUE_CAPACITY_ENTRIES,
             write_batch_bytes: DEFAULT_WRITE_BATCH_BYTES,
             write_batch_entries: DEFAULT_WRITE_BATCH_ENTRIES,
-            read_busy_write_batch_bytes: DEFAULT_READ_BUSY_WRITE_BATCH_BYTES,
             write_batch_delay: DEFAULT_WRITE_BATCH_DELAY,
             read_concurrency: default_read_concurrency(),
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
@@ -166,9 +162,6 @@ impl ExtentEngineConfig {
         }
         if let Some(value) = tuning.write_batch_entries {
             self.write_batch_entries = value;
-        }
-        if let Some(value) = tuning.read_busy_write_batch_bytes {
-            self.read_busy_write_batch_bytes = value;
         }
         if let Some(value) = tuning.write_batch_delay {
             self.write_batch_delay = value;
@@ -233,9 +226,6 @@ impl ExtentEngineConfig {
             return Err(config_error(
                 "extent write batch entries must be positive and no larger than the queue",
             ));
-        }
-        if self.read_busy_write_batch_bytes == 0 {
-            return Err(config_error("extent read-busy write batch bytes must be positive"));
         }
         if self.read_concurrency == 0 {
             return Err(config_error("extent read concurrency must be positive"));
@@ -493,13 +483,10 @@ impl ExtentEngine {
             io_control.statistics().clone(),
             config.write_batch_entries,
             config.write_batch_bytes,
-            config.read_busy_write_batch_bytes,
             config.write_batch_delay,
             config.checkpoint_interval,
             background_error.clone(),
             stats.clone(),
-            index_read_limiter.clone(),
-            read_limiter.clone(),
             shutdown.clone(),
             #[cfg(test)]
             panic_next.clone(),
@@ -554,25 +541,33 @@ impl Engine<Bytes, EngineValue, HybridCacheProperties> for ExtentEngine {
             self.inner.stats.record_dropped_command();
             return StorageFilterResult::Reject;
         }
-        if estimated_size > self.inner.queue.capacity_bytes()
-            || self.inner.queue.pending_entries() >= self.inner.queue.capacity_entries()
-            || self.inner.queue.pending_bytes() >= self.inner.queue.capacity_bytes()
-        {
+        if estimated_size > self.inner.queue.capacity_bytes() {
             self.inner.stats.record_dropped_command();
             self.inner.metrics.storage_queue_buffer_overflow.increase(1);
             return StorageFilterResult::Reject;
         }
-        // The exact priority is available only at enqueue. Keep this prefilter to hard bounds and
-        // apply priority/read-pressure shedding at the engine boundary.
+        // Queue occupancy is transient pipeline state, not logical admission policy. BlockEngine
+        // makes the same separation: only enqueue applies its current queue-pressure gate.
         StorageFilterResult::Admit
     }
 
     fn enqueue(&self, piece: ExtentPiece, estimated_size: usize) {
-        let key = piece.key().clone();
+        // Foyer offers a successful disk load back to storage as Young. Treat that age as a
+        // no-reinsertion hint: writing it again would turn a read into payload and index write
+        // amplification. Age does not pin or validate the old location. The load already passed
+        // Extent's pre/post-I/O generation checks; reclaim racing after it may cause a later miss,
+        // which is allowed by the best-effort cache contract, but cannot expose stale bytes.
+        if piece.properties().age() == Age::Young {
+            self.inner.stats.record_young_skipped_command();
+            return;
+        }
+        let key = piece.key();
         let value = piece.value().value();
-        if key.is_empty()
-            || key.len() > MAX_KEY_SIZE
-            || value.is_empty()
+        if key.is_empty() || key.len() > MAX_KEY_SIZE {
+            self.inner.stats.record_dropped_command();
+            return;
+        }
+        if value.is_empty()
             || STORED_ENTRY_HEADER_SIZE
                 .checked_add(key.len())
                 .and_then(|size| size.checked_add(value.len()))
@@ -582,8 +577,7 @@ impl Engine<Bytes, EngineValue, HybridCacheProperties> for ExtentEngine {
             return;
         }
         let priority = piece.value().priority();
-        self.inner
-            .try_send(estimated_size, priority, |reservation| Command::put(piece, reservation));
+        self.inner.try_send_put(piece, estimated_size, priority);
     }
 
     fn load(
@@ -728,26 +722,17 @@ impl Engine<Bytes, EngineValue, HybridCacheProperties> for ExtentEngine {
 }
 
 impl Inner {
-    fn try_send(
-        &self,
-        charge: usize,
-        priority: crate::CachePriority,
-        build: impl FnOnce(QueueReservation) -> Command,
-    ) -> bool {
+    fn try_send_put(&self, piece: ExtentPiece, charge: usize, priority: crate::CachePriority) -> bool {
         if self.close_state.load(Ordering::Acquire) != OPEN || self.background_error.is_failed() {
             self.stats.record_dropped_command();
             return false;
         }
-        if self.should_shed(priority) {
-            self.stats.record_shed_command(priority);
-            return false;
-        }
         let Some(reservation) = self.queue.try_reserve(charge) else {
-            self.stats.record_dropped_command();
+            self.stats.record_shed_command(priority);
             self.metrics.storage_queue_buffer_overflow.increase(1);
             return false;
         };
-        let command = build(reservation);
+        let command = Command::put(piece, reservation);
         let sender = mutex_lock(&self.sender);
         match sender.as_ref() {
             Some(sender) => match sender.send(command) {
@@ -803,28 +788,6 @@ impl Inner {
         }
     }
 
-    fn should_shed(&self, priority: crate::CachePriority) -> bool {
-        let readers_active = self.index_read_limiter.active() > 0 || self.read_limiter.active() > 0;
-        let (numerator, denominator) = match (priority, readers_active) {
-            (crate::CachePriority::Low, true) => (1, 4),
-            (crate::CachePriority::Low, false) => (1, 2),
-            (crate::CachePriority::Normal, true) => (1, 2),
-            (crate::CachePriority::Normal, false) => (3, 4),
-            (crate::CachePriority::High, _) => return false,
-        };
-        at_fraction(
-            self.queue.pending_entries(),
-            self.queue.capacity_entries(),
-            numerator,
-            denominator,
-        ) || at_fraction(
-            self.queue.pending_bytes(),
-            self.queue.capacity_bytes(),
-            numerator,
-            denominator,
-        )
-    }
-
     async fn close(self: Arc<Self>) -> foyer::Result<()> {
         match self
             .close_state
@@ -870,14 +833,6 @@ impl Inner {
     }
 }
 
-fn at_fraction(value: usize, capacity: usize, numerator: usize, denominator: usize) -> bool {
-    let threshold = capacity
-        .checked_mul(numerator)
-        .map_or_else(|| capacity / denominator * numerator, |scaled| scaled / denominator)
-        .max(1);
-    value >= threshold
-}
-
 fn config_error(message: &'static str) -> FoyerError {
     FoyerError::new(FoyerErrorKind::Config, message)
 }
@@ -919,7 +874,7 @@ mod tests {
         assert_eq!(default_read_concurrency_for(128), MAX_DEFAULT_READ_CONCURRENCY);
     }
 
-    async fn cache(path: &std::path::Path) -> (TestCache, ExtentEngineHandle) {
+    async fn cache_with_recover(path: &std::path::Path, recover_mode: RecoverMode) -> (TestCache, ExtentEngineHandle) {
         let config = ExtentEngineConfig::new(path, 16 * 1024 * 1024)
             .with_test_tuning(test_tuning())
             .with_index_cache_size(1024 * 1024);
@@ -931,11 +886,15 @@ mod tests {
             .memory(1024 * 1024)
             .storage()
             .with_engine_config(Box::new(config) as Box<dyn EngineConfig<Bytes, EngineValue, HybridCacheProperties>>)
-            .with_recover_mode(RecoverMode::None)
+            .with_recover_mode(recover_mode)
             .build()
             .await
             .unwrap();
         (cache, handle)
+    }
+
+    async fn cache(path: &std::path::Path) -> (TestCache, ExtentEngineHandle) {
+        cache_with_recover(path, RecoverMode::None).await
     }
 
     fn insert(cache: &TestCache, suffix: u8) {
@@ -1074,6 +1033,61 @@ mod tests {
             Some(vec![2; 4096])
         );
         assert_eq!(reopened.store.get(&EntryKey::new(&deleted).unwrap()).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn active_readers_do_not_change_normal_write_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let (cache, handle) = cache(directory.path()).await;
+        let inner = handle.upgrade().unwrap();
+        let read_permit = inner.read_limiter.try_acquire().unwrap();
+        let held = inner.queue.try_reserve(inner.queue.capacity_bytes() * 3 / 5).unwrap();
+
+        insert(&cache, 1);
+        let writes = handle.write_stats().unwrap();
+        assert_eq!(writes.accepted_commands, 1);
+        assert_eq!(writes.shed_normal_commands, 0);
+
+        drop((held, read_permit));
+        drop(inner);
+        cache.storage().wait().await;
+        cache.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disk_hit_does_not_rewrite_young_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = Bytes::from_static(b"disk-hit");
+        let (cache, _) = cache(directory.path()).await;
+        cache.insert(
+            key.clone(),
+            EngineValue::new(Bytes::from(vec![7; 4096]), crate::CachePriority::Normal).unwrap(),
+        );
+        cache.storage().wait().await;
+        cache.close().await.unwrap();
+        drop(cache);
+
+        let (reopened, handle) = cache_with_recover(directory.path(), RecoverMode::Strict).await;
+        let physical_before = handle.physical_write_stats().unwrap();
+        for _ in 0..128 {
+            reopened.memory().remove(&key);
+            let entry = reopened
+                .get_or_fetch(&key, || async {
+                    Err::<EngineValue, _>(std::io::Error::other("disk hit unexpectedly missed"))
+                })
+                .await
+                .unwrap();
+            assert_eq!(entry.value().value(), &Bytes::from(vec![7; 4096]));
+        }
+        reopened.storage().wait().await;
+
+        let writes = handle.write_stats().unwrap();
+        assert_eq!(writes.young_skipped_commands, 128);
+        assert_eq!(writes.accepted_commands, 0);
+        assert_eq!(writes.completed_commands, 0);
+        assert_eq!(handle.read_stats().unwrap().calls, 128);
+        assert_eq!(handle.physical_write_stats().unwrap(), physical_before);
+        reopened.close().await.unwrap();
     }
 
     #[tokio::test]

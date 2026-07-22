@@ -57,6 +57,7 @@ pub struct Metrics {
     pub storage_engine_command_dropped: BoxedCounter,
     pub storage_engine_command_completed: BoxedCounter,
     pub storage_engine_command_rejected: BoxedCounter,
+    pub storage_engine_command_young_skipped: BoxedCounter,
     pub storage_engine_command_shutdown_dropped: BoxedCounter,
     pub storage_engine_command_shed_low: BoxedCounter,
     pub storage_engine_command_shed_normal: BoxedCounter,
@@ -358,6 +359,8 @@ impl Metrics {
             foyer_storage_engine_command_total.counter(&[name.clone(), "completed".into()]);
         let storage_engine_command_rejected =
             foyer_storage_engine_command_total.counter(&[name.clone(), "storage_rejected".into()]);
+        let storage_engine_command_young_skipped =
+            foyer_storage_engine_command_total.counter(&[name.clone(), "young_skipped".into()]);
         let storage_engine_command_shutdown_dropped =
             foyer_storage_engine_command_total.counter(&[name.clone(), "shutdown_dropped".into()]);
         let storage_engine_command_shed_low =
@@ -516,6 +519,7 @@ impl Metrics {
             storage_engine_command_dropped,
             storage_engine_command_completed,
             storage_engine_command_rejected,
+            storage_engine_command_young_skipped,
             storage_engine_command_shutdown_dropped,
             storage_engine_command_shed_low,
             storage_engine_command_shed_normal,

@@ -79,10 +79,15 @@ key or cache-extent generation.
 
 ## Priority and admission
 
-Cache priority is the caller's explicit temperature and retention class. It affects queue shedding,
-physical extent placement, protected capacity floors, and victim selection. Foreground reads do not
-maintain a second frequency estimate, and reclaim never copies a hit merely to preserve it. Callers
-that know data is hot use high priority; cold or speculative data uses low priority.
+Cache priority is the caller's explicit temperature and retention class. It affects physical extent
+placement, protected capacity floors, and victim selection, but not volatile queue admission.
+Foreground reads do not affect write admission, maintain a second frequency estimate, or resize
+write batches. A successfully loaded entry is marked young and skipped if Foyer offers it back to
+storage, so a read hit does not rewrite payload or index metadata. Age is a volatile reinsertion
+hint, not a persisted generation or location lease. Extent's pre/post-I/O generation validation
+remains the authority for hit integrity; reclaim after a load may produce a later miss. Reclaim
+never copies a hit merely to preserve it. Callers that know data is hot use high priority; cold or
+speculative data uses low priority.
 
 Admission is internal. A put can be queued, shed, dropped during shutdown, rejected by cache
 policy, or fail in the background without changing the method's return type. These outcomes are

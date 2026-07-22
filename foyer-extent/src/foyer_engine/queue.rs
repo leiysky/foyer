@@ -6,7 +6,11 @@ use std::sync::{
 use foyer::Metrics;
 use tokio::sync::Notify;
 
-/// Hard bounds shared by queued and currently executing engine commands.
+/// Hard write-memory bounds shared by queued and currently executing engine commands.
+///
+/// Admission into this queue depends only on write-pipeline occupancy. Read activity and cache
+/// priority are deliberately not inputs: priority governs persistent placement and reclaim, while
+/// physical read/write arbitration belongs to the I/O scheduler below the queue.
 pub struct SubmissionQueue {
     capacity_entries: usize,
     capacity_bytes: usize,
@@ -45,11 +49,11 @@ impl SubmissionQueue {
     }
 
     pub fn pending_entries(&self) -> usize {
-        self.pending_entries.load(Ordering::Relaxed)
+        self.pending_entries.load(Ordering::Acquire)
     }
 
     pub fn pending_bytes(&self) -> usize {
-        self.pending_bytes.load(Ordering::Relaxed)
+        self.pending_bytes.load(Ordering::Acquire)
     }
 
     pub fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<QueueReservation> {
@@ -57,21 +61,21 @@ impl SubmissionQueue {
             return None;
         }
 
-        let mut entries = self.pending_entries.load(Ordering::Relaxed);
+        let mut entries = self.pending_entries.load(Ordering::Acquire);
         loop {
             if entries >= self.capacity_entries {
                 return None;
             }
             match self
                 .pending_entries
-                .compare_exchange_weak(entries, entries + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .compare_exchange_weak(entries, entries + 1, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => break,
                 Err(observed) => entries = observed,
             }
         }
 
-        let mut current = self.pending_bytes.load(Ordering::Relaxed);
+        let mut current = self.pending_bytes.load(Ordering::Acquire);
         loop {
             let Some(next) = current.checked_add(bytes) else {
                 self.rollback_entry();
@@ -83,7 +87,7 @@ impl SubmissionQueue {
             }
             match self
                 .pending_bytes
-                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed)
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => break,
                 Err(observed) => current = observed,
@@ -178,15 +182,33 @@ mod tests {
     }
 
     #[test]
-    fn every_command_shares_the_same_hard_limits() {
-        let queue = Arc::new(SubmissionQueue::new(1, 4, Arc::new(Metrics::noop())));
-        let data = queue.try_reserve(4).unwrap();
-        assert!(queue.try_reserve(3).is_none());
-        assert_eq!(queue.pending_entries(), 1);
-        assert_eq!(queue.pending_bytes(), 4);
-        assert!(queue.try_reserve(0).is_none());
-
-        drop(data);
+    fn randomized_concurrent_reservations_stay_within_hard_bounds() {
+        let queue = Arc::new(SubmissionQueue::new(128, 1024 * 1024, Arc::new(Metrics::noop())));
+        let mut workers = Vec::new();
+        for worker in 0..8u64 {
+            let queue = queue.clone();
+            workers.push(std::thread::spawn(move || {
+                let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ worker;
+                let mut reservations = Vec::new();
+                for _ in 0..10_000 {
+                    state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    if !reservations.is_empty() && (state & 3) == 0 {
+                        let index = state as usize % reservations.len();
+                        reservations.swap_remove(index);
+                    } else {
+                        let bytes = ((state >> 16) as usize % (32 * 1024)) + 1;
+                        if let Some(reservation) = queue.try_reserve(bytes) {
+                            reservations.push(reservation);
+                        }
+                    }
+                    assert!(queue.pending_entries() <= queue.capacity_entries());
+                    assert!(queue.pending_bytes() <= queue.capacity_bytes());
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
         assert_eq!(queue.pending_entries(), 0);
         assert_eq!(queue.pending_bytes(), 0);
     }

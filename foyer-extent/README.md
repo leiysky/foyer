@@ -11,10 +11,10 @@ engine submission boundary and one hard-bounded ordered disk queue. `ExtentStore
 publication, and checkpoint coordination; its concrete `Reclaimer` owns allocation pressure,
 generation-reuse fencing, and priority-aware reclaim.
 
-The balanced engine defaults use a 256 MiB submission budget, 128 MiB idle write batches, an 8 MiB
-write batch while reads are active, and a 30-second periodic checkpoint request in addition to
-the 256 MiB published-byte trigger. High and normal priorities have borrowable 10% and 70% logical
-extent capacity floors; low priority uses unprotected capacity. Durable-index and payload reads use
+The balanced engine defaults use a 256 MiB submission budget, 128 MiB write batches, and a
+30-second periodic checkpoint request in addition to the 256 MiB published-byte trigger. High and
+normal priorities have borrowable 10% and 70% logical extent capacity floors; low priority uses
+unprotected capacity. Durable-index and payload reads use
 independent hard, non-waiting `min(2 * available_parallelism, 64)` admission limits. The synchronous
 payload I/O scheduler gives an active entry-payload read a bounded 2 ms head start over newly
 admitted writes; reads never wait behind writes, and
@@ -23,13 +23,19 @@ admission layer: reads, syncs, and default single-concurrency writes execute on 
 parallel-write configurations use one persistent bounded pool rather than per-batch OS threads.
 No io_uring dependency is involved.
 
-Low- and normal-priority writes are progressively shed before the queue is full, with earlier
-shedding while reads are active; high-priority puts retain the hard queue budget. Puts and deletes
-share the same hard entry and byte bounds. A rejected put does not enqueue a compensating delete,
-so overload cannot become unbounded control debt; mutable callers encode freshness in the key as
-required by the cache contract. An ordered worker batch retains only the final command per complete
-key and coalesces all surviving puts into page-aligned writes. Checkpoints group payload durability
-once per captured epoch. Reclaim adds one recovery-critical generation-state sync without syncing
+Puts and deletes share exact hard entry and byte bounds. Queue admission observes only write-memory
+occupancy: active reads and cache priority do not change the limit, and no class is shed before the
+hard bound. Entries populated by a successful disk hit are marked young and skipped before queue
+admission, so a cache read cannot rewrite the same entry. Age is only a reinsertion hint: the load's
+generation checks establish hit integrity, while a later reclaim may cause a future miss without
+exposing stale data. Priority controls persistent placement and reclaim instead. A command dropped
+at the hard queue bound does not enqueue a compensating delete, so overload cannot become
+metadata-write amplification; mutable callers encode freshness in the key as required by the cache
+contract. One FIFO stream preserves complete-key order. An ordered worker batch retains only the
+final command per complete key and coalesces all surviving puts into page-aligned writes. Read
+priority is enforced only by the payload I/O scheduler, not by queue admission or batch sizing.
+Checkpoints group payload durability once per captured epoch. Reclaim adds one recovery-critical
+generation-state sync without syncing
 unrelated dirty payload; it does not scan the victim or copy retained payload. An
 `ExtentEngineHandle` exposes queue depth, publication/durability frontiers, asynchronous write
 outcomes, active read admission, scheduler waits, physical I/O, reclaim work, and the first sticky

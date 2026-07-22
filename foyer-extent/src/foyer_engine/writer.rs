@@ -15,7 +15,7 @@ use foyer::{Metrics, Statistics};
 
 use crate::{
     ReclaimStats,
-    foyer_engine::{ExtentPiece, mutex_lock, queue::QueueReservation, read::ReadLimiter, stats::EngineStats},
+    foyer_engine::{ExtentPiece, mutex_lock, queue::QueueReservation, stats::EngineStats},
     model::EntryKey,
     store::{BatchInsertResult, EntryInsert, ExtentStore, InsertOutcome},
 };
@@ -105,13 +105,10 @@ pub struct WriteWorker {
     statistics: Arc<Statistics>,
     batch_entries: usize,
     batch_bytes: usize,
-    read_busy_batch_bytes: usize,
     batch_delay: Duration,
     checkpoint_interval: Duration,
     background_error: Arc<BackgroundError>,
     stats: Arc<EngineStats>,
-    index_read_limiter: Arc<ReadLimiter>,
-    read_limiter: Arc<ReadLimiter>,
     shutdown: Arc<AtomicBool>,
     #[cfg(test)]
     panic_next: Arc<AtomicBool>,
@@ -123,13 +120,10 @@ impl WriteWorker {
         statistics: Arc<Statistics>,
         batch_entries: usize,
         batch_bytes: usize,
-        read_busy_batch_bytes: usize,
         batch_delay: Duration,
         checkpoint_interval: Duration,
         background_error: Arc<BackgroundError>,
         stats: Arc<EngineStats>,
-        index_read_limiter: Arc<ReadLimiter>,
-        read_limiter: Arc<ReadLimiter>,
         shutdown: Arc<AtomicBool>,
         #[cfg(test)] panic_next: Arc<AtomicBool>,
     ) -> Self {
@@ -138,13 +132,10 @@ impl WriteWorker {
             statistics,
             batch_entries,
             batch_bytes,
-            read_busy_batch_bytes,
             batch_delay,
             checkpoint_interval,
             background_error,
             stats,
-            index_read_limiter,
-            read_limiter,
             shutdown,
             #[cfg(test)]
             panic_next,
@@ -203,12 +194,7 @@ impl WriteWorker {
             let mut bytes = first.charge();
             let mut commands = Vec::with_capacity(self.batch_entries.min(1_024));
             commands.push(first);
-            let batch_bytes = if self.read_limiter.active() == 0 && self.index_read_limiter.active() == 0 {
-                self.batch_bytes
-            } else {
-                self.read_busy_batch_bytes.min(self.batch_bytes)
-            };
-            while commands.len() < self.batch_entries && bytes < batch_bytes {
+            while commands.len() < self.batch_entries && bytes < self.batch_bytes {
                 match receiver.try_recv() {
                     Ok(command) => {
                         bytes = bytes.saturating_add(command.charge());

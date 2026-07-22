@@ -28,17 +28,19 @@ pub struct EngineReadStats {
 /// Cumulative outcomes at ExtentEngine's asynchronous write boundary.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EngineWriteStats {
+    /// Disk-populated young entries skipped before queue admission.
+    pub young_skipped_commands: u64,
     /// Commands accepted by Extent's hard-bounded ordered queue.
     pub accepted_commands: u64,
     /// Commands shed by admission, validation, close, or an enqueue race.
     pub dropped_commands: u64,
     /// Accepted commands discarded during a bounded graceful shutdown.
     pub shutdown_dropped_commands: u64,
-    /// Low-priority commands shed before reaching the hard queue bound.
+    /// Low-priority commands dropped at the hard write-queue bound.
     pub shed_low_commands: u64,
-    /// Normal-priority commands shed before reaching the hard queue bound.
+    /// Normal-priority commands dropped at the hard write-queue bound.
     pub shed_normal_commands: u64,
-    /// High-priority commands shed at the hard queue bound.
+    /// High-priority commands dropped at the hard write-queue bound.
     pub shed_high_commands: u64,
     /// Accepted commands fully processed by ExtentStore.
     pub completed_commands: u64,
@@ -99,6 +101,11 @@ impl EngineStats {
     pub fn record_accepted_command(&self) {
         self.writes.accepted_commands.fetch_add(1, Ordering::Relaxed);
         self.metrics.storage_engine_command_accepted.increase(1);
+    }
+
+    pub fn record_young_skipped_command(&self) {
+        self.writes.young_skipped_commands.fetch_add(1, Ordering::Relaxed);
+        self.metrics.storage_engine_command_young_skipped.increase(1);
     }
 
     pub fn record_dropped_command(&self) {
@@ -276,6 +283,7 @@ struct EngineReadCounters {
 
 #[derive(Default)]
 struct EngineWriteCounters {
+    young_skipped_commands: AtomicU64,
     accepted_commands: AtomicU64,
     dropped_commands: AtomicU64,
     shutdown_dropped_commands: AtomicU64,
@@ -291,6 +299,7 @@ struct EngineWriteCounters {
 impl EngineWriteCounters {
     fn snapshot(&self) -> EngineWriteStats {
         EngineWriteStats {
+            young_skipped_commands: self.young_skipped_commands.load(Ordering::Relaxed),
             accepted_commands: self.accepted_commands.load(Ordering::Relaxed),
             dropped_commands: self.dropped_commands.load(Ordering::Relaxed),
             shutdown_dropped_commands: self.shutdown_dropped_commands.load(Ordering::Relaxed),

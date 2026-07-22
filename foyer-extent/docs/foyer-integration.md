@@ -26,31 +26,37 @@ layer around Foyer.
 
 ## Write path
 
-Foyer invokes ExtentEngine through a non-blocking enqueue contract. The engine reserves both one
-queue entry and its encoded-byte charge before accepting a command. That reservation remains owned
-by the command for its complete queued and in-flight lifetime, preventing accounting gaps during
-worker handoff.
+Foyer invokes ExtentEngine through a non-blocking enqueue contract. The engine reserves both one queue
+entry and its encoded-byte charge before accepting a command. That reservation remains owned by the
+command for its complete queued and in-flight lifetime, preventing accounting gaps during worker
+handoff.
 
-Every put and delete reservation is bounded by the same entry and byte limits. Low- and
-normal-priority puts are progressively shed before the hard byte bound, with earlier shedding while
-storage reads are active. High-priority puts may use the full configured queue budget. Shedding
-prevents unbounded I/O debt and does not become a per-put result. A rejected or invalid put is simply
-dropped; it does not append a compensating delete that could turn overload into unbounded control
-debt. Explicit delete remains a best-effort hint and may also be dropped at the hard bound.
+Logical admission and pipeline pressure are separate decisions. `filter` handles only stable entry
+eligibility, lifecycle failure, and an entry too large ever to fit the queue. Stable rejection there
+continues through Foyer's normal cache invalidation path. The enqueue boundary first skips a
+disk-populated `Age::Young` entry as a no-reinsertion hint, then applies one exact shared entry/byte
+limit to puts and deletes. Age does not pin the old location or replace Extent generation checks:
+reclaim racing after the successful load can cause a future miss, but not a stale hit. Admission
+does not inspect active readers or cache priority, so an identical write workload receives identical
+queue capacity during idle and read-heavy periods. Cache priority remains a persistent placement and
+reclaim policy. Commands that encounter the hard bound are dropped without blocking the caller or
+appending a compensating delete that could turn overload into metadata-write amplification.
+Explicit delete remains a best-effort hint and may also be dropped at the hard bound. Per-priority
+shed counters describe which data traffic reached that single bound; they are observations, not
+separate queue quotas.
 
 One worker owns write order and groups commands into physical store batches. Before publication it
 keeps only the final command for each complete key, writes all surviving puts in one store batch,
 and applies final deletes together. This removes superseded payload writes without weakening the
 hard queue bound. Because a rejected replacement does not invalidate an older disk value, mutable
-callers must include freshness in the key or validate it after lookup, as required by the cache
-contract.
+callers include freshness in the key or validate it after lookup, as required by the cache contract.
 
-The worker uses a larger idle batch and a smaller read-busy batch so already admitted writes make
-progress without monopolizing the device. Immediate draining is the default. An optional
-microbatch window can wait for sparse arrivals to join the same batch; the deadline is measured
-from the first command's enqueue time, so an already-backlogged command receives no extra delay.
-This can amortize page-aligned data writes; durability is grouped independently by checkpoints.
-Completion is reported to Foyer's
+The worker always uses the configured write-batch limits. Immediate draining is the default. An
+optional microbatch window can wait for sparse arrivals to join the same batch; the deadline is
+measured from the first command's enqueue time, so an already-backlogged command receives no extra
+delay. Device read priority belongs exclusively to the payload I/O scheduler below this queue; it
+does not alter admission or split an otherwise identical write batch. This can amortize page-aligned
+data writes; durability is grouped independently by checkpoints. Completion is reported to Foyer's
 pending-write keeper with the command generation;
 completion of an older same-key write cannot erase a newer pending value.
 
@@ -147,11 +153,11 @@ contract.
 
 `ExtentEngineHandle` is a read-only view over the same state used by the engine. It exposes queue
 ownership, asynchronous outcomes, publication and durable frontiers, physical-record occupancy and
-the indexed-cardinality upper bound, physical
+the indexed-cardinality upper bound, disk-populated young entries skipped before admission, physical
 I/O, per-file sync counts, separate index WAL/SST/manifest writes and syncs, index flush/compaction
 bytes, lazy stale-location checks/discards, immutable layout planning, checkpoint-wait and
-generation-invalidation reclaim timing, scheduler waits, and the first background failure. It is
-not a second control plane or a write receipt.
+generation-invalidation reclaim timing, scheduler waits, and the first background failure. It is not
+a second control plane or a write receipt.
 
 The shared Foyer registry exports the corresponding counters, gauges, and latency histograms.
 Queue gauges change at reservation ownership boundaries, checkpoint gauges are refreshed after

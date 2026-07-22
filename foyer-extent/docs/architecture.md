@@ -97,10 +97,12 @@ rewrite or adds reclaim I/O.
 
 ### Keep resource pressure best effort
 
-Foyer puts are fire-and-forget, every put/delete reservation is bounded, reads do not wait for
-storage capacity, and low-value work may be shed. A rejected put does not manufacture a delete:
-callers encode freshness in the key, and explicit delete remains a best-effort hint subject to the
-same hard queue limits. This weak admission contract is paired with a strong integrity contract:
+Foyer puts are fire-and-forget, every put/delete reservation is bounded, and reads do not wait for
+storage capacity. Queue admission depends only on the write pipeline's exact entry and byte usage;
+it does not observe active readers or apply cache-priority partitions. A command dropped at the
+enqueue boundary's hard limit does not manufacture a delete, so overload cannot become
+metadata-write amplification. Stable filter rejection continues to use Foyer's normal cache
+invalidation semantics. This weak admission contract is paired with a strong integrity contract:
 every hit must pass location, generation, value-content-digest, and complete-key checks.
 
 ## Cross-layer invariants
@@ -111,7 +113,9 @@ every hit must pass location, generation, value-content-digest, and complete-key
   it.
 - A reclaimed location is rejected from the lock-free liveness table before payload I/O; a racing
   reuse is rejected again after I/O.
+- Foyer `Age` is a reinsertion hint; it neither persists nor pins an Extent generation.
 - A queue reservation has exactly one owner from admission through completion or discard.
+- Read activity and cache priority cannot change queue capacity or write-batch limits.
 - Completion of an older same-key command cannot remove a newer pending value.
 - The first background write or checkpoint error is sticky and visible to later mutation and close.
 - Cumulative physical-I/O counters are reconciled exactly once; observability must not introduce
