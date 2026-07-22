@@ -96,11 +96,10 @@ is explicitly counted. This bounds shutdown by one batch plus checkpoint work wi
 partially published entry; cache writes remain best effort and the source remains authoritative.
 
 Compatibility CI reconstructs a frozen complete development-V3 store image and verifies that Format
-1 rejects it and can recreate the expendable cache without leaving legacy owner or directory files
-behind. A pre-release Format 1 image carrying the removed `directory` file is rejected by Strict
-recovery and recreated by Quiet recovery. The stable-family magic prevents development formats
-V1-V6 from colliding with its version numbering. Current-format round-trip, checkpoint-tail-discard,
-and process-crash tests cover the payload, allocator, checkpoint, and reclaim publication paths.
+1 rejects it and can recreate the expendable cache without leaving its legacy owner file behind.
+The stable-family magic prevents development formats V1-V6 from colliding with its version
+numbering. Current-format round-trip, checkpoint-tail-discard, and process-crash tests cover the
+payload, allocator, checkpoint, and reclaim publication paths.
 
 Design documentation is organized by boundary:
 

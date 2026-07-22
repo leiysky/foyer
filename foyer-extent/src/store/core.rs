@@ -22,10 +22,7 @@ use crate::{
         index::{EntryIndex, EntryIndexMemoryLookup, EntryIndexReadStats, EntryIndexStats, INDEX_DIRECTORY},
         io::IoSchedulerStats,
         operation::{BatchInsertResult, EntryInsert, GetResult, InsertOutcome},
-        pool::{
-            DATA_FILE, EntryAllocation, EntryWrite, ExtentPool, LEGACY_ENTRY_DIRECTORY_FILE, LEGACY_SLOT_OWNER_FILE,
-            STATE_FILE,
-        },
+        pool::{DATA_FILE, EntryAllocation, EntryWrite, ExtentPool, LEGACY_SLOT_OWNER_FILE, STATE_FILE},
         reclaim::{AllocationDecision, ReclaimResult, Reclaimer},
         stats::{ExtentLayoutStats, ExtentOccupancy, PhysicalWriteStats},
     },
@@ -87,12 +84,7 @@ impl ExtentStore {
         let root = path.as_ref();
         fs::create_dir_all(root).map_err(|error| Error::io("create extent store directory", error))?;
         remove_owned_directory(&root.join(INDEX_DIRECTORY))?;
-        for file in [
-            DATA_FILE,
-            LEGACY_ENTRY_DIRECTORY_FILE,
-            LEGACY_SLOT_OWNER_FILE,
-            STATE_FILE,
-        ] {
+        for file in [DATA_FILE, LEGACY_SLOT_OWNER_FILE, STATE_FILE] {
             remove_owned_file(&root.join(file))?;
         }
         Self::create(root, config)
@@ -101,11 +93,6 @@ impl ExtentStore {
     pub fn open_with_options(path: impl AsRef<Path>, options: ExtentStoreOptions) -> Result<Self> {
         validate_options(options)?;
         let root = path.as_ref();
-        if root.join(LEGACY_ENTRY_DIRECTORY_FILE).exists() {
-            return Err(Error::InvalidSuperblock(
-                "Extent cache contains the obsolete pre-release Format 1 directory file".to_string(),
-            ));
-        }
         let pool = ExtentPool::open(
             root,
             options.direct_io,

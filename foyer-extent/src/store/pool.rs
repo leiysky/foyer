@@ -30,7 +30,6 @@ use crate::{
 };
 
 pub(crate) const DATA_FILE: &str = "data";
-pub(crate) const LEGACY_ENTRY_DIRECTORY_FILE: &str = "directory";
 pub(crate) const LEGACY_SLOT_OWNER_FILE: &str = "owners";
 pub(crate) const STATE_FILE: &str = "state";
 
@@ -1163,7 +1162,6 @@ mod tests {
     fn batch_write_read_checkpoint_and_reopen() {
         let dir = tempdir().unwrap();
         let pool = create_pool(dir.path());
-        assert!(!dir.path().join(LEGACY_ENTRY_DIRECTORY_FILE).exists());
         let values = (0..12).map(|index| vec![index as u8; 100 + index]).collect::<Vec<_>>();
         let keys = (0..values.len()).map(|index| key(index as u64)).collect::<Vec<_>>();
         let allocations = values

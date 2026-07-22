@@ -235,10 +235,8 @@ accounting, and rejected index implementations are specified in
 - A frozen development-V3 fixture covers the former payload, owner, allocator, manifest, and WAL
   layout. Stable format 1 must reject it and the explicit recreate path must remove legacy owned
   files before creating the current layout. The stable family magic also rejects development
-  formats that used the same numeric version. A pre-release Format 1 image carrying the obsolete
-  `directory` file is likewise rejected; Quiet recovery recreates it without that file.
-  Current-format tests separately cover append, reopen, checkpoint-tail discard, reclaim, and
-  process abort.
+  formats that used the same numeric version. Current-format tests separately cover append, reopen,
+  checkpoint-tail discard, reclaim, and process abort.
 - Incomplete final WAL frames are ignored; corruption inside the durable prefix is an error.
 - The newest invalid allocator or manifest copy falls back to the older valid copy.
 - New SSTs are synced before a manifest can reference them.

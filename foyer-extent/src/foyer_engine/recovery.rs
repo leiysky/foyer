@@ -95,10 +95,7 @@ fn directory_is_empty(path: &Path) -> crate::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        format::PAGE_SIZE,
-        store::{ExtentStoreOptions, LEGACY_ENTRY_DIRECTORY_FILE},
-    };
+    use crate::{format::PAGE_SIZE, store::ExtentStoreOptions};
 
     fn config() -> ExtentStoreConfig {
         ExtentStoreConfig::new(4 * 1024 * 1024)
@@ -127,20 +124,5 @@ mod tests {
         drop(open.store);
 
         assert_eq!(fs::read(sentinel).unwrap(), b"keep");
-    }
-
-    #[test]
-    fn obsolete_format_one_directory_forces_quiet_recreate() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("cache");
-        let open = open_store(&root, config(), RecoverMode::None).unwrap();
-        open.store.sync().unwrap();
-        drop(open.store);
-        fs::write(root.join(LEGACY_ENTRY_DIRECTORY_FILE), b"obsolete").unwrap();
-
-        assert!(open_store(&root, config(), RecoverMode::Strict).is_err());
-        let open = open_store(&root, config(), RecoverMode::Quiet).unwrap();
-        assert!(matches!(open.outcome, RecoveryOutcome::Recreated(_)));
-        assert!(!root.join(LEGACY_ENTRY_DIRECTORY_FILE).exists());
     }
 }
