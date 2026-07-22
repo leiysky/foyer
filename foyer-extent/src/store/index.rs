@@ -98,6 +98,7 @@ pub struct EntryIndex {
     database: FixedLsm,
     state: RwLock<RuntimeState>,
     mutations: Mutex<()>,
+    liveness: RwLock<Option<Arc<ExtentPool>>>,
 }
 
 impl EntryIndex {
@@ -143,10 +144,12 @@ impl EntryIndex {
                 ..RuntimeState::default()
             }),
             mutations: Mutex::new(()),
+            liveness: RwLock::new(None),
         }
     }
 
     pub fn install_liveness_filter(&self, pool: Arc<ExtentPool>) {
+        *write_lock(&self.liveness) = Some(pool.clone());
         self.database
             .set_compaction_filter(Some(Arc::new(StaleLocationFilter { pool })));
     }
@@ -400,10 +403,16 @@ impl EntryIndex {
 
     pub fn persist_checkpoint(&self, checkpoint: IndexCheckpoint) -> Result<()> {
         let mut batch = WriteBatch::with_capacity(checkpoint.frozen.len());
+        let pool = read_lock(&self.liveness).clone();
         for (key, mutation) in checkpoint.frozen.iter() {
-            if let Some(location) = mutation.location {
+            if let Some(location) = mutation
+                .location
+                .filter(|location| pool.as_ref().is_none_or(|pool| pool.location_is_live(*location)))
+            {
                 batch.put(encode_key(*key), location.encode());
             } else {
+                // A stale captured location must become a tombstone rather than merely being
+                // omitted: an older value may already exist in a lower LSM level.
                 batch.delete(encode_key(*key));
             }
         }

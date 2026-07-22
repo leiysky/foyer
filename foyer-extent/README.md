@@ -7,29 +7,30 @@ generation, and reclaim unit owned by `ExtentPool`.
 The public cache object is `Entry`: a complete variable-length opaque key of at most 1 KiB, a
 non-empty variable-length value, and a priority. Both key and value use `Bytes`, so cloning a hit is
 cheap. Foyer owns the memory tier and hybrid coordination. `ExtentEngine` owns the non-blocking
-engine submission boundary and one put-bounded ordered disk queue. `ExtentStore` owns lookup,
+engine submission boundary and one hard-bounded ordered disk queue. `ExtentStore` owns lookup,
 publication, and checkpoint coordination; its concrete `Reclaimer` owns allocation pressure,
 generation-reuse fencing, and priority-aware reclaim.
 
 The balanced engine defaults use a 256 MiB submission budget, 128 MiB idle write batches, an 8 MiB
 write batch while reads are active, and a one-second periodic checkpoint request in addition to
 the 256 MiB published-byte trigger. High and normal priorities have borrowable 10% and 70% logical
-extent capacity floors; low priority uses unprotected capacity. Physical reads have a hard, non-waiting
-`2 * available_parallelism` admission limit. The synchronous payload I/O scheduler gives an active
-entry-payload read a bounded 2 ms head start over newly admitted writes; reads never wait behind writes, and
+extent capacity floors; low priority uses unprotected capacity. Durable-index and payload reads use
+independent hard, non-waiting `2 * available_parallelism` admission limits. The synchronous payload
+I/O scheduler gives an active entry-payload read a bounded 2 ms head start over newly admitted
+writes; reads never wait behind writes, and
 writes proceed after the bound so sustained reads cannot starve publication. This is a cooperative
 admission layer: reads, syncs, and default single-concurrency writes execute on the calling thread;
 parallel-write configurations use one persistent bounded pool rather than per-batch OS threads.
 No io_uring dependency is involved. Set the read-priority duration to zero for a full runtime bypass.
 
 Low- and normal-priority writes are progressively shed before the queue is full, with earlier
-shedding while reads are active; high-priority puts retain the hard queue budget. Ordered deletes
-may temporarily overcommit that budget so a rejected update cannot leave an older value visible;
-pending queue gauges expose the overcommit instead of blocking the caller. An ordered worker batch
-retains only the final command per complete key, coalesces all surviving puts
-behind one ordinary payload fence, and tombstones a stale disk value when a replacement is
-rejected. Reclaim reuses that payload fence and adds one recovery-critical generation-state sync;
-it does not scan the victim or copy retained payload. An
+shedding while reads are active; high-priority puts retain the hard queue budget. Puts and deletes
+share the same hard entry and byte bounds. A rejected put does not enqueue a compensating delete,
+so overload cannot become unbounded control debt; mutable callers encode freshness in the key as
+required by the cache contract. An ordered worker batch retains only the final command per complete
+key and coalesces all surviving puts into page-aligned writes. Checkpoints group payload durability
+once per captured epoch. Reclaim adds one recovery-critical generation-state sync without syncing
+unrelated dirty payload; it does not scan the victim or copy retained payload. An
 `ExtentEngineHandle` exposes queue depth, publication/durability frontiers, asynchronous write
 outcomes, active read admission, scheduler waits, physical I/O, reclaim work, and the first sticky
 background failure. These observations do not turn fire-and-forget puts into acknowledged writes.
@@ -58,7 +59,8 @@ counters are reconciled exactly once so concurrent lookups cannot double-count i
 
 Stored Entries occupy contiguous byte ranges packed within cache extents. Adjacent allocations in
 one publication batch share page-aligned I/O frames; an I/O frame is not a capacity or reclaim unit.
-Each Stored Entry has one fixed directory record, and a cache extent is reused as one generation.
+The sparse Format 1 directory is an inert compatibility placeholder; Stored Entries are indexed
+directly by location, and a cache extent is reused as one generation.
 Object ranges, application-specific key encoding, and remote-storage behavior belong outside the
 project.
 
@@ -66,9 +68,10 @@ Capacity is the only production static input. Stable format 1 owns a 64 MiB cach
 frame, and a 4 KiB Entry planning charge. The charge sizes planned directory and index targets; it
 neither rounds physical Entry allocations nor caps how many small Entries may be packed into an
 extent. The data file, planned directory budget, and allocator state fit the configured capacity.
-The sparse directory address space and EntryIndex target may exceed their plans and report that
-pressure without rejecting a cache write. Changing these choices, layout derivation, record
-encoding, or an incompatible embedded-index format requires an `EXTENT_FORMAT_VERSION` bump.
+The sparse directory address space remains logical-only, while the EntryIndex target may exceed its
+plan and report that pressure without rejecting a cache write. Changing these choices, layout
+derivation, record encoding, or an incompatible embedded-index format requires an
+`EXTENT_FORMAT_VERSION` bump.
 Layout overrides remain available only as a test and benchmark escape hatch. Runtime I/O, queue,
 batching, checkpoint, priority-floor, and index-memory settings can change across reopens.
 
@@ -96,9 +99,8 @@ partially published entry; cache writes remain best effort and the source remain
 Compatibility CI reconstructs a frozen complete development-V3 store image and verifies that stable
 format 1 rejects it and can recreate the expendable cache without leaving its legacy owner file
 behind. The stable format uses a distinct family magic, so development formats V1-V6 cannot collide
-with its version numbering. Stable-format round-trip,
-tail-recovery, and process-crash tests cover the current directory, allocator, checkpoint, and
-reclaim publication paths.
+with its version numbering. Stable-format round-trip, checkpoint-tail-discard, and process-crash
+tests cover the current directory, allocator, checkpoint, and reclaim publication paths.
 
 Design documentation is organized by boundary:
 

@@ -28,7 +28,7 @@ pub struct EngineReadStats {
 /// Cumulative outcomes at ExtentEngine's asynchronous write boundary.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EngineWriteStats {
-    /// Commands accepted by Extent's ordered queue (puts are bounded; deletes may overcommit).
+    /// Commands accepted by Extent's hard-bounded ordered queue.
     pub accepted_commands: u64,
     /// Commands shed by admission, validation, close, or an enqueue race.
     pub dropped_commands: u64,

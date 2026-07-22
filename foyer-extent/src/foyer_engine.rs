@@ -201,14 +201,15 @@ impl ExtentEngineConfig {
         self
     }
 
-    /// Wait briefly after the first queued command so sparse arrivals can share one page frame
-    /// and payload durability fence. A zero duration restores immediate draining.
+    /// Wait briefly after the first queued command so sparse arrivals can share page-aligned data
+    /// write runs. Durability is grouped independently by checkpoints. A zero duration restores
+    /// immediate draining.
     pub fn with_write_batch_delay(mut self, delay: Duration) -> Self {
         self.write_batch_delay = delay;
         self
     }
 
-    /// Set the hard number of concurrent physical cache reads.
+    /// Set the hard concurrency of each independent index and payload read stage.
     ///
     /// Reads above the limit return `Load::Throttled` immediately rather than queueing.
     pub fn with_read_concurrency(mut self, concurrency: usize) -> Self {
@@ -358,9 +359,23 @@ impl ExtentEngineHandle {
     }
 
     pub fn active_reads(&self) -> Option<usize> {
+        self.upgrade().map(|inner| {
+            inner
+                .index_read_limiter
+                .active()
+                .saturating_add(inner.read_limiter.active())
+        })
+    }
+
+    pub fn active_index_reads(&self) -> Option<usize> {
+        self.upgrade().map(|inner| inner.index_read_limiter.active())
+    }
+
+    pub fn active_payload_reads(&self) -> Option<usize> {
         self.upgrade().map(|inner| inner.read_limiter.active())
     }
 
+    /// Return the independent concurrency limit applied to each read stage.
     pub fn read_concurrency(&self) -> Option<usize> {
         self.upgrade().map(|inner| inner.read_limiter.limit())
     }
@@ -451,6 +466,7 @@ struct Inner {
     metrics: Arc<Metrics>,
     background_error: Arc<BackgroundError>,
     stats: Arc<EngineStats>,
+    index_read_limiter: Arc<ReadLimiter>,
     read_limiter: Arc<ReadLimiter>,
     shutdown: Arc<AtomicBool>,
     close_state: AtomicU8,
@@ -468,8 +484,8 @@ impl ExtentEngine {
         spawner: Spawner,
         metrics: Arc<Metrics>,
     ) -> foyer::Result<Self> {
-        // Data commands are bounded by `SubmissionQueue`; the channel itself stays unbounded so
-        // ordered deletes can overcommit the soft queue limit without blocking the caller.
+        // The channel itself stays unbounded, while every command owns a hard-bounded queue
+        // reservation until it has finished executing.
         let (sender, receiver) = std::sync::mpsc::channel();
         let queue = Arc::new(SubmissionQueue::new(
             config.queue_capacity_entries,
@@ -482,6 +498,7 @@ impl ExtentEngine {
         stats.record_remaining_index_reads(io_control.statistics(), store.entry_index_io_read_stats());
         stats.record_extent_occupancy(store.extent_occupancy());
         let read_limiter = ReadLimiter::new(config.read_concurrency, metrics.clone());
+        let index_read_limiter = ReadLimiter::new_secondary(config.read_concurrency, metrics.clone());
         let shutdown = Arc::new(AtomicBool::new(false));
         stats.record_checkpoint(store.checkpoint_stats());
         #[cfg(test)]
@@ -496,6 +513,7 @@ impl ExtentEngine {
             config.checkpoint_interval,
             background_error.clone(),
             stats.clone(),
+            index_read_limiter.clone(),
             read_limiter.clone(),
             shutdown.clone(),
             #[cfg(test)]
@@ -518,6 +536,7 @@ impl ExtentEngine {
                 metrics,
                 background_error,
                 stats,
+                index_read_limiter,
                 read_limiter,
                 shutdown,
                 close_state: AtomicU8::new(OPEN),
@@ -575,18 +594,11 @@ impl Engine<Bytes, EngineValue, HybridCacheProperties> for ExtentEngine {
                 .is_none_or(|size| size > self.inner.extent_size || u32::try_from(size).is_err())
         {
             self.inner.stats.record_dropped_command();
-            if !key.is_empty() && key.len() <= MAX_KEY_SIZE {
-                self.inner.send_delete(key);
-            }
             return;
         }
         let priority = piece.value().priority();
-        if !self
-            .inner
-            .try_send(estimated_size, priority, |reservation| Command::put(piece, reservation))
-        {
-            self.inner.send_delete(key);
-        }
+        self.inner
+            .try_send(estimated_size, priority, |reservation| Command::put(piece, reservation));
     }
 
     fn load(
@@ -617,6 +629,33 @@ impl Engine<Bytes, EngineValue, HybridCacheProperties> for ExtentEngine {
             if prepared == PreparedGet::Miss {
                 return Ok(Load::Miss);
             }
+            let location = match prepared {
+                PreparedGet::Location(location) => location,
+                PreparedGet::Miss => unreachable!("definitive misses return before read admission"),
+                PreparedGet::Unknown(_) => {
+                    let Some(index_permit) = inner.index_read_limiter.try_acquire() else {
+                        return Ok(Load::Throttled);
+                    };
+                    let store = inner.store.clone();
+                    let resolved = inner
+                        .spawner
+                        .spawn_blocking(move || {
+                            let _index_permit = index_permit;
+                            store.resolve_prepared(prepared)
+                        })
+                        .await;
+                    inner.stats.record_remaining_index_reads(
+                        inner.io_control.statistics(),
+                        inner.store.entry_index_io_read_stats(),
+                    );
+                    let Some(location) =
+                        resolved?.map_err(|error| extent_error("resolve Extent index lookup", error))?
+                    else {
+                        return Ok(Load::Miss);
+                    };
+                    location
+                }
+            };
             let Some(read_permit) = inner.read_limiter.try_acquire() else {
                 return Ok(Load::Throttled);
             };
@@ -625,12 +664,9 @@ impl Engine<Bytes, EngineValue, HybridCacheProperties> for ExtentEngine {
                 .spawner
                 .spawn_blocking(move || {
                     let _read_permit = read_permit;
-                    store.get_prepared(&entry_key, prepared)
+                    store.read_location(&entry_key, location)
                 })
                 .await;
-            inner
-                .stats
-                .record_remaining_index_reads(inner.io_control.statistics(), inner.store.entry_index_io_read_stats());
             let loaded = loaded?.map_err(|error| extent_error("load Extent entry", error))?;
             inner
                 .stats
@@ -754,7 +790,7 @@ impl Inner {
             self.stats.record_dropped_command();
             return false;
         }
-        let Some(reservation) = self.queue.reserve_control(key.len()) else {
+        let Some(reservation) = self.queue.try_reserve(key.len()) else {
             self.stats.record_dropped_command();
             self.metrics.storage_queue_buffer_overflow.increase(1);
             return false;
@@ -783,7 +819,7 @@ impl Inner {
     }
 
     fn should_shed(&self, priority: crate::CachePriority) -> bool {
-        let readers_active = self.read_limiter.active() > 0;
+        let readers_active = self.index_read_limiter.active() > 0 || self.read_limiter.active() > 0;
         let (numerator, denominator) = match (priority, readers_active) {
             (crate::CachePriority::Low, true) => (1, 4),
             (crate::CachePriority::Low, false) => (1, 2),
@@ -948,7 +984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_batch_delay_coalesces_sparse_arrivals_into_one_durability_fence() {
+    async fn write_batch_delay_coalesces_sparse_arrivals_into_one_data_batch() {
         let directory = tempfile::tempdir().unwrap();
         let config = ExtentEngineConfig::new(directory.path(), 16 * 1024 * 1024)
             .with_test_layout(4 * 1024, 32 * 1024)
@@ -983,7 +1019,7 @@ mod tests {
         assert_eq!(writes.completed_batches, 1);
         let physical = handle.physical_write_stats().unwrap();
         assert_eq!(physical.data_syncs, 1);
-        assert_eq!(physical.entry_directory_syncs, 1);
+        assert_eq!(physical.entry_directory_syncs, 0);
         cache.close().await.unwrap();
     }
 
@@ -1036,8 +1072,8 @@ mod tests {
         assert_eq!(writes.completed_batches, 1);
         let physical = handle.physical_write_stats().unwrap();
         assert_eq!(physical.data_syncs, 1);
-        assert_eq!(physical.entry_directory_syncs, 1);
-        assert_eq!(physical.entry_directory_bytes, crate::store::ENTRY_OWNER_SIZE as u64);
+        assert_eq!(physical.entry_directory_syncs, 0);
+        assert_eq!(physical.entry_directory_bytes, 0);
 
         cache.close().await.unwrap();
         drop(cache);

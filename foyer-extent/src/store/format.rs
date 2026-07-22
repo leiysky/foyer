@@ -1,9 +1,11 @@
 use crc_fast::{CrcAlgorithm, Digest};
 
+#[cfg(test)]
+use crate::model::KeyDigest;
 use crate::{
     error::{Error, Result},
     format::{CONTENT_DIGEST_SIZE, ContentDigest, MIN_STORED_ENTRY_SIZE, PAGE_SIZE},
-    model::{CachePriority, KeyDigest},
+    model::CachePriority,
     store::config::ExtentStoreConfig,
 };
 
@@ -34,9 +36,9 @@ const FIXED_LSM_INDEX_MAXIMUM_OVERHEAD: u64 = 16 * 1024 * 1024;
 pub struct StoreLayout {
     pub entry_charge: usize,
     pub extent_size: usize,
-    /// Entry count planned for directory and index capacity accounting.
+    /// Entry count planned for compatibility-directory and index capacity accounting.
     pub planned_entries_per_extent: u32,
-    /// Maximum directory positions addressable inside one extent.
+    /// Maximum Format 1 entry ordinals addressable inside one extent.
     pub directory_entries_per_extent: u32,
     pub extent_count: u32,
     /// Planned live cardinality used only to derive soft metadata targets.
@@ -45,9 +47,9 @@ pub struct StoreLayout {
     pub maximum_entries: u64,
     pub index_capacity_bytes: u64,
     pub data_file_size: u64,
-    /// Sparse logical size of the Entry directory.
+    /// Sparse logical size of the inert Format 1 Entry directory.
     pub entry_directory_file_size: u64,
-    /// Planned physical directory budget included in configured cache capacity.
+    /// Legacy planned directory budget included in configured cache capacity.
     pub entry_directory_capacity_bytes: u64,
     pub state_copy_size: usize,
     /// Planned hard allocation excluding the soft EntryIndex target.
@@ -142,6 +144,7 @@ impl StoreLayout {
         (extent < u64::from(self.extent_count)).then_some((extent as u32, extent_offset as u32))
     }
 
+    #[cfg(test)]
     pub fn directory_index(self, extent: u32, entry: u32) -> Option<u64> {
         (extent < self.extent_count && entry < self.directory_entries_per_extent)
             .then(|| u64::from(extent) * u64::from(self.directory_entries_per_extent) + u64::from(entry))
@@ -484,6 +487,7 @@ impl EntryLocation {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EntryOwner {
     pub key_digest: KeyDigest,
@@ -496,6 +500,7 @@ pub struct EntryOwner {
     pub sequence: u64,
 }
 
+#[cfg(test)]
 impl EntryOwner {
     pub fn encode(self) -> [u8; ENTRY_OWNER_SIZE] {
         let mut output = [0; ENTRY_OWNER_SIZE];

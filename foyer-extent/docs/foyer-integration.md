@@ -16,7 +16,7 @@ defined in [ExtentStore design](extent-store.md).
 | --- | --- |
 | Foyer `HybridCache` | Memory tier, in-flight lookup coalescing, pending-write keeper, S3FIFO policy, memory-first lookup, promotion, and shared statistics. |
 | Public `Cache` facade | Entry-oriented API, builder validation, lifecycle delegation, and access to the read-only ExtentEngine handle. |
-| `ExtentEngine` | Foyer engine adaptation, put-bounded submission queue, load admission, ordered write worker, periodic checkpoint requests, recovery policy, and Foyer metrics. |
+| `ExtentEngine` | Foyer engine adaptation, hard-bounded submission queue, load admission, ordered write worker, periodic checkpoint requests, recovery policy, and Foyer metrics. |
 | `ExtentStore` | Ordered disk publication, checkpoint frontier, EntryIndex coordination, and reclaim orchestration. |
 | `ExtentPool` / `EntryIndex` | Physical payload placement and durable digest-to-location indexing respectively. |
 
@@ -31,26 +31,26 @@ queue entry and its encoded-byte charge before accepting a command. That reserva
 by the command for its complete queued and in-flight lifetime, preventing accounting gaps during
 worker handoff.
 
-Put reservations are bounded by entries and bytes. Low- and normal-priority puts are progressively shed
-before the hard byte bound, with earlier shedding while storage reads are active. High-priority puts
-may use the full configured queue budget. Shedding prevents unbounded I/O debt and does not become a
-per-put result. Deletes share the same ordered stream but may overcommit the put budget: dropping a
-delete after rejecting an update would expose the older value. The caller still never blocks, and
-pending entry/byte gauges rise above their capacity gauges while this control debt is outstanding.
+Every put and delete reservation is bounded by the same entry and byte limits. Low- and
+normal-priority puts are progressively shed before the hard byte bound, with earlier shedding while
+storage reads are active. High-priority puts may use the full configured queue budget. Shedding
+prevents unbounded I/O debt and does not become a per-put result. A rejected or invalid put is simply
+dropped; it does not append a compensating delete that could turn overload into unbounded control
+debt. Explicit delete remains a best-effort hint and may also be dropped at the hard bound.
 
 One worker owns write order and groups commands into physical store batches. Before publication it
 keeps only the final command for each complete key, writes all surviving puts in one store batch,
-and applies final deletes together. A rejected replacement also installs a tombstone so an older
-disk value cannot reappear after the memory entry leaves Foyer. This removes superseded payload
-writes and prevents put/delete interleaving from multiplying the ordinary batch payload fence;
-reclaim can still add recovery-critical fences before generation reuse.
+and applies final deletes together. This removes superseded payload writes without weakening the
+hard queue bound. Because a rejected replacement does not invalidate an older disk value, mutable
+callers must include freshness in the key or validate it after lookup, as required by the cache
+contract.
 
 The worker uses a larger idle batch and a smaller read-busy batch so already admitted writes make
 progress without monopolizing the device. Immediate draining is the default. An optional
 microbatch window can wait for sparse arrivals to join the same batch; the deadline is measured
 from the first command's enqueue time, so an already-backlogged command receives no extra delay.
-This can amortize data and directory durability fences without changing their order or delaying a
-batch that has already reached its byte/entry target. Completion is reported to Foyer's
+This can amortize page-aligned data writes; durability is grouped independently by checkpoints.
+Completion is reported to Foyer's
 pending-write keeper with the command generation;
 completion of an older same-key write cannot erase a newer pending value.
 
@@ -65,11 +65,15 @@ Foyer checks and coalesces its memory tier before invoking the disk engine. Exte
 2. probes EntryIndex memory state without table I/O;
 3. returns a definitive miss immediately when no in-memory record or SST range can contain the
    digest;
-4. acquires one non-waiting storage-read permit for a possible hit; and
-5. executes possible index and payload I/O on the blocking pool.
+4. acquires a non-waiting index permit only for an unknown SST-backed result;
+5. resolves the durable index without consuming payload capacity; and
+6. acquires a separate non-waiting payload permit only after a location is known.
 
-The read concurrency bound is hard and non-waiting. Saturation returns `Load::Throttled`, allowing
-the upper cache or caller to fall back instead of creating an unbounded reader queue.
+Each stage has the configured hard, non-waiting concurrency bound. Saturation returns
+`Load::Throttled`, allowing the upper cache or caller to fall back instead of creating an unbounded
+reader queue. A durable miss storm can consume index permits but cannot consume the permits reserved
+for known payload hits. SST-backed hits and misses remain indistinguishable until the index lookup
+completes.
 
 Index state can resolve a location, a definitive miss, or an unknown SST-backed result. Only the
 unknown case performs durable-index lookup. Full database, block-cache, and WAL statistics are not
@@ -82,8 +86,8 @@ ExtentPool supplies a cooperative synchronous scheduler below the engine queue a
 payload syscalls. One logical Entry read holds a lock-free read permit across all of its bounded
 physical runs and never waits behind writes.
 
-Payload and Entry-directory write runs, plus their publication syncs, first wait for a
-read-quiescent point. The wait is bounded by the configured read-priority duration, 2 ms by default;
+Payload write runs and checkpoint data syncs first wait for a read-quiescent point. The wait is
+bounded by the configured read-priority duration, 2 ms by default;
 after that bound a write proceeds even while reads remain active. Existing write concurrency is
 still the hard cap, so sustained reads cannot starve publication, reclaim, sync, or close. A zero
 duration bypasses this policy and its accounting.
@@ -134,7 +138,7 @@ reference engines and environment parsing remain outside production modules.
 ownership, asynchronous outcomes, publication and durable frontiers, physical-record occupancy and
 the indexed-cardinality upper bound, physical
 I/O, per-file sync counts, separate index WAL/SST/manifest writes and syncs, index flush/compaction
-bytes, lazy stale-location checks/discards, immutable layout planning, sparse-directory reads,
+bytes, lazy stale-location checks/discards, immutable layout planning, the inert Format 1 directory,
 checkpoint-wait and generation-invalidation reclaim timing, scheduler waits, and the first background failure. It is not a
 second control plane or a write receipt.
 
@@ -152,8 +156,9 @@ accounting lock.
   file durability.
 - A dedicated payload-I/O executor added a worker hop and buffer ownership without a demonstrated
   latency benefit.
-- A global high-level read semaphore cannot honestly distinguish cached index lookups from physical
-  metadata I/O; scheduling metadata requires a lower FixedRecordLSM operation hook.
+- One global read semaphore lets negative index work starve known payload hits. The two-stage gates
+  isolate payload capacity; deeper scheduling of FixedRecordLSM data/filter I/O still requires a
+  lower operation hook.
 - Static-dispatch-only integration would prevent BlockEngine and ExtentEngine from sharing the same
   runtime builder and rollback boundary.
 

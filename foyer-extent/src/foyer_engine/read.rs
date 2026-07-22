@@ -13,6 +13,7 @@ pub struct ReadLimiter {
     limit: usize,
     active: AtomicUsize,
     metrics: Arc<Metrics>,
+    report_active: bool,
 }
 
 impl ReadLimiter {
@@ -23,6 +24,18 @@ impl ReadLimiter {
             limit,
             active: AtomicUsize::new(0),
             metrics,
+            report_active: true,
+        })
+    }
+
+    /// Create a separate admission domain without overwriting Foyer's payload-read gauges. A
+    /// rejection still contributes to the shared rejected-read counter.
+    pub fn new_secondary(limit: usize, metrics: Arc<Metrics>) -> Arc<Self> {
+        Arc::new(Self {
+            limit,
+            active: AtomicUsize::new(0),
+            metrics,
+            report_active: false,
         })
     }
 
@@ -45,7 +58,9 @@ impl ReadLimiter {
             self.metrics.storage_engine_read_rejected.increase(1);
             return None;
         }
-        self.metrics.storage_engine_read_active.increase(1);
+        if self.report_active {
+            self.metrics.storage_engine_read_active.increase(1);
+        }
         Some(ReadPermit { limiter: self.clone() })
     }
 }
@@ -58,7 +73,9 @@ impl Drop for ReadPermit {
     fn drop(&mut self) {
         let previous = self.limiter.active.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "Extent active reader count underflow");
-        self.limiter.metrics.storage_engine_read_active.decrease(1);
+        if self.limiter.report_active {
+            self.limiter.metrics.storage_engine_read_active.decrease(1);
+        }
     }
 }
 
@@ -76,5 +93,20 @@ mod tests {
         drop(first);
         assert!(limiter.try_acquire().is_some());
         drop(second);
+    }
+
+    #[test]
+    fn metadata_miss_pressure_does_not_consume_payload_permits() {
+        let metadata = ReadLimiter::new_secondary(2, Arc::new(Metrics::noop()));
+        let payload = ReadLimiter::new(1, Arc::new(Metrics::noop()));
+        let _first_miss = metadata.try_acquire().unwrap();
+        let _second_miss = metadata.try_acquire().unwrap();
+        assert!(metadata.try_acquire().is_none());
+
+        let hit = payload
+            .try_acquire()
+            .expect("metadata misses must not occupy payload admission");
+        assert_eq!(payload.active(), 1);
+        drop(hit);
     }
 }

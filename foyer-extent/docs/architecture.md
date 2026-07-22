@@ -46,9 +46,9 @@ Cache API
    lifecycle translation, periodic checkpoint requests, and Foyer metrics.
 3. **ExtentStore** — owns ordered disk publication, checkpoint frontiers, EntryIndex coordination,
    and invocation of the concrete Reclaimer.
-4. **Persistence** — `ExtentPool` owns payload, Entry-directory, and allocator files. `EntryIndex`
-   owns digest-to-location lookup through FixedRecordLSM. Neither component knows about public API
-   semantics or application key structure.
+4. **Persistence** — `ExtentPool` owns payload and allocator files plus the inert Format 1
+   directory placeholder. `EntryIndex` owns digest-to-location lookup through FixedRecordLSM.
+   Neither component knows about public API semantics or application key structure.
 
 These are concrete module boundaries rather than interchangeable backend traits. A new abstraction
 is justified only when it owns an invariant or allows an accepted implementation to be replaced
@@ -77,33 +77,37 @@ copies payload. The generation and used-range fast path is one atomic word per c
 before and after payload I/O. Caller priority is the physical hot/warm/cold classification, avoiding
 read-frequency tracking and promotion write amplification.
 
-### Separate publication from metadata checkpointing
+### Separate volatile publication from durability
 
-An aggregated store batch fences payload and Entry-directory bytes before advancing its published
-epoch. Allocator and index state are captured immutably and persisted outside the mutation lock.
-This removes metadata checkpoint I/O from the foreground critical section while retaining one total
-mutation order and generation-safe reclaim.
+An aggregated store batch writes complete payload ranges and publishes locations to the volatile
+overlay without issuing `fdatasync`. It then advances the published epoch. A checkpoint holds the
+mutation order long enough to synchronize all dirty payload once and capture matching allocator
+and index images; allocator and index metadata persistence continues after the lock is released.
+This groups sparse-write durability, retains one total mutation order, and deliberately permits
+recovery to discard the uncheckpointed tail. The Format 1 directory file remains in the layout for
+compatibility but is neither written nor read by the runtime.
 
 ### Keep the durable index narrow
 
 FixedRecordLSM implements only the fixed-record point-index features Extent needs. Its recovery
 opens manifests, fence summaries, and a bounded WAL tail; it does not scan payload data or rebuild a
 full live map. The index capacity value is a soft planning target, while usage accounting remains
-exact. Generation-stale locations are discarded only when an existing non-trivial compaction is
-already rewriting them; garbage collection never forces an SST rewrite or adds reclaim I/O.
+exact. Checkpoint capture tombstones stale overlay locations; older SST debt is discarded only when
+an existing non-trivial compaction is already rewriting it. Garbage collection never forces an SST
+rewrite or adds reclaim I/O.
 
 ### Keep resource pressure best effort
 
-Foyer puts are fire-and-forget, put reservations are bounded, reads do not wait for storage
-capacity, and low-value work may be shed. Ordered deletes may temporarily exceed the put budget to
-hide an older value after a rejected update; queue gauges make this non-blocking control debt
-visible. This weak admission contract is paired with a strong integrity contract: every hit must
-pass location, generation, value-content-digest, and complete-key checks.
+Foyer puts are fire-and-forget, every put/delete reservation is bounded, reads do not wait for
+storage capacity, and low-value work may be shed. A rejected put does not manufacture a delete:
+callers encode freshness in the key, and explicit delete remains a best-effort hint subject to the
+same hard queue limits. This weak admission contract is paired with a strong integrity contract:
+every hit must pass location, generation, value-content-digest, and complete-key checks.
 
 ## Cross-layer invariants
 
-- A durable EntryIndex location references only payload and allocator state fenced no later than the
-  corresponding index checkpoint.
+- A durable EntryIndex location references only payload and allocator state fenced no later than
+  the corresponding index checkpoint; stale captured locations become tombstones.
 - One cache-extent generation cannot be reused while an older captured epoch may still reference
   it.
 - A reclaimed location is rejected from the lock-free liveness table before payload I/O; a racing

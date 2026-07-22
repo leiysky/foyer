@@ -51,6 +51,7 @@ impl KeyDigest {
         Self(digest)
     }
 
+    #[cfg(test)]
     pub(crate) const fn new(bytes: [u8; 24]) -> Self {
         Self(bytes)
     }

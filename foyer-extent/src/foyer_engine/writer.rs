@@ -110,6 +110,7 @@ pub struct WriteWorker {
     checkpoint_interval: Duration,
     background_error: Arc<BackgroundError>,
     stats: Arc<EngineStats>,
+    index_read_limiter: Arc<ReadLimiter>,
     read_limiter: Arc<ReadLimiter>,
     shutdown: Arc<AtomicBool>,
     #[cfg(test)]
@@ -127,6 +128,7 @@ impl WriteWorker {
         checkpoint_interval: Duration,
         background_error: Arc<BackgroundError>,
         stats: Arc<EngineStats>,
+        index_read_limiter: Arc<ReadLimiter>,
         read_limiter: Arc<ReadLimiter>,
         shutdown: Arc<AtomicBool>,
         #[cfg(test)] panic_next: Arc<AtomicBool>,
@@ -141,6 +143,7 @@ impl WriteWorker {
             checkpoint_interval,
             background_error,
             stats,
+            index_read_limiter,
             read_limiter,
             shutdown,
             #[cfg(test)]
@@ -200,7 +203,7 @@ impl WriteWorker {
             let mut bytes = first.charge();
             let mut commands = Vec::with_capacity(self.batch_entries.min(1_024));
             commands.push(first);
-            let batch_bytes = if self.read_limiter.active() == 0 {
+            let batch_bytes = if self.read_limiter.active() == 0 && self.index_read_limiter.active() == 0 {
                 self.batch_bytes
             } else {
                 self.read_busy_batch_bytes.min(self.batch_bytes)
@@ -335,13 +338,6 @@ fn process_commands(store: &ExtentStore, commands: &[Command]) -> crate::Result<
             .map(|(piece, key)| EntryInsert::new(key, piece.value().value(), piece.value().priority()))
             .collect::<Vec<_>>();
         let inserted = store.insert_batch_with_stats(&inserts)?;
-        for (key, outcome) in put_keys.iter().zip(&inserted.outcomes) {
-            if *outcome == InsertOutcome::Rejected {
-                // A rejected update must not leave an older value visible after the in-memory
-                // replacement is evicted. Publish a tombstone for the stale disk entry.
-                deletes.push(key.clone());
-            }
-        }
         result.merge(inserted);
     }
     store.remove_batch(&deletes)?;

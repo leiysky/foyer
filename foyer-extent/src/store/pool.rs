@@ -21,9 +21,9 @@ use crate::{
         ContentDigest, PAGE_SIZE, copy_stored_entry_range, decode_entry_value, encoded_entry_value_digest,
         stored_entry_len,
     },
-    model::{CachePriority, EntryKey, KeyDigest},
+    model::{CachePriority, EntryKey},
     store::{
-        format::{ENTRY_OWNER_SIZE, EntryLocation, EntryOwner, ExtentPoolState, ExtentRole, StoreLayout},
+        format::{EntryLocation, ExtentPoolState, ExtentRole, StoreLayout},
         io::{IoSchedulerStats, PayloadIoScheduler},
         stats::{DirectoryReadStats, ExtentOccupancy, PhysicalWriteStats},
     },
@@ -33,7 +33,6 @@ pub(crate) const DATA_FILE: &str = "data";
 pub(crate) const ENTRY_DIRECTORY_FILE: &str = "directory";
 pub(crate) const LEGACY_SLOT_OWNER_FILE: &str = "owners";
 pub(crate) const STATE_FILE: &str = "state";
-const DIRECTORY_READ_RECORDS: u32 = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EntryAllocation {
@@ -57,7 +56,6 @@ pub enum AllocationResult {
 pub struct EntryWrite<'a> {
     pub allocation: EntryAllocation,
     pub key: &'a EntryKey,
-    pub key_digest: KeyDigest,
     pub value: &'a [u8],
     pub content_digest: ContentDigest,
 }
@@ -355,7 +353,6 @@ impl ExtentPool {
             reads: PoolReadCounters::default(),
             writes: PoolWriteCounters::default(),
         };
-        pool.recover_current_tails()?;
         pool.publish_all_liveness();
         Ok(pool)
     }
@@ -522,7 +519,6 @@ impl ExtentPool {
         let data_runs = data_write_runs(&order, writes, self.write_run_size)?;
         self.write_data_runs(writes, &data_runs)?;
         self.payload_dirty.store(true, Ordering::Release);
-        let entry_directory_runs = self.write_entry_directory_runs(writes)?;
         self.seal_write_frames(writes)?;
 
         let mut locations = vec![None; writes.len()];
@@ -541,9 +537,9 @@ impl ExtentPool {
                 .map(|location| location.expect("every write must have a location"))
                 .collect(),
             data_runs: data_runs.len(),
-            entry_directory_runs,
+            entry_directory_runs: 0,
             data_bytes: data_runs.iter().map(|run| run.len).sum(),
-            entry_directory_bytes: writes.len().saturating_mul(ENTRY_OWNER_SIZE),
+            entry_directory_bytes: 0,
         })
     }
 
@@ -843,63 +839,6 @@ impl ExtentPool {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub fn visit_entry_owner_chunks(
-        &self,
-        victim: ExtentVictim,
-        mut visit: impl FnMut(&[(u64, EntryOwner)]) -> Result<()>,
-    ) -> Result<()> {
-        let mut previous_end = 0u32;
-        let mut previous_sequence = 0u64;
-        let mut first_entry = 0u32;
-        while first_entry < victim.entries {
-            let count = (victim.entries - first_entry).min(DIRECTORY_READ_RECORDS);
-            let mut owners = Vec::with_capacity(count as usize);
-            for owner in self.read_entry_owner_chunk(victim.extent, first_entry, count)? {
-                let owner =
-                    owner.ok_or_else(|| invalid_state("occupied extent contains an invalid entry-directory record"))?;
-                let end = owner
-                    .extent_offset
-                    .checked_add(owner.stored_len)
-                    .ok_or_else(|| invalid_state("entry-directory range overflows u32"))?;
-                let gap = owner.extent_offset.saturating_sub(previous_end);
-                if owner.extent_generation != victim.generation
-                    || owner.priority != victim.priority
-                    || owner.stored_len == 0
-                    || owner.value_len == 0
-                    || owner.value_len >= owner.stored_len
-                    || owner.extent_offset < previous_end
-                    || end > victim.used_bytes
-                    || owner.sequence <= previous_sequence
-                    || (gap > 0
-                        && (!(owner.extent_offset as usize).is_multiple_of(PAGE_SIZE) || gap as usize >= PAGE_SIZE))
-                {
-                    return Err(invalid_state("occupied extent entry directory is inconsistent"));
-                }
-                let data_offset = self
-                    .layout
-                    .data_offset(victim.extent, owner.extent_offset)
-                    .ok_or_else(|| invalid_state("entry-directory offset is outside the data file"))?;
-                owners.push((data_offset, owner));
-                previous_end = end;
-                previous_sequence = owner.sequence;
-            }
-            visit(&owners)?;
-            first_entry += count;
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub fn entry_owners(&self, victim: ExtentVictim) -> Result<Vec<(u64, EntryOwner)>> {
-        let mut owners = Vec::with_capacity(victim.entries as usize);
-        self.visit_entry_owner_chunks(victim, |chunk| {
-            owners.extend_from_slice(chunk);
-            Ok(())
-        })?;
-        Ok(owners)
-    }
-
     pub fn release(&self, victim: ExtentVictim) -> Result<()> {
         let mut state = mutex_lock(&self.state);
         let extent = &state.extents[victim.extent as usize];
@@ -928,27 +867,18 @@ impl ExtentPool {
     }
 
     pub fn sync_payload(&self) -> Result<()> {
+        if !self.payload_dirty.load(Ordering::Acquire) {
+            return Ok(());
+        }
         self.io
             .write(|| self.data.sync_data())
             .map_err(|error| Error::io("sync extent data", error))?;
         self.writes.data_syncs.fetch_add(1, Ordering::Relaxed);
-        self.io
-            .write(|| self.entry_directory.sync_data())
-            .map_err(|error| Error::io("sync extent entry directory", error))?;
-        self.writes.entry_directory_syncs.fetch_add(1, Ordering::Relaxed);
         self.payload_dirty.store(false, Ordering::Release);
         Ok(())
     }
 
-    pub fn ensure_payload_fenced(&self) -> Result<()> {
-        if self.payload_dirty.load(Ordering::Acquire) {
-            return Err(invalid_state(
-                "reclaim cannot reuse a generation with unfenced payload writes",
-            ));
-        }
-        Ok(())
-    }
-
+    #[cfg(test)]
     pub fn payload_is_dirty(&self) -> bool {
         self.payload_dirty.load(Ordering::Acquire)
     }
@@ -1009,122 +939,6 @@ impl ExtentPool {
         mutex_lock(&self.state).clone()
     }
 
-    fn recover_current_tails(&self) -> Result<()> {
-        let mut state = mutex_lock(&self.state);
-        let recovery_sequence_floor = state.next_sequence;
-        let mut next_sequence = state.next_sequence;
-        let mut tails = state
-            .current
-            .iter()
-            .enumerate()
-            .filter_map(|(priority, extent)| {
-                extent.map(|extent| {
-                    (
-                        extent,
-                        CachePriority::from_byte(priority as u8).expect("current priority index must be valid"),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        if let Some((target, extent)) = state
-            .extents
-            .iter()
-            .enumerate()
-            .find(|(_, extent)| extent.role == ExtentRole::ReclaimTarget)
-        {
-            tails.push((
-                u32::try_from(target).expect("extent index must fit u32"),
-                extent.priority,
-            ));
-        }
-        for (extent, priority) in tails {
-            let entry_index = extent as usize;
-            let generation = state.extents[entry_index].generation;
-            let start_entry = state.extents[entry_index].entries;
-            let mut recovered_entries = start_entry;
-            let mut recovered_used = state.extents[entry_index].used_bytes;
-            let mut previous_sequence = recovery_sequence_floor.saturating_sub(1);
-            let mut first_entry = start_entry;
-            'tail: while first_entry < self.layout.directory_entries_per_extent {
-                let count = (self.layout.directory_entries_per_extent - first_entry).min(DIRECTORY_READ_RECORDS);
-                for (offset, owner) in self
-                    .read_entry_owner_chunk(extent, first_entry, count)?
-                    .into_iter()
-                    .enumerate()
-                {
-                    let entry = first_entry + offset as u32;
-                    let Some(owner) = owner else {
-                        break 'tail;
-                    };
-                    let Some(end) = owner.extent_offset.checked_add(owner.stored_len) else {
-                        break 'tail;
-                    };
-                    let gap = owner.extent_offset.saturating_sub(recovered_used);
-                    if owner.extent_generation != generation
-                        || owner.priority != priority
-                        || owner.stored_len == 0
-                        || owner.value_len == 0
-                        || owner.value_len >= owner.stored_len
-                        || owner.stored_len as usize > self.layout.extent_size
-                        || owner.extent_offset < recovered_used
-                        || end as usize > self.layout.extent_size
-                        || owner.sequence <= previous_sequence
-                        || (gap > 0
-                            && (!(owner.extent_offset as usize).is_multiple_of(PAGE_SIZE) || gap as usize >= PAGE_SIZE))
-                    {
-                        break 'tail;
-                    }
-                    recovered_used = end;
-                    recovered_entries = entry + 1;
-                    previous_sequence = owner.sequence;
-                    next_sequence = next_sequence.max(owner.sequence.saturating_add(1));
-                }
-                first_entry += count;
-            }
-            if recovered_entries > start_entry {
-                recovered_used = u32::try_from(
-                    (recovered_used as usize)
-                        .next_multiple_of(PAGE_SIZE)
-                        .min(self.layout.extent_size),
-                )
-                .expect("extent size must fit u32");
-            }
-            state.extents[entry_index].used_bytes = recovered_used;
-            state.extents[entry_index].entries = recovered_entries;
-        }
-        state.next_sequence = next_sequence;
-        Ok(())
-    }
-
-    fn read_entry_owner_chunk(&self, extent: u32, first_entry: u32, count: u32) -> Result<Vec<Option<EntryOwner>>> {
-        if count == 0
-            || first_entry
-                .checked_add(count)
-                .is_none_or(|end| end > self.layout.directory_entries_per_extent)
-        {
-            return Err(invalid_state("extent entry-directory read range is invalid"));
-        }
-        let directory_index = self
-            .layout
-            .directory_index(extent, first_entry)
-            .ok_or_else(|| invalid_state("extent entry-directory read starts outside the layout"))?;
-        let offset = directory_index
-            .checked_mul(ENTRY_OWNER_SIZE as u64)
-            .ok_or_else(|| invalid_state("extent entry-directory offset overflows u64"))?;
-        let bytes = usize::try_from(count)
-            .ok()
-            .and_then(|count| count.checked_mul(ENTRY_OWNER_SIZE))
-            .ok_or_else(|| invalid_state("extent entry-directory read size overflows usize"))?;
-        let mut input = vec![0; bytes];
-        read_exact_at(&self.entry_directory, &mut input, offset)
-            .map_err(|error| Error::io("read extent entry directory", error))?;
-        self.reads.entry_directory_runs.fetch_add(1, Ordering::Relaxed);
-        self.reads
-            .entry_directory_bytes
-            .fetch_add(bytes as u64, Ordering::Relaxed);
-        Ok(input.chunks_exact(ENTRY_OWNER_SIZE).map(EntryOwner::decode).collect())
-    }
-
     fn write_data_runs(&self, writes: &[EntryWrite<'_>], runs: &[DataWriteRun]) -> Result<()> {
         if runs.is_empty() {
             return Ok(());
@@ -1177,69 +991,6 @@ impl ExtentPool {
         self.writes.data_runs.fetch_add(1, Ordering::Relaxed);
         self.writes.data_bytes.fetch_add(run.len as u64, Ordering::Relaxed);
         Ok(())
-    }
-
-    fn write_entry_directory_runs(&self, writes: &[EntryWrite<'_>]) -> Result<usize> {
-        let mut order = (0..writes.len()).collect::<Vec<_>>();
-        order.sort_unstable_by_key(|index| {
-            self.layout
-                .directory_index(
-                    writes[*index].allocation.extent,
-                    writes[*index].allocation.directory_entry,
-                )
-                .expect("validated directory entry must be in the layout")
-        });
-        let mut runs = 0usize;
-        let mut start = 0usize;
-        while start < order.len() {
-            let first = writes[order[start]].allocation;
-            let first_directory_index = self
-                .layout
-                .directory_index(first.extent, first.directory_entry)
-                .expect("validated directory entry must be in the layout");
-            let mut end = start + 1;
-            while end < order.len() {
-                let allocation = writes[order[end]].allocation;
-                let directory_index = self
-                    .layout
-                    .directory_index(allocation.extent, allocation.directory_entry)
-                    .expect("validated directory entry must be in the layout");
-                if directory_index != first_directory_index + (end - start) as u64 {
-                    break;
-                }
-                end += 1;
-            }
-            let mut output = vec![0; (end - start) * ENTRY_OWNER_SIZE];
-            for (output_index, write_index) in order[start..end].iter().copied().enumerate() {
-                let write = writes[write_index];
-                let owner = EntryOwner {
-                    key_digest: write.key_digest,
-                    extent_generation: write.allocation.extent_generation,
-                    extent_offset: write.allocation.extent_offset,
-                    stored_len: u32::try_from(write.stored_len()).expect("validated stored entry length must fit u32"),
-                    value_len: u32::try_from(write.value.len()).expect("validated value length must fit u32"),
-                    content_digest: write.content_digest,
-                    priority: write.allocation.priority,
-                    sequence: write.allocation.sequence,
-                }
-                .encode();
-                let offset = output_index * ENTRY_OWNER_SIZE;
-                output[offset..offset + ENTRY_OWNER_SIZE].copy_from_slice(&owner);
-            }
-            let offset = first_directory_index
-                .checked_mul(ENTRY_OWNER_SIZE as u64)
-                .ok_or_else(|| invalid_state("extent entry-directory offset overflows u64"))?;
-            self.io
-                .write(|| write_all_at(&self.entry_directory, &output, offset))
-                .map_err(|error| Error::io("write extent entry directory", error))?;
-            self.writes.entry_directory_runs.fetch_add(1, Ordering::Relaxed);
-            self.writes
-                .entry_directory_bytes
-                .fetch_add(output.len() as u64, Ordering::Relaxed);
-            runs += 1;
-            start = end;
-        }
-        Ok(runs)
     }
 
     fn seal_write_frames(&self, writes: &[EntryWrite<'_>]) -> Result<()> {
@@ -1491,7 +1242,6 @@ mod tests {
             .map(|(index, value)| EntryWrite {
                 allocation: allocations[index],
                 key: &keys[index],
-                key_digest: KeyDigest::for_key(&keys[index]),
                 value,
                 content_digest: value_digest(value),
             })
@@ -1500,19 +1250,10 @@ mod tests {
         assert!(writes.len() > pool.layout().planned_entries_per_extent as usize);
         assert_eq!(result.data_runs, 1);
         assert_eq!(result.data_bytes, PAGE_SIZE);
-        assert_eq!(result.entry_directory_runs, 1);
-        assert_eq!(result.entry_directory_bytes, values.len() * ENTRY_OWNER_SIZE);
+        assert_eq!(result.entry_directory_runs, 0);
+        assert_eq!(result.entry_directory_bytes, 0);
         assert!(pool.payload_is_dirty());
-        assert!(pool.ensure_payload_fenced().is_err());
-        let (victim, _) = pool.reclaim_candidates().oldest(CachePriority::Normal).unwrap();
-        assert_eq!(pool.entry_owners(victim).unwrap().len(), values.len());
-        assert_eq!(
-            pool.directory_read_stats(),
-            DirectoryReadStats {
-                runs: 1,
-                bytes: (values.len() * ENTRY_OWNER_SIZE) as u64,
-            }
-        );
+        assert_eq!(pool.directory_read_stats(), DirectoryReadStats::default());
         for (index, location) in result.locations.iter().enumerate() {
             assert_eq!(
                 pool.read_entry(&keys[index], *location).unwrap(),
@@ -1526,7 +1267,6 @@ mod tests {
         }
         pool.sync_payload().unwrap();
         assert!(!pool.payload_is_dirty());
-        pool.ensure_payload_fenced().unwrap();
         pool.checkpoint_state().unwrap();
         let layout = pool.layout();
         drop(pool);
@@ -1547,10 +1287,10 @@ mod tests {
     }
 
     #[test]
-    fn directory_reads_are_chunked_after_random_small_entries_exceed_the_planning_charge() {
+    fn random_small_writes_do_not_touch_the_format_one_directory() {
         let dir = tempdir().unwrap();
         let pool = create_pool_with_extent(dir.path(), PAGE_SIZE * 64, 16 * 1024 * 1024);
-        let entry_count = DIRECTORY_READ_RECORDS as usize + 76;
+        let entry_count = 1_100;
         let keys = (0..entry_count).map(|index| key(index as u64)).collect::<Vec<_>>();
         let values = (0..entry_count)
             .map(|index| {
@@ -1576,23 +1316,20 @@ mod tests {
             .map(|(index, value)| EntryWrite {
                 allocation: allocations[index],
                 key: &keys[index],
-                key_digest: KeyDigest::for_key(&keys[index]),
                 value,
                 content_digest: value_digest(value),
             })
             .collect::<Vec<_>>();
-        pool.write_batch(&writes).unwrap();
+        let result = pool.write_batch(&writes).unwrap();
         assert!(entry_count > pool.layout().planned_entries_per_extent as usize);
-
-        let (victim, _) = pool.reclaim_candidates().oldest(CachePriority::Normal).unwrap();
-        assert_eq!(pool.entry_owners(victim).unwrap().len(), entry_count);
-        assert_eq!(
-            pool.directory_read_stats(),
-            DirectoryReadStats {
-                runs: 2,
-                bytes: (entry_count * ENTRY_OWNER_SIZE) as u64,
-            }
-        );
+        assert_eq!(result.entry_directory_runs, 0);
+        assert_eq!(result.entry_directory_bytes, 0);
+        assert_eq!(pool.directory_read_stats(), DirectoryReadStats::default());
+        pool.sync_payload().unwrap();
+        let writes = pool.physical_write_stats();
+        assert_eq!(writes.entry_directory_runs, 0);
+        assert_eq!(writes.entry_directory_bytes, 0);
+        assert_eq!(writes.entry_directory_syncs, 0);
     }
 
     #[test]
@@ -1603,7 +1340,6 @@ mod tests {
         let mut replacement = vec![0x22; 512];
         replacement[508..].copy_from_slice(&[0xce, 0xe0, 0x15, 0xb2]);
         let key = key(1);
-        let key_digest = KeyDigest::for_key(&key);
         let checksum = stored_entry_checksum(&key, &old_value);
         assert_ne!(old_value, replacement);
         assert_eq!(stored_entry_checksum(&key, &replacement), checksum);
@@ -1614,7 +1350,6 @@ mod tests {
             .write_batch(&[EntryWrite {
                 allocation,
                 key: &key,
-                key_digest,
                 value: &old_value,
                 content_digest: value_digest(&old_value),
             }])
@@ -1632,7 +1367,6 @@ mod tests {
                 pool.write_batch(&[EntryWrite {
                     allocation: replacement_allocation,
                     key: &key,
-                    key_digest,
                     value: &replacement,
                     content_digest: value_digest(&replacement),
                 }])?;
@@ -1667,7 +1401,6 @@ mod tests {
         let writes: [EntryWrite<'_>; 2] = std::array::from_fn(|index| EntryWrite {
             allocation: allocations[index],
             key: &keys[index],
-            key_digest: KeyDigest::for_key(&keys[index]),
             value: &values[index],
             content_digest: value_digest(&values[index]),
         });
@@ -1715,7 +1448,6 @@ mod tests {
             .write_batch(&[EntryWrite {
                 allocation,
                 key: &key,
-                key_digest: KeyDigest::for_key(&key),
                 value: &value,
                 content_digest: value_digest(&value),
             }])
@@ -1729,7 +1461,7 @@ mod tests {
     }
 
     #[test]
-    fn reopen_recovers_uncheckpointed_current_tail() {
+    fn reopen_discards_uncheckpointed_current_tail() {
         let dir = tempdir().unwrap();
         let pool = create_pool(dir.path());
         let value = vec![9; 512];
@@ -1739,7 +1471,6 @@ mod tests {
         pool.write_batch(&[EntryWrite {
             allocation: first,
             key: &first_key,
-            key_digest: KeyDigest::for_key(&first_key),
             value: &value,
             content_digest: value_digest(&value),
         }])
@@ -1752,7 +1483,6 @@ mod tests {
         pool.write_batch(&[EntryWrite {
             allocation: tail,
             key: &tail_key,
-            key_digest: KeyDigest::for_key(&tail_key),
             value: &value,
             content_digest: value_digest(&value),
         }])
@@ -1763,11 +1493,8 @@ mod tests {
         let reopened = ExtentPool::open(dir.path(), false, 1, Duration::ZERO, PAGE_SIZE * 4, PAGE_SIZE * 4).unwrap();
         let next = allocated(reopened.allocate(CachePriority::High, stored_len).unwrap());
         assert_eq!(next.extent, tail.extent);
-        assert_eq!(
-            next.extent_offset as usize,
-            (tail.extent_offset as usize + stored_len).next_multiple_of(PAGE_SIZE)
-        );
-        assert_eq!(next.directory_entry, tail.directory_entry + 1);
+        assert_eq!(next.extent_offset, tail.extent_offset);
+        assert_eq!(next.directory_entry, tail.directory_entry);
     }
 
     #[test]
@@ -1801,7 +1528,6 @@ mod tests {
         pool.write_batch(&[EntryWrite {
             allocation,
             key: &key,
-            key_digest: KeyDigest::for_key(&key),
             value: &value,
             content_digest: value_digest(&value),
         }])

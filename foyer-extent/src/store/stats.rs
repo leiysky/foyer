@@ -1,6 +1,8 @@
 use crate::model::CachePriority;
 
-/// Cumulative buffered reads issued against the sparse Entry directory.
+/// Compatibility counters for the inert Format 1 Entry directory.
+///
+/// Runtime values are expected to remain zero; nonzero values indicate a regression.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DirectoryReadStats {
     pub runs: u64,
@@ -10,8 +12,8 @@ pub struct DirectoryReadStats {
 /// Immutable capacity and cardinality decisions for one Extent layout.
 ///
 /// `planned_file_bytes` is the hard space planned inside the configured cache capacity. The
-/// EntryIndex target and directory address space are deliberately reported separately because
-/// both may overcommit their planning targets without rejecting a cache write.
+/// The EntryIndex target and compatibility-directory address space are reported separately. The
+/// index target is soft and may be overcommitted without rejecting a cache write.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ExtentLayoutStats {
     pub configured_capacity_bytes: u64,

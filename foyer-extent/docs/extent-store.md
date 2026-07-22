@@ -27,7 +27,7 @@ Stored Entry
   -> contiguous byte allocation
   -> page-aligned publication frame
   -> cache extent (append and reclaim unit)
-  -> preallocated data file plus sparse Entry directory
+  -> preallocated data file
 ```
 
 Range parsing and application-level assembly belong above this store. One Entry always has one
@@ -41,14 +41,15 @@ The store directory contains:
 | Path | Role |
 | --- | --- |
 | `data` | Preallocated packed Stored Entry bytes |
-| `directory` | Sparse address space with one fixed record per Entry allocation |
+| `directory` | Inert sparse placeholder retained by stable Format 1 |
 | `state` | Two alternating checksummed allocator-state copies |
 | `index-lsm/` | FixedRecordLSM WAL, manifests, and SSTs |
 
-An Entry-directory record binds one allocation's byte offset to the key digest, extent generation,
-value length, 88-bit value-content digest, sequence, and priority. The record itself has a CRC.
-Recovery reads the directory only to discover the uncheckpointed tail of at most one current extent
-per priority. Reclaim does not read it. Exact key validation remains in the Stored Entry.
+Format 1 originally reserved a 64-byte Entry-directory record shape. The stable layout and logical
+file size are retained so existing Format 1 stores reopen without migration, but the runtime writes
+no records and performs no directory reads or syncs. Exact key and value validation live in the
+Stored Entry and `EntryLocation`; recovery intentionally discards allocations newer than the last
+allocator/index checkpoint.
 
 The hard layout calculation includes the preallocated data file, a directory budget based on the
 4 KiB Entry planning charge, and both allocator-state copies. One extent is excluded from usable
@@ -58,16 +59,13 @@ steady-state index copy, one atomic compaction output copy, and one WAL/L0 write
 soft target.
 
 Physical allocation is bounded by packed payload bytes, not by the planning charge. The directory
-therefore uses a sparse logical address space large enough for the theoretical maximum number of
-valid Stored Entries (header plus a one-byte key and one-byte value). Small Entries may exceed the
-planned cardinality without being rejected; only the directory blocks actually written consume
-space. Creation establishes the complete logical address space with one sentinel positional write
-at its final byte rather than `ftruncate`; this preserves holes on filesystems that otherwise
-allocate an extended range eagerly. Directory and EntryIndex usage can consequently exceed their
-planning targets, and that overcommit is reported as pressure rather than converted into a
-cache-health boundary. The host
-filesystem remains the real allocation limit. Index reservations include transient overlap and
-release obsolete bytes only after unlink and directory sync, preserving exact usage accounting.
+keeps a sparse logical address space large enough for the theoretical maximum number of valid
+Stored Entries (header plus a one-byte key and one-byte value), but only its sentinel sizing block
+is allocated. Small Entries may exceed planned cardinality without being rejected. EntryIndex usage
+can also exceed its planning target, and that overcommit is reported as pressure rather than
+converted into a cache-health boundary. The host filesystem remains the real allocation limit.
+Index reservations include transient overlap and release obsolete bytes only after unlink and
+directory sync, preserving exact usage accounting.
 
 ## Lookup
 
@@ -85,15 +83,14 @@ XXH3 value-content digest, compares the complete key, and rechecks the generatio
 default keeps values through 1 MiB, including the Stored Entry metadata and alignment fragments, in
 one run. Direct I/O expands the read to the covering 4 KiB frame span; buffered I/O reads only the
 logical bytes. Frame counters describe pages covered, not separate I/O calls. This path does not
-read Entry-directory metadata, so a hot index lookup does not add a sidecar I/O.
-Directory records exist for bounded current-tail recovery, not foreground lookup or reclaim. Any stale, torn, or
-mismatched location is a miss/error boundary, never an unverified hit. There is deliberately no
+read Entry-directory metadata, so a hot index lookup does not add a sidecar I/O. Any stale, torn,
+or mismatched location is a miss/error boundary, never an unverified hit. There is deliberately no
 second batch-read implementation beside Foyer's point-load interface.
 
-Tail recovery reads directory records in bounded 64 KiB runs and stops at the first invalid record.
-Normal reopen therefore reads at most three current tails, independent of total payload size and
-sealed-extent count. Reclaim is a metadata-only generation transition and contributes no directory,
-index, or payload reads.
+Recovery loads one of two bounded allocator copies plus FixedRecordLSM metadata and its bounded WAL
+tail. It never scans payload or directory records. Allocations and overlay mutations newer than the
+last complete checkpoint are discarded as ordinary cache loss. Reclaim is a metadata-only
+generation transition and contributes no directory, index, or payload reads.
 
 Run limits are runtime syscall-batching controls, not persistent-layout boundaries. A point read
 allocates only the covering range for that Entry, capped per syscall; setting a 2 MiB maximum does
@@ -106,9 +103,9 @@ format migration.
 
 `ExtentPool` owns the physical half of the cooperative synchronous I/O scheduler described in
 [Foyer integration](foyer-integration.md). One read permit spans all physical runs of an Entry
-payload; acquisition is an atomic lock-free fast path and never waits for a write. Data and
-Entry-directory write runs plus their publication syncs use write permits. A write first looks for
-a read-quiescent point, but the read-priority interval is bounded (2 ms by default), so continuously
+payload; acquisition is an atomic lock-free fast path and never waits for a write. Data write runs
+and checkpoint payload syncs use write permits. A write first looks for a read-quiescent point, but
+the read-priority interval is bounded (2 ms by default), so continuously
 arriving reads cannot starve cache publication or reclaim. Existing write concurrency remains the
 hard cap. A zero interval bypasses admission and accounting entirely.
 
@@ -126,37 +123,37 @@ runtime tuning signals rather than acknowledged-write semantics.
 
 ## Insert and checkpoint
 
-An insert validates the Entry and reserves an exact byte range plus one directory position. Adjacent
-same-extent allocations in a store batch are packed into page-aligned write frames; only the final
-frame is padded. The store writes payload and Entry-directory records, advances the extent cursor to
-the frame boundary, installs locations in the active overlay, and synchronizes the payload
-publication fence. It then advances a logical epoch. Once `checkpoint_bytes` is reached, or the
-periodic cache worker requests one, the coordinator captures immutable allocator and index images
-under the mutation lock and releases it.
+An insert validates the Entry and reserves an exact byte range plus one Format 1 entry ordinal.
+Adjacent same-extent allocations in a store batch are packed into page-aligned write frames; only
+the final frame is padded. The store writes payload, advances the extent cursor to the frame
+boundary, installs locations in the active overlay, and advances a logical published epoch without
+issuing `fdatasync`. Once `checkpoint_bytes` is reached, or the periodic cache worker requests one,
+the coordinator holds the mutation lock while synchronizing all dirty payload once and capturing
+immutable allocator and index images, then releases the lock before metadata persistence.
 
-The value-content digest is computed once on submission and stored in both the directory record and
-index location. A repeated key, encoded length, digest, and priority is idempotent without reading
+The value-content digest is computed once on submission and stored in the Stored Entry and index
+location. A repeated key, encoded length, digest, and priority is idempotent without reading
 the old payload only when the index location is memory-resident and its allocator generation and
 range are still live. An SST-only or stale location is conservatively rewritten. The development-V4
 CRC32 shortcut could suppress an update for an easily
 constructed collision; development V5 introduced an 88-bit seeded XXH3 identity, retained by
-stable format 1, while keeping the same 32-byte location and 64-byte directory record sizes. The
-complete key is still compared on every returned hit.
+stable format 1. The complete key is still compared on every returned hit.
 
 Durable checkpoint order is:
 
 ```text
-payload + Entry directory sync
+data-file sync
   -> alternating allocator-state copy
   -> synced FixedRecordLSM batch + indexed-cardinality upper bound
   -> frozen-overlay retirement
 ```
 
-Publication returns to the Foyer flush worker after the payload fence; metadata checkpointing has
-no per-insert strict mode. Published-byte and periodic triggers feed the same coalescing checkpoint
-worker, which advances the durable frontier while later mutations may continue. A checkpoint error
-becomes sticky and subsequent mutations fail rather than continuing with an unknown durability
-state. Graceful `sync` and close wait for the latest epoch and already-scheduled FixedRecordLSM
+Volatile publication returns to the Foyer flush worker after data writes; metadata checkpointing
+has no per-insert strict mode. Published-byte and periodic triggers feed the same coalescing
+checkpoint worker. Data sync and image capture serialize briefly with mutations, while allocator
+and index persistence proceed after the lock is released and later mutations may continue. A
+checkpoint error becomes sticky and subsequent mutations fail rather than continuing with an
+unknown durability state. Graceful `sync` and close wait for the latest epoch and already-scheduled FixedRecordLSM
 maintenance, so a late flush or compaction failure cannot be hidden by an earlier WAL durability
 acknowledgement.
 
@@ -167,6 +164,8 @@ The checkpoint protocol maintains these invariants:
 - a captured allocator/index image is immutable while it is persisted;
 - a newer requested epoch remains pending when an older checkpoint completes;
 - abort merge preserves the newest per-key overlay mutation;
+- a captured location that is already generation-stale becomes a tombstone, not durable stale
+  metadata;
 - reclaim cannot reuse a cache-extent generation while an older captured epoch may reference it;
   and
 - close succeeds only after its target epoch and scheduled index maintenance are durable.
@@ -190,9 +189,10 @@ its minimum. Floor percentages are runtime policy and may change across reopen; 
 remains part of the durable allocator state.
 
 Once a victim is selected, reclaim waits only for an already captured metadata checkpoint to
-finish, verifies that previous payload writes are fenced, increments the victim generation, marks
-the extent free, and persists the alternating allocator-state copy. This is the complete normal
-reclaim transaction. It performs no directory scan, per-key index lookup, tombstone batch, payload
+finish, increments the victim generation, marks the extent free, and persists the alternating
+allocator-state copy before the bytes can be reused. It does not synchronize unrelated dirty
+payload. This is the complete normal reclaim transaction. It performs no directory scan, per-key
+index lookup, tombstone batch, payload
 read, payload copy, or index checkpoint. The allocator write and sync are required before the same
 physical bytes can be overwritten; the pre-I/O generation check makes every old location a miss.
 
@@ -210,11 +210,22 @@ or `low`). Entries of one class are appended to class-owned extents, and victim 
 that same physical granularity. ExtentStore does not infer hotness from foreground reads and does
 not turn hits into reclaim writes.
 
-Old index locations are intentionally left in place on the reclaim path. FixedRecordLSM checks
-their generation only while an existing non-trivial compaction is already rewriting those records;
-an invalid newest location becomes a tombstone, and a bottom-level compaction can drop it. Trivial
-moves remain zero-copy and do not rewrite a file merely for garbage collection. The persisted index
-cardinality is consequently an upper bound, never an admission limit or a correctness input.
+Old index locations are intentionally left in place on the reclaim path. Their generation is
+checked at two later boundaries. Checkpoint persistence converts a stale captured overlay location
+into a tombstone immediately. Older durable SST locations are checked only while an existing
+non-trivial compaction is already rewriting those records; an invalid newest location becomes a
+tombstone, and a bottom-level compaction can drop it. Trivial moves remain zero-copy and do not
+rewrite a file merely for garbage collection. The persisted index cardinality is consequently an
+upper bound, never an admission limit or a correctness input.
+
+### Format 1 reclaim scaling boundary
+
+Generation invalidation is O(1) logical work and O(1) sync operations, but Format 1 encodes the
+allocator as two full copies. Each reclaimed extent therefore rewrites one `state_copy_size` image,
+whose bytes grow linearly with configured extent count. This is small at the current target
+capacities but becomes meaningful at multi-terabyte scale. A constant-byte generation journal or
+batched generation transaction changes recovery metadata and belongs to Format 2; it is not hidden
+behind a runtime switch in Format 1.
 
 ## EntryIndex boundary
 
@@ -230,13 +241,13 @@ accounting, and rejected index implementations are specified in
   layout. Stable format 1 must reject it and the explicit recreate path must remove legacy owned
   files before creating the new directory layout. The stable family magic also rejects development
   formats that used the same numeric version. Current-format tests separately cover append, reopen,
-  active-tail recovery, reclaim, and process abort.
+  checkpoint-tail discard, reclaim, and process abort.
 - Incomplete final WAL frames are ignored; corruption inside the durable prefix is an error.
 - The newest invalid allocator or manifest copy falls back to the older valid copy.
 - New SSTs are synced before a manifest can reference them.
 - Obsolete SST/WAL files are unlinked only after the new manifest is durable.
-- A crash before index publication may leak byte allocations or directory positions; a crash after
-  it recovers only previously durable payload/generation state.
+- A crash before index publication discards the uncheckpointed byte/allocation tail; a crash after
+  it recovers only payload and allocator state fenced by that checkpoint.
 - Since this is an expendable cache, an integrator may recreate an invalid top-level store; the
   store itself still reports the corruption precisely.
 
@@ -248,11 +259,11 @@ accounting, and rejected index implementations are specified in
 - **Cross-extent Entry descriptors** would reduce boundary waste but make reads, reclaim, and crash
   recovery span multiple generations. Extent seals the current cache extent instead.
 - **Payload or directory scanning during reclaim** would make eviction cost proportional to victim
-  cardinality and pollute the read path. Generation invalidation makes reclaim O(1). The directory
-  remains only because bounded current-tail recovery needs allocation boundaries without scanning
-  payload bytes.
-- **One directory record per page or slot** duplicates Entry identity and inflates index cardinality.
-  The packed layout stores one directory record and one EntryIndex location per complete Entry.
+  cardinality and pollute the read path. Generation invalidation keeps reclaim independent of
+  victim cardinality.
+- **Operational Entry-directory records** duplicate Entry identity and add a write, sync, and
+  recovery-read stream solely to rescue an expendable uncheckpointed tail. Format 1 retains the
+  sparse file shape for compatibility but performs no runtime directory I/O.
 - **Fixed priority partitions** strand capacity when one class is idle. Borrowable floors preserve
   minimum residency while allowing repayment under later demand.
 - **An independent background reclaimer** would race the total mutation order and generation
@@ -268,8 +279,10 @@ accounting, and rejected index implementations are specified in
 - **Larger 4 MiB and 8 MiB write runs** reduce syscall count but did not materially improve
   throughput in the bounded large-value validation and raised peak RSS. Writes remain capped at
   1 MiB unless a production device demonstrates a different throughput/latency tradeoff.
-- **Synchronizing mutable payload files in the background checkpoint** lets the sync chase later
-  writes. Each physical batch pays its bounded payload fence before immutable metadata capture.
+- **Synchronizing every physical batch** turned sparse puts into nearly one `fdatasync` each and
+  doubled the fence with the directory file. Checkpoints now hold mutation order across one grouped
+  data sync and immutable capture; the tradeoff is a periodic write-latency pause instead of
+  per-batch durability I/O.
 
 ## Deliberate non-goals
 

@@ -75,7 +75,7 @@ point index, not a reusable RocksDB replacement.
 EntryIndex durability follows the ExtentStore publication order:
 
 ```text
-payload + Entry directory
+data-file sync
   -> allocator state
   -> synced FixedRecordLSM mutation batch + indexed-cardinality upper bound
   -> frozen-overlay retirement
@@ -85,9 +85,12 @@ A crash before the LSM batch may leave unreachable physical bytes but cannot exp
 whose allocator generation is not durable. A crash after the batch recovers only previously fenced
 payload and allocator state.
 
-If checkpoint persistence fails, the frozen overlay is merged behind newer active mutations using
-per-key sequence order. The failure remains sticky for the current store instance; later mutations
-and close observe it.
+Before building the durable batch, EntryIndex checks every captured location against the
+lock-free extent-liveness table. A location already invalidated by reclaim is written as a
+tombstone, not as stale metadata; omission would be unsafe because an older value may exist in a
+lower level. If checkpoint persistence fails, the frozen overlay is merged behind newer active
+mutations using per-key sequence order. The failure remains sticky for the current store instance;
+later mutations and close observe it.
 
 ## Recovery
 
@@ -109,14 +112,15 @@ enumerate stale index keys.
 ## Generation garbage collection
 
 Whole-extent reclaim deliberately does not install per-key tombstones. Doing so would turn one
-allocator transition into directory reads, index lookups, WAL writes, and an index checkpoint.
-Stale locations are harmless because ExtentPool rejects their generation before payload I/O.
+allocator transition into index lookups, WAL writes, and an index checkpoint. Stale locations are
+harmless because ExtentPool rejects their generation before payload I/O.
 
-FixedRecordLSM removes that metadata debt only as a side effect of work it already has to perform.
-During a non-trivial compaction, the newest value for each key is decoded and checked against the
-lock-free extent-liveness table. An invalid location is emitted as a tombstone so an older lower-level
-value cannot reappear; bottom-level compaction may omit the tombstone. A trivial move never rewrites
-an SST just to run this filter. Cumulative check and discard counters expose cleanup progress without
+Captured overlay debt is removed at the next ordinary checkpoint by the liveness check described
+above. Older SST debt is removed only as a side effect of work FixedRecordLSM already has to
+perform. During a non-trivial compaction, the newest value for each key is decoded and checked
+against the same table. An invalid location is emitted as a tombstone so an older lower-level value
+cannot reappear; bottom-level compaction may omit the tombstone. A trivial move never rewrites an
+SST just to run this filter. Cumulative check and discard counters expose cleanup progress without
 creating a separate garbage-collection job or recovery scan.
 
 ## Read cache and accounting

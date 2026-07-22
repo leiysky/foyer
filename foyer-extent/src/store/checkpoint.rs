@@ -20,10 +20,10 @@ use crate::{
 
 /// Coordinates one total publication order with an independently advancing durability frontier.
 ///
-/// The store mutation mutex is held only while an immutable allocator/index epoch is detached.
-/// Payload synchronization and metadata persistence happen after that mutex is released. Reclaim
-/// waits for an already captured epoch to finish before generation reuse, so two allocator images
-/// can never race to publish the same state generation.
+/// The store mutation mutex is held while dirty payload is synchronized and an immutable
+/// allocator/index epoch is detached. Metadata persistence then happens after that mutex is
+/// released. Reclaim waits for an already captured epoch to finish before generation reuse, so
+/// two allocator images can never race to publish the same state generation.
 pub struct CheckpointCoordinator {
     shared: Arc<CheckpointShared>,
     worker: Option<JoinHandle<()>>,
@@ -250,6 +250,12 @@ impl Drop for CheckpointCoordinator {
 
 impl CheckpointShared {
     fn prepare_epoch(&self, epoch: u64) -> Result<CheckpointEpoch> {
+        // One checkpoint fence covers every data write in the captured publication range. The
+        // Format 1 directory file is retained for layout compatibility but is no longer written:
+        // recovery deliberately discards an uncheckpointed tail instead of paying per-put I/O.
+        self.pool.sync_payload()?;
+        #[cfg(test)]
+        crate::store::crash_if_requested("extent_after_payload_sync");
         let allocator = self.pool.prepare_checkpoint_state()?;
         let index = self.index.prepare_checkpoint()?;
         Ok(CheckpointEpoch {

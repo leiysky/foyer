@@ -98,38 +98,6 @@ impl SubmissionQueue {
         })
     }
 
-    /// Reserve space for an ordered control command without enforcing the data-command limits.
-    ///
-    /// Deletes must not be discarded at the queue boundary: doing so can expose a stale value
-    /// after an update was rejected. Pending gauges intentionally exceed their configured
-    /// capacities while control commands are overcommitted, making the pressure observable.
-    pub fn reserve_control(self: &Arc<Self>, bytes: usize) -> Option<QueueReservation> {
-        if self
-            .pending_entries
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |entries| entries.checked_add(1))
-            .is_err()
-        {
-            return None;
-        }
-        if self
-            .pending_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |pending| {
-                pending.checked_add(bytes)
-            })
-            .is_err()
-        {
-            self.rollback_entry();
-            return None;
-        }
-
-        self.metrics.storage_engine_queue_pending_entries.increase(1);
-        self.metrics.storage_engine_queue_pending_bytes.increase(bytes as u64);
-        Some(QueueReservation {
-            queue: self.clone(),
-            bytes,
-        })
-    }
-
     fn release(&self, bytes: usize) {
         let previous_bytes = self.pending_bytes.fetch_sub(bytes, Ordering::AcqRel);
         assert!(previous_bytes >= bytes, "Extent pending queue byte count underflow");
@@ -210,16 +178,15 @@ mod tests {
     }
 
     #[test]
-    fn control_reservation_can_overcommit_soft_limits() {
+    fn every_command_shares_the_same_hard_limits() {
         let queue = Arc::new(SubmissionQueue::new(1, 4, Arc::new(Metrics::noop())));
         let data = queue.try_reserve(4).unwrap();
-        let control = queue.reserve_control(3).unwrap();
-
-        assert_eq!(queue.pending_entries(), 2);
-        assert_eq!(queue.pending_bytes(), 7);
+        assert!(queue.try_reserve(3).is_none());
+        assert_eq!(queue.pending_entries(), 1);
+        assert_eq!(queue.pending_bytes(), 4);
         assert!(queue.try_reserve(0).is_none());
 
-        drop((data, control));
+        drop(data);
         assert_eq!(queue.pending_entries(), 0);
         assert_eq!(queue.pending_bytes(), 0);
     }

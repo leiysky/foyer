@@ -228,17 +228,25 @@ impl ExtentStore {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn get_prepared(&self, key: &EntryKey, prepared: PreparedGet) -> Result<GetResult> {
-        let location = match prepared {
-            PreparedGet::Location(location) => location,
-            PreparedGet::Miss => return Ok(GetResult::default()),
-            PreparedGet::Unknown(key_digest) => {
-                let Some(location) = self.index.peek(key_digest)? else {
-                    return Ok(GetResult::default());
-                };
-                location
-            }
+        let Some(location) = self.resolve_prepared(prepared)? else {
+            return Ok(GetResult::default());
         };
+        self.read_location(key, location)
+    }
+
+    /// Resolve only the fixed-index portion of a prepared lookup. This deliberately performs no
+    /// payload I/O so metadata misses cannot consume the payload-read admission budget.
+    pub(crate) fn resolve_prepared(&self, prepared: PreparedGet) -> Result<Option<EntryLocation>> {
+        match prepared {
+            PreparedGet::Location(location) => Ok(Some(location)),
+            PreparedGet::Miss => Ok(None),
+            PreparedGet::Unknown(key_digest) => self.index.peek(key_digest),
+        }
+    }
+
+    pub(crate) fn read_location(&self, key: &EntryKey, location: EntryLocation) -> Result<GetResult> {
         let stored = self.pool.read_entry(key, location)?;
         Ok(GetResult {
             priority: stored.value.as_ref().map(|_| location.priority),
@@ -287,7 +295,6 @@ impl ExtentStore {
             let mut known: HashMap<KeyDigest, KnownInsert<'_>> = HashMap::new();
             let mut pending = Vec::new();
             let mut protected_extents = HashSet::new();
-            let mut fence_before_reclaim = false;
 
             while input_index < inserts.len() {
                 let insert = inserts[input_index];
@@ -335,7 +342,6 @@ impl ExtentStore {
                     }
                     AllocationDecision::FlushRequired(reclaimed) => {
                         reclaim.merge(reclaimed);
-                        fence_before_reclaim = true;
                         break;
                     }
                     AllocationDecision::Rejected(reclaimed) => {
@@ -385,7 +391,6 @@ impl ExtentStore {
                 .map(|pending| EntryWrite {
                     allocation: pending.allocation,
                     key: pending.key,
-                    key_digest: pending.key_digest,
                     value: pending.value,
                     content_digest: pending.content_digest,
                 })
@@ -409,15 +414,9 @@ impl ExtentStore {
                 .saturating_add(physical.data_bytes)
                 .saturating_add(physical.entry_directory_bytes)
                 .saturating_add(indexed.written_bytes);
-            if fence_before_reclaim {
-                self.fence_payload()?;
-            }
         }
 
         if published_bytes > 0 {
-            if self.pool.payload_is_dirty() {
-                self.fence_payload()?;
-            }
             self.checkpoints.record_publication(published_bytes)?;
         }
         let checkpoint_target = self.checkpoints.published_epoch();
@@ -435,18 +434,6 @@ impl ExtentStore {
             written_bytes: written_bytes.saturating_add(reclaim.written_bytes),
             reclaim: reclaim.stats,
         })
-    }
-
-    fn fence_payload(&self) -> Result<()> {
-        // Payload and directory durability is the publication fence. Checkpoint epochs therefore
-        // persist only immutable allocator/index metadata and never race fdatasync with later
-        // buffered writes to the same monolithic files. A store batch that fills the device
-        // fences its completed prefix before entering generation-reusing reclaim; the complete
-        // caller-visible batch still advances one publication epoch below.
-        self.pool.sync_payload()?;
-        #[cfg(test)]
-        crate::store::crash_if_requested("extent_after_payload_sync");
-        Ok(())
     }
 
     #[cfg(test)]
@@ -683,10 +670,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{
-        format::PAGE_SIZE,
-        store::{format::ENTRY_OWNER_SIZE, pool::AllocationResult},
-    };
+    use crate::{format::PAGE_SIZE, store::pool::AllocationResult};
 
     fn key(index: u64) -> EntryKey {
         let mut bytes = [index as u8; 24];
@@ -888,7 +872,7 @@ mod tests {
         );
         let stats = store.physical_write_stats();
         assert_eq!(stats.data_bytes, (PAGE_SIZE * 4) as u64);
-        assert_eq!(stats.entry_directory_bytes, ENTRY_OWNER_SIZE as u64);
+        assert_eq!(stats.entry_directory_bytes, 0);
         let read = store.get_with_stats(&key(7)).unwrap();
         assert_eq!(read.value, Some(value.clone()));
         assert_eq!(read.data_frames, 4);
@@ -922,8 +906,8 @@ mod tests {
         let writes = store.physical_write_stats();
         assert_eq!(writes.data_runs, 1);
         assert_eq!(writes.data_bytes, PAGE_SIZE as u64);
-        assert_eq!(writes.entry_directory_runs, 1);
-        assert_eq!(writes.entry_directory_bytes, (keys.len() * ENTRY_OWNER_SIZE) as u64);
+        assert_eq!(writes.entry_directory_runs, 0);
+        assert_eq!(writes.entry_directory_bytes, 0);
         let occupancy = store.extent_occupancy();
         assert_eq!(occupancy.used_entries(CachePriority::Normal), keys.len() as u64);
         assert_eq!(occupancy.used_bytes(CachePriority::Normal), PAGE_SIZE as u64);
@@ -1130,10 +1114,10 @@ mod tests {
         let before_checkpoint = store.physical_write_stats();
         assert_eq!(before_checkpoint.data_runs, 1);
         assert_eq!(before_checkpoint.data_bytes, (PAGE_SIZE * 2) as u64);
-        assert_eq!(before_checkpoint.entry_directory_runs, 1);
-        assert_eq!(before_checkpoint.entry_directory_bytes, (ENTRY_OWNER_SIZE * 2) as u64);
-        assert_eq!(before_checkpoint.data_syncs, 1);
-        assert_eq!(before_checkpoint.entry_directory_syncs, 1);
+        assert_eq!(before_checkpoint.entry_directory_runs, 0);
+        assert_eq!(before_checkpoint.entry_directory_bytes, 0);
+        assert_eq!(before_checkpoint.data_syncs, 0);
+        assert_eq!(before_checkpoint.entry_directory_syncs, 0);
         assert_eq!(before_checkpoint.index_runs, 0);
         assert_eq!(before_checkpoint.index_syncs, 0);
         assert_eq!(before_checkpoint.allocator_runs, 0);
@@ -1162,7 +1146,9 @@ mod tests {
                 + after_checkpoint.index_bytes
                 + after_checkpoint.allocator_bytes
         );
-        assert_eq!(after_checkpoint.total_syncs(), 4);
+        assert_eq!(after_checkpoint.data_syncs, 1);
+        assert_eq!(after_checkpoint.entry_directory_syncs, 0);
+        assert_eq!(after_checkpoint.total_syncs(), 3);
     }
 
     #[cfg(target_os = "linux")]
@@ -1268,7 +1254,37 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_reuses_the_existing_payload_fence_without_resyncing() {
+    fn checkpoint_turns_reclaimed_overlay_locations_into_tombstones() {
+        let dir = tempdir().unwrap();
+        let store = store(dir.path(), 2 * 1024 * 1024);
+        let inserts = store.pool.layout().planned_max_entries as usize * 2;
+        let values = (0..inserts)
+            .map(|index| vec![(index % 251) as u8; 16])
+            .collect::<Vec<_>>();
+        let keys = (0..inserts).map(|index| key(index as u64)).collect::<Vec<_>>();
+        let batch = values
+            .iter()
+            .zip(&keys)
+            .map(|(value, key)| EntryInsert::new(key, value, CachePriority::Normal))
+            .collect::<Vec<_>>();
+
+        store.insert_batch_with_stats(&batch).unwrap();
+        store.sync().unwrap();
+        drop(store);
+
+        let reopened = ExtentStore::open_with_options(dir.path(), options()).unwrap();
+        for key in &keys {
+            if let Some(location) = reopened.index.peek(KeyDigest::for_key(key)).unwrap() {
+                assert!(
+                    reopened.pool.location_is_live(location),
+                    "checkpoint persisted a reclaimed overlay location for {key:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reclaim_does_not_force_a_payload_sync() {
         let dir = tempdir().unwrap();
         let store = store(dir.path(), 2 * 1024 * 1024);
         let entries = store.pool.layout().planned_max_entries as usize;
@@ -1294,9 +1310,13 @@ mod tests {
         assert_eq!(result.reclaim.total_reclaimed_extents(), 1);
         assert_eq!(result.outcomes, vec![InsertOutcome::Inserted]);
         let after = store.physical_write_stats();
-        assert_eq!(after.data_syncs - before.data_syncs, 1);
-        assert_eq!(after.entry_directory_syncs - before.entry_directory_syncs, 1);
+        assert_eq!(after.data_syncs - before.data_syncs, 0);
+        assert_eq!(after.entry_directory_syncs - before.entry_directory_syncs, 0);
         assert_eq!(store.get(&incoming_key).unwrap(), Some(value));
+        store.checkpoint().unwrap();
+        let checkpointed = store.physical_write_stats();
+        assert_eq!(checkpointed.data_syncs - after.data_syncs, 1);
+        assert_eq!(checkpointed.entry_directory_syncs, 0);
     }
 
     #[test]

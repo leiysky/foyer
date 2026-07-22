@@ -48,8 +48,8 @@ impl<'a> Reclaimer<'a> {
                     return Ok(AllocationDecision::Allocated(allocation, reclaimed));
                 }
                 AllocationResult::ReclaimRequired if !protected_extents.is_empty() => {
-                    // Reclaim persists allocator state. Publish pending byte ranges first so every
-                    // durable cursor names only complete directory records and a sealed I/O frame.
+                    // Publish pending byte ranges before allowing their extents to become reclaim
+                    // candidates. Durability is intentionally deferred to the next checkpoint.
                     return Ok(AllocationDecision::FlushRequired(reclaimed));
                 }
                 AllocationResult::ReclaimRequired => {}
@@ -81,7 +81,6 @@ impl<'a> Reclaimer<'a> {
 
     fn reclaim(&self, victim: ExtentVictim) -> Result<ReclaimResult> {
         let started = Instant::now();
-        self.pool.ensure_payload_fenced()?;
         let checkpoint_wait_started = Instant::now();
         self.checkpoints.wait_for_idle_locked()?;
         let checkpoint_wait = checkpoint_wait_started.elapsed();

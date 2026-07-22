@@ -109,8 +109,9 @@ priority, and extent generation. Its compact record is independently checksummed
 _Avoid_: Extent location, blob address, index entry
 
 **Entry directory**:
-The per-cache-extent sequence of fixed records identifying its Stored Entries for bounded current-tail
-recovery without reading payload bytes. Normal reclaim does not read it.
+The inert sparse file and record shape retained by stable Format 1 for compatibility. Current
+runtime paths do not write, synchronize, or read it; checkpoint recovery discards the volatile
+tail instead.
 _Avoid_: Slot owners, EntryIndex, public index
 
 **I/O frame**:
@@ -119,8 +120,9 @@ reclaim unit, and multiple Stored Entries may share one frame.
 _Avoid_: Allocation slot, cache extent, block
 
 **Entry charge**:
-The planning weight of one Entry used to derive soft directory and EntryIndex capacity targets. It
-does not bound cardinality, round the Entry allocation, or describe physical bytes written.
+The planning weight of one Entry used to derive the legacy directory budget and soft EntryIndex
+capacity target. It does not bound cardinality, round the Entry allocation, or describe physical
+bytes written.
 _Avoid_: Slot size, Entry size, frame size
 
 **Extent generation**:

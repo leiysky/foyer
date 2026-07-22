@@ -7,12 +7,12 @@ use crate::model::{EntryKey, MAX_KEY_SIZE};
 pub const PAGE_SIZE: usize = 4 * 1024;
 /// Persisted value identity used for idempotence and payload validation.
 ///
-/// Eleven bytes fit both fixed metadata records without increasing their size. The records retain
-/// a separate CRC for torn-write detection, while complete keys are still verified on every hit.
+/// Eleven bytes fit the Stored Entry header and fixed index location without increasing either
+/// representation. Complete keys are still verified on every hit.
 pub(crate) const CONTENT_DIGEST_SIZE: usize = 11;
 pub(crate) type ContentDigest = [u8; CONTENT_DIGEST_SIZE];
 const CONTENT_DIGEST_SEED: u64 = 0x4f1b_bcdd_94d0_49bb;
-/// The planning charge used to size Entry-directory and index targets.
+/// The planning charge used to size the Format 1 compatibility directory and index targets.
 ///
 /// Stored Entries are packed by byte inside an extent. This charge is neither a physical
 /// allocation unit nor an Entry-count limit.
