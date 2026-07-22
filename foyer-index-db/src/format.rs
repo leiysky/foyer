@@ -104,13 +104,13 @@ pub fn read_exact_at(file: &File, mut output: &mut [u8], mut offset: u64) -> io:
         if read == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "file ended before the requested fixed-lsm range",
+                "file ended before the requested IndexDB range",
             ));
         }
         output = &mut output[read..];
         offset = offset
             .checked_add(read as u64)
-            .ok_or_else(|| io::Error::other("fixed-lsm read offset overflow"))?;
+            .ok_or_else(|| io::Error::other("IndexDB read offset overflow"))?;
     }
     Ok(())
 }

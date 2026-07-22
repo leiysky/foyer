@@ -223,7 +223,7 @@ impl ExtentStore {
         self.read_location(key, location)
     }
 
-    /// Resolve only the fixed-index portion of a prepared lookup. This deliberately performs no
+    /// Resolve only the EntryIndex portion of a prepared lookup. This deliberately performs no
     /// payload I/O so metadata misses cannot consume the payload-read admission budget.
     pub(crate) fn resolve_prepared(&self, prepared: PreparedGet) -> Result<Option<EntryLocation>> {
         match prepared {
@@ -574,9 +574,9 @@ fn validate_options(options: ExtentStoreOptions) -> Result<()> {
             "extent checkpoint_bytes must be greater than zero".to_string(),
         ));
     }
-    if options.index_write_buffer_size < fixed_lsm::KEY_SIZE + fixed_lsm::VALUE_SIZE + 8 {
+    if options.index_write_buffer_size < index_db::KEY_SIZE + index_db::VALUE_SIZE + 8 {
         return Err(Error::InvalidConfig(
-            "extent index_write_buffer_size must fit one fixed-LSM record".to_string(),
+            "extent index_write_buffer_size must fit one IndexDB record".to_string(),
         ));
     }
     if options.index_cache_size == 0 {

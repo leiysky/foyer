@@ -15,7 +15,7 @@ use foyer::{
 };
 use foyer_extent::{
     CachePriority, DEFAULT_HIGH_PRIORITY_CAPACITY_PERCENT, DEFAULT_NORMAL_PRIORITY_CAPACITY_PERCENT, EngineReadStats,
-    EngineValue, EntryIndexReadStats, ExtentEngineConfig, ExtentEngineHandle, MAX_KEY_SIZE,
+    EngineValue, EntryIndexReadStats, ExtentEngineConfig, ExtentEngineHandle, ExtentEngineTestTuning, MAX_KEY_SIZE,
 };
 
 #[path = "support/scenario.rs"]
@@ -996,23 +996,26 @@ async fn build_cache(
         DiskEngine::Extent => {
             let queue_entries = (config.queue_bytes / (4 * KIB)).max(1);
             let extent = ExtentEngineConfig::new(path.join("extent-engine"), config.capacity_bytes as u64)
-                .with_test_layout(config.extent_entry_charge, config.extent_size)
-                .with_write_concurrency(config.write_concurrency)
-                .with_io_read_priority_duration(config.extent_io_read_priority)
-                .with_read_run_size(config.extent_read_run_bytes)
-                .with_write_run_size(config.extent_write_run_bytes)
+                .with_test_tuning(ExtentEngineTestTuning {
+                    layout: Some((config.extent_entry_charge, config.extent_size)),
+                    write_concurrency: Some(config.write_concurrency),
+                    io_read_priority_duration: Some(config.extent_io_read_priority),
+                    read_run_size: Some(config.extent_read_run_bytes),
+                    write_run_size: Some(config.extent_write_run_bytes),
+                    index_write_buffer_size: Some(config.extent_index_write_buffer_bytes),
+                    queue_capacity_bytes: Some(config.queue_bytes),
+                    queue_capacity_entries: Some(queue_entries),
+                    write_batch_bytes: Some((128 * MIB).min(config.queue_bytes)),
+                    write_batch_entries: Some(4_096.min(queue_entries)),
+                    write_batch_delay: Some(config.extent_write_batch_delay),
+                    ..Default::default()
+                })
                 .with_index_cache_size(config.extent_index_cache_bytes)
-                .with_index_write_buffer_size(config.extent_index_write_buffer_bytes)
                 .with_priority_capacity_floors(
                     config.extent_high_capacity_percent,
                     config.extent_normal_capacity_percent,
                 )
-                .with_direct_io(config.direct_io)
-                .with_queue_capacity_bytes(config.queue_bytes)
-                .with_queue_capacity_entries(queue_entries)
-                .with_write_batch_bytes((128 * MIB).min(config.queue_bytes))
-                .with_write_batch_entries(4_096.min(queue_entries))
-                .with_write_batch_delay(config.extent_write_batch_delay);
+                .with_direct_io(config.direct_io);
             let handle = extent.handle();
             (Box::new(extent), Some(handle))
         }

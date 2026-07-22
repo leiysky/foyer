@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
-use fixed_lsm::{FixedLsm, FixedLsmMemoryLookup, FixedLsmOptions, WriteBatch, WriteOptions};
+use index_db::{IndexDb, IndexDbMemoryLookup, IndexDbOptions, WriteBatch, WriteOptions};
 
 #[cfg(test)]
 use crate::format::PAGE_SIZE;
@@ -21,7 +21,7 @@ use crate::{
     },
 };
 
-pub(crate) const INDEX_DIRECTORY: &str = "index-lsm";
+pub(crate) const INDEX_DIRECTORY: &str = "index";
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EntryIndexStats {
@@ -95,7 +95,7 @@ pub struct IndexCheckpoint {
 
 #[derive(Debug)]
 pub struct EntryIndex {
-    database: FixedLsm,
+    database: IndexDb,
     state: RwLock<RuntimeState>,
     mutations: Mutex<()>,
     liveness: RwLock<Option<Arc<ExtentPool>>>,
@@ -109,33 +109,33 @@ impl EntryIndex {
         cache_capacity: usize,
     ) -> Result<Self> {
         let directory = root.join(INDEX_DIRECTORY);
-        let database = FixedLsm::create(
+        let database = IndexDb::create(
             &directory,
-            FixedLsmOptions {
+            IndexDbOptions {
                 write_buffer_capacity,
                 cache_capacity,
                 max_disk_bytes: capacity_bytes,
             },
         )
-        .map_err(|error| fixed_error("create", error))?;
+        .map_err(|error| index_db_error("create", error))?;
         Ok(Self::from_parts(database))
     }
 
     pub fn open(root: &Path, capacity_bytes: u64, write_buffer_capacity: usize, cache_capacity: usize) -> Result<Self> {
         let directory = root.join(INDEX_DIRECTORY);
-        let database = FixedLsm::open(
+        let database = IndexDb::open(
             &directory,
-            FixedLsmOptions {
+            IndexDbOptions {
                 write_buffer_capacity,
                 cache_capacity,
                 max_disk_bytes: capacity_bytes,
             },
         )
-        .map_err(|error| fixed_error("open", error))?;
+        .map_err(|error| index_db_error("open", error))?;
         Ok(Self::from_parts(database))
     }
 
-    fn from_parts(database: FixedLsm) -> Self {
+    fn from_parts(database: IndexDb) -> Self {
         let indexed_count = database.user_state();
         Self {
             database,
@@ -247,13 +247,13 @@ impl EntryIndex {
     pub fn ensure_healthy(&self) -> Result<()> {
         self.database
             .ensure_healthy()
-            .map_err(|error| fixed_error("health check", error))
+            .map_err(|error| index_db_error("health check", error))
     }
 
     pub fn wait_for_maintenance(&self) -> Result<()> {
         self.database
             .wait_for_maintenance()
-            .map_err(|error| fixed_error("wait for maintenance", error))
+            .map_err(|error| index_db_error("wait for maintenance", error))
     }
 
     pub fn lookup_memory(&self, key: KeyDigest) -> Result<EntryIndexMemoryLookup> {
@@ -270,7 +270,7 @@ impl EntryIndex {
             let lookup = self
                 .database
                 .probe_memory(&encode_key(key))
-                .map_err(|error| fixed_error("memory lookup", error))?;
+                .map_err(|error| index_db_error("memory lookup", error))?;
             let state = read_lock(&self.state);
             if let Some(mutation) = overlay_mutation(&state, key) {
                 return Ok(mutation
@@ -279,9 +279,9 @@ impl EntryIndex {
             }
             if state.base_revision == base_revision {
                 return match lookup {
-                    FixedLsmMemoryLookup::Value(value) => decode_location(value).map(EntryIndexMemoryLookup::Location),
-                    FixedLsmMemoryLookup::Miss => Ok(EntryIndexMemoryLookup::Miss),
-                    FixedLsmMemoryLookup::Unknown => Ok(EntryIndexMemoryLookup::Unknown),
+                    IndexDbMemoryLookup::Value(value) => decode_location(value).map(EntryIndexMemoryLookup::Location),
+                    IndexDbMemoryLookup::Miss => Ok(EntryIndexMemoryLookup::Miss),
+                    IndexDbMemoryLookup::Unknown => Ok(EntryIndexMemoryLookup::Unknown),
                 };
             }
         }
@@ -295,14 +295,14 @@ impl EntryIndex {
         self.lookup_with(key, || {
             self.database
                 .get(&encode_key(key))
-                .map_err(|error| fixed_error("lookup", error))
+                .map_err(|error| index_db_error("lookup", error))
         })
     }
 
     fn lookup_with(
         &self,
         key: KeyDigest,
-        mut durable_lookup: impl FnMut() -> Result<Option<[u8; fixed_lsm::VALUE_SIZE]>>,
+        mut durable_lookup: impl FnMut() -> Result<Option<[u8; index_db::VALUE_SIZE]>>,
     ) -> Result<Option<EntryLocation>> {
         loop {
             let base_revision = {
@@ -391,7 +391,7 @@ impl EntryIndex {
         }
         assert!(
             state.frozen.is_none(),
-            "only one fixed-index checkpoint may be in flight"
+            "only one EntryIndex checkpoint may be in flight"
         );
         let frozen = Arc::new(std::mem::take(&mut state.active));
         state.frozen = Some(frozen.clone());
@@ -421,7 +421,7 @@ impl EntryIndex {
             .write_with_user_state(&batch, WriteOptions::sync(), checkpoint.indexed_count)
         {
             self.restore_checkpoint(checkpoint);
-            return Err(fixed_error("persist checkpoint", error));
+            return Err(index_db_error("persist checkpoint", error));
         }
         #[cfg(test)]
         crate::store::crash_if_requested("entry_index_after_wal_sync");
@@ -430,10 +430,10 @@ impl EntryIndex {
         let current = state
             .frozen
             .take()
-            .expect("persisted fixed checkpoint must have a frozen overlay");
+            .expect("persisted EntryIndex checkpoint must have a frozen overlay");
         assert!(
             Arc::ptr_eq(&current, &checkpoint.frozen),
-            "persisted fixed checkpoint must install its own frozen overlay"
+            "persisted EntryIndex checkpoint must install its own frozen overlay"
         );
         // An in-flight lookup may have missed this mutation in the old durable base and then find
         // no overlay after it is retired. Advancing the base revision makes that lookup retry.
@@ -453,10 +453,10 @@ impl EntryIndex {
         let current = state
             .frozen
             .take()
-            .expect("aborted fixed checkpoint must have a frozen overlay");
+            .expect("aborted EntryIndex checkpoint must have a frozen overlay");
         assert!(
             Arc::ptr_eq(&current, &checkpoint.frozen),
-            "aborted fixed checkpoint must restore its own frozen overlay"
+            "aborted EntryIndex checkpoint must restore its own frozen overlay"
         );
         for (key, mutation) in checkpoint.frozen.iter() {
             state.active.entry(*key).or_insert(*mutation);
@@ -469,13 +469,13 @@ struct StaleLocationFilter {
     pool: Arc<ExtentPool>,
 }
 
-impl fixed_lsm::CompactionFilter for StaleLocationFilter {
-    fn should_discard(&self, _key: &fixed_lsm::Key, value: &fixed_lsm::Value) -> bool {
+impl index_db::CompactionFilter for StaleLocationFilter {
+    fn should_discard(&self, _key: &index_db::Key, value: &index_db::Value) -> bool {
         EntryLocation::decode(value).is_some_and(|location| !self.pool.location_is_live(location))
     }
 }
 
-fn decode_location(value: [u8; fixed_lsm::VALUE_SIZE]) -> Result<EntryLocation> {
+fn decode_location(value: [u8; index_db::VALUE_SIZE]) -> Result<EntryLocation> {
     EntryLocation::decode(&value)
         .ok_or_else(|| Error::InvalidSuperblock("EntryIndex contains an invalid EntryLocation".to_string()))
 }
@@ -499,24 +499,24 @@ fn encode_key(key: KeyDigest) -> [u8; 24] {
     *key.as_bytes()
 }
 
-fn fixed_error(context: &'static str, error: fixed_lsm::Error) -> Error {
+fn index_db_error(context: &'static str, error: index_db::Error) -> Error {
     match error {
-        fixed_lsm::Error::InvalidOptions(reason) => Error::InvalidConfig(format!("fixed LSM {context}: {reason}")),
-        fixed_lsm::Error::MissingDatabase(path) => Error::io(
+        index_db::Error::InvalidOptions(reason) => Error::InvalidConfig(format!("IndexDB {context}: {reason}")),
+        index_db::Error::MissingDatabase(path) => Error::io(
             context,
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("FixedRecordLSM does not exist at {}", path.display()),
+                format!("IndexDB does not exist at {}", path.display()),
             ),
         ),
-        fixed_lsm::Error::Corruption { path, reason } => {
-            Error::InvalidSuperblock(format!("fixed LSM {context}: corrupt {}: {reason}", path.display()))
+        index_db::Error::Corruption { path, reason } => {
+            Error::InvalidSuperblock(format!("IndexDB {context}: corrupt {}: {reason}", path.display()))
         }
-        fixed_lsm::Error::Io {
+        index_db::Error::Io {
             context: io_context,
             source,
         } => Error::io(io_context, source),
-        error => Error::Index(format!("fixed LSM {context}: {error}")),
+        error => Error::Index(format!("IndexDB {context}: {error}")),
     }
 }
 
@@ -661,7 +661,7 @@ mod tests {
                 index
                     .database
                     .get(&encode_key(key(1)))
-                    .map_err(|error| fixed_error("test lookup", error))
+                    .map_err(|error| index_db_error("test lookup", error))
             })
             .unwrap();
 

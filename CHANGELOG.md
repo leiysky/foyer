@@ -16,7 +16,7 @@ date: 2023-05-12T11:02:09+08:00
 - Define ExtentEngine's disk format as format 1 under its own family magic; incompatible cache
   images are rejected and may be recreated from the authoritative source.
 - Add the vendored `foyer-extent` cache-extent-based SSD engine and its specialized
-  `foyer-fixed-lsm` durable index as separate workspace packages.
+  `foyer-index-db` durable index as separate workspace packages.
 - Reserve `Engine` for Foyer's SPI, name the disk core `ExtentStore`, the physical owner
   `ExtentPool`, and the append/seal/reclaim unit a cache extent; format 1 keeps one complete Entry
   per exact index location.

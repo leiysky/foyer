@@ -19,10 +19,10 @@ use crate::{
     },
 };
 
-const DATA_BLOCK_MAGIC: [u8; 8] = *b"FXLSMB07";
-const FENCE_PAGE_MAGIC: [u8; 8] = *b"FXLSMX07";
-const FILTER_PAGE_MAGIC: [u8; 8] = *b"FXLSMF07";
-const TABLE_FOOTER_MAGIC: [u8; 8] = *b"FXLSMT07";
+const DATA_BLOCK_MAGIC: [u8; 8] = *b"IDXDBB07";
+const FENCE_PAGE_MAGIC: [u8; 8] = *b"IDXDBX07";
+const FILTER_PAGE_MAGIC: [u8; 8] = *b"IDXDBF07";
+const TABLE_FOOTER_MAGIC: [u8; 8] = *b"IDXDBT07";
 const FORMAT_VERSION: u32 = 7;
 const BLOCK_CHECKSUM_OFFSET: usize = 60;
 const FOOTER_CHECKSUM_OFFSET: usize = TABLE_FOOTER_SIZE - size_of::<u32>();

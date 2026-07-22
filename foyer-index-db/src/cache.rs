@@ -184,23 +184,23 @@ impl CacheShard {
             let victim = self
                 .clock(kind)
                 .pop_front()
-                .expect("a non-empty fixed-lsm cache must have a clock entry");
+                .expect("a non-empty IndexDB cache must have a clock entry");
             let referenced = self
                 .entries
                 .get(&victim)
-                .expect("fixed-lsm cache clock must reference a resident entry")
+                .expect("IndexDB cache clock must reference a resident entry")
                 .referenced;
             if referenced {
                 self.entries
                     .get_mut(&victim)
-                    .expect("fixed-lsm cache entry must remain resident")
+                    .expect("IndexDB cache entry must remain resident")
                     .referenced = false;
                 self.clock(kind).push_back(victim);
             } else {
                 let removed = self
                     .entries
                     .remove(&victim)
-                    .expect("fixed-lsm cache victim must remain resident");
+                    .expect("IndexDB cache victim must remain resident");
                 self.used -= removed.data.len();
                 if kind == CacheKind::Filter {
                     self.metadata_used -= removed.data.len();

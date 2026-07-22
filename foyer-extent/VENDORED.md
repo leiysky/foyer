@@ -1,6 +1,6 @@
 # Vendored source
 
-`foyer-extent` and `foyer-fixed-lsm` were imported into the leiysky Foyer fork on 2026-07-19 from
+`foyer-extent` and `foyer-index-db` were imported into the leiysky Foyer fork on 2026-07-19 from
 the standalone Extent prototype developed alongside ScopeDB. This in-tree copy is now the source
 of truth for Foyer integration; changes should be made and tested here rather than synchronized by
 copying files from the prototype workspace.

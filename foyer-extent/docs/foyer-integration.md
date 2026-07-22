@@ -57,6 +57,10 @@ completion of an older same-key write cannot erase a newer pending value.
 The first write-worker or checkpoint failure is sticky. Later submissions are shed, existing reads
 remain available, and wait/close report the retained causal error.
 
+Published bytes request a checkpoint after 256 MiB by default. A 30-second periodic request bounds
+the recovery tail for sparse traffic without forcing metadata work every second; a request is a
+no-op when no newer epoch needs publication.
+
 ## Read path
 
 Foyer checks and coalesces its memory tier before invoking the disk engine. ExtentEngine then:
@@ -73,7 +77,8 @@ Each stage has the configured hard, non-waiting concurrency bound. Saturation re
 `Load::Throttled`, allowing the upper cache or caller to fall back instead of creating an unbounded
 reader queue. A durable miss storm can consume index permits but cannot consume the permits reserved
 for known payload hits. SST-backed hits and misses remain indistinguishable until the index lookup
-completes.
+completes. The default is twice the detected CPU parallelism capped at 64 independently for each
+stage, preventing very large hosts from creating an accidental I/O fan-out.
 
 Index state can resolve a location, a definitive miss, or an unknown SST-backed result. Only the
 unknown case performs durable-index lookup. Full database, block-cache, and WAL statistics are not
@@ -96,7 +101,7 @@ Admission does not own buffers or emulate an asynchronous I/O queue. With the de
 concurrency of one, the caller reuses one aligned buffer and executes `pwrite` inline. Configurations
 above one use a persistent bounded worker pool rather than creating and joining OS threads for each
 batch. Reads and `fdatasync` remain on the admitted caller. Allocator-state
-and FixedRecordLSM operations remain outside the payload scheduler because their operation classes
+and IndexDB operations remain outside the payload scheduler because their operation classes
 and durability requirements differ.
 
 ## Lifecycle
@@ -113,7 +118,7 @@ Graceful close follows this order:
 5. close the underlying Foyer engine exactly once.
 
 This bounds shutdown without exposing a partially published Entry. `wait` and close also wait for
-already scheduled FixedRecordLSM maintenance so a late flush or compaction failure cannot be hidden
+already scheduled IndexDB maintenance so a late flush or compaction failure cannot be hidden
 by an earlier WAL acknowledgement.
 
 Online `HybridCache::clear()` is unsupported. Correct reset requires a new cache incarnation rather
@@ -131,6 +136,12 @@ unit.
 BlockEngine behavior is not changed by Extent. The same HybridCache configuration is used for
 cross-engine validation, with the selected `EngineConfig` as the principal variable. Benchmark-only
 reference engines and environment parsing remain outside production modules.
+
+The production `ExtentEngineConfig` surface is limited to cache path/capacity and operational
+policy: direct I/O, index-cache and read-admission budgets, priority floors, throttle, and the
+read-only handle. Layout, queue, batching, write-run, and checkpoint overrides live together in an
+explicitly non-production test tuning object so benchmark control does not become a stable operator
+contract.
 
 ## Observability
 
@@ -157,7 +168,7 @@ accounting lock.
 - A dedicated payload-I/O executor added a worker hop and buffer ownership without a demonstrated
   latency benefit.
 - One global read semaphore lets negative index work starve known payload hits. The two-stage gates
-  isolate payload capacity; deeper scheduling of FixedRecordLSM data/filter I/O still requires a
+  isolate payload capacity; deeper scheduling of IndexDB data/filter I/O still requires a
   lower operation hook.
 - Static-dispatch-only integration would prevent BlockEngine and ExtentEngine from sharing the same
   runtime builder and rollback boundary.

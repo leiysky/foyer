@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use fixed_lsm::{FixedLsm, FixedLsmOptions, FixedLsmStats, WriteBatch, WriteOptions};
+use index_db::{IndexDb, IndexDbOptions, IndexDbStats, WriteBatch, WriteOptions};
 
 const DEFAULT_CACHE_MIB: usize = 512;
 const DEFAULT_WRITE_BUFFER_MIB: usize = 64;
@@ -26,16 +26,16 @@ struct BenchmarkConfig {
 impl BenchmarkConfig {
     fn from_env() -> Self {
         Self {
-            cache_mib: env_usize("FIXED_LSM_BENCH_CACHE_MIB", DEFAULT_CACHE_MIB),
-            write_buffer_mib: env_usize("FIXED_LSM_BENCH_WRITE_BUFFER_MIB", DEFAULT_WRITE_BUFFER_MIB),
+            cache_mib: env_usize("INDEX_DB_BENCH_CACHE_MIB", DEFAULT_CACHE_MIB),
+            write_buffer_mib: env_usize("INDEX_DB_BENCH_WRITE_BUFFER_MIB", DEFAULT_WRITE_BUFFER_MIB),
         }
     }
 
-    fn options(self) -> FixedLsmOptions {
-        FixedLsmOptions {
+    fn options(self) -> IndexDbOptions {
+        IndexDbOptions {
             cache_capacity: self.cache_mib * 1024 * 1024,
             write_buffer_capacity: self.write_buffer_mib * 1024 * 1024,
-            ..FixedLsmOptions::default()
+            ..IndexDbOptions::default()
         }
     }
 }
@@ -65,7 +65,7 @@ fn validate_value(value: &[u8; 32], index: u64, generation: u32) {
     assert_eq!(value, &scale_value(index, generation));
 }
 
-fn lookup(db: &FixedLsm, index: u64) -> [u8; 32] {
+fn lookup(db: &IndexDb, index: u64) -> [u8; 32] {
     db.get(&scale_key(index)).unwrap().expect("benchmark key is missing")
 }
 
@@ -93,15 +93,15 @@ fn mixed_key_id(operation: u64, salt: u64, blobs: u64, hot_access_percent: usize
 
 fn generate(path: &Path, blobs: u64, config: BenchmarkConfig) {
     if path.exists() {
-        assert!(env_bool("FIXED_LSM_BENCH_REGENERATE", false));
+        assert!(env_bool("INDEX_DB_BENCH_REGENERATE", false));
         std::fs::remove_dir_all(path).unwrap();
     }
-    let batch_entries = env_usize("FIXED_LSM_BENCH_BATCH_ENTRIES", DEFAULT_BATCH_ENTRIES);
+    let batch_entries = env_usize("INDEX_DB_BENCH_BATCH_ENTRIES", DEFAULT_BATCH_ENTRIES);
     assert!(batch_entries > 0);
     let read_before = process_field("/proc/self/io", "read_bytes:");
     let write_before = process_field("/proc/self/io", "write_bytes:");
     let started = Instant::now();
-    let db = FixedLsm::create(path, config.options()).unwrap();
+    let db = IndexDb::create(path, config.options()).unwrap();
     let mut first = 0_u64;
     let mut next_progress = 5_000_000_u64.min(blobs);
     while first < blobs {
@@ -114,7 +114,7 @@ fn generate(path: &Path, blobs: u64, config: BenchmarkConfig) {
         first = end;
         if first >= next_progress {
             println!(
-                "{{\"phase\":\"fixed_lsm_generate_progress\",\"blobs\":{first},\"total_blobs\":{blobs},\"elapsed_seconds\":{:.3}}}",
+                "{{\"phase\":\"index_db_generate_progress\",\"blobs\":{first},\"total_blobs\":{blobs},\"elapsed_seconds\":{:.3}}}",
                 started.elapsed().as_secs_f64(),
             );
             std::io::stdout().flush().unwrap();
@@ -130,7 +130,7 @@ fn generate(path: &Path, blobs: u64, config: BenchmarkConfig) {
     }
     let stats = db.stats();
     println!(
-        "{{\"phase\":\"fixed_lsm_generate_result\",\"blobs\":{blobs},\"batch_entries\":{batch_entries},\"publication_ms\":{:.3},\"publication_mops\":{:.3},\"drain_ms\":{:.3},\"total_ms\":{:.3},\"disk_bytes\":{},\"level_files\":{},\"level_bytes\":{},\"level_tombstones\":{},\"base_level\":{},\"level_targets\":{},\"maintenance\":{},\"cache_usage_bytes\":{},\"table_read_bytes\":{},\"table_write_bytes\":{},\"read_bytes\":{},\"write_bytes\":{}}}",
+        "{{\"phase\":\"index_db_generate_result\",\"blobs\":{blobs},\"batch_entries\":{batch_entries},\"publication_ms\":{:.3},\"publication_mops\":{:.3},\"drain_ms\":{:.3},\"total_ms\":{:.3},\"disk_bytes\":{},\"level_files\":{},\"level_bytes\":{},\"level_tombstones\":{},\"base_level\":{},\"level_targets\":{},\"maintenance\":{},\"cache_usage_bytes\":{},\"table_read_bytes\":{},\"table_write_bytes\":{},\"read_bytes\":{},\"write_bytes\":{}}}",
         publication.as_secs_f64() * 1_000.0,
         blobs as f64 / publication.as_secs_f64() / 1_000_000.0,
         drain.as_secs_f64() * 1_000.0,
@@ -141,7 +141,7 @@ fn generate(path: &Path, blobs: u64, config: BenchmarkConfig) {
         array_json(&stats.level_tombstones),
         stats.base_level,
         array_json(&stats.level_targets),
-        maintenance_delta_json(&FixedLsmStats::default(), &stats),
+        maintenance_delta_json(&IndexDbStats::default(), &stats),
         stats.cache_resident_bytes,
         stats.table_read_bytes,
         stats.table_write_bytes,
@@ -151,18 +151,18 @@ fn generate(path: &Path, blobs: u64, config: BenchmarkConfig) {
 }
 
 fn recover(path: &Path, blobs: u64, config: BenchmarkConfig) {
-    let cold = env_bool("FIXED_LSM_BENCH_COLD", true);
-    let validate_base_keys = env_bool("FIXED_LSM_BENCH_VALIDATE_BASE_KEYS", true);
-    let lookups = env_usize("FIXED_LSM_BENCH_LOOKUPS", 0);
+    let cold = env_bool("INDEX_DB_BENCH_COLD", true);
+    let validate_base_keys = env_bool("INDEX_DB_BENCH_VALIDATE_BASE_KEYS", true);
+    let lookups = env_usize("INDEX_DB_BENCH_LOOKUPS", 0);
     let minimum_concurrency = minimum_concurrency();
-    let concurrency = env_usize("FIXED_LSM_BENCH_CONCURRENCY", minimum_concurrency);
-    let hot_keys = env_usize("FIXED_LSM_BENCH_HOT_KEYS", 258_048).min(blobs as usize);
+    let concurrency = env_usize("INDEX_DB_BENCH_CONCURRENCY", minimum_concurrency);
+    let hot_keys = env_usize("INDEX_DB_BENCH_HOT_KEYS", 258_048).min(blobs as usize);
     assert!(lookups == 0 || concurrency >= minimum_concurrency);
     assert!(!cold || evict_directory(path));
     let read_before = process_field("/proc/self/io", "read_bytes:");
     let rss_before = process_field("/proc/self/status", "VmRSS:");
     let started = Instant::now();
-    let db = FixedLsm::open(path, config.options()).unwrap();
+    let db = IndexDb::open(path, config.options()).unwrap();
     let recovery = started.elapsed();
     let recovery_read_bytes = io_difference(read_before, "/proc/self/io", "read_bytes:");
     if validate_base_keys {
@@ -172,7 +172,7 @@ fn recover(path: &Path, blobs: u64, config: BenchmarkConfig) {
     }
     let stats = db.stats();
     println!(
-        "{{\"phase\":\"fixed_lsm_recovery_result\",\"blobs\":{blobs},\"cold\":{cold},\"validate_base_keys\":{validate_base_keys},\"recovery_ms\":{:.3},\"read_bytes\":{},\"rss_before_kib\":{},\"rss_after_kib\":{},\"peak_rss_kib\":{},\"recovered_records\":{},\"discarded_wal_tail_bytes\":{},\"level_files\":{},\"level_bytes\":{},\"level_tombstones\":{},\"base_level\":{},\"level_targets\":{},\"cache_usage_bytes\":{},\"table_read_bytes\":{},\"disk_bytes\":{}}}",
+        "{{\"phase\":\"index_db_recovery_result\",\"blobs\":{blobs},\"cold\":{cold},\"validate_base_keys\":{validate_base_keys},\"recovery_ms\":{:.3},\"read_bytes\":{},\"rss_before_kib\":{},\"rss_after_kib\":{},\"peak_rss_kib\":{},\"recovered_records\":{},\"discarded_wal_tail_bytes\":{},\"level_files\":{},\"level_bytes\":{},\"level_tombstones\":{},\"base_level\":{},\"level_targets\":{},\"cache_usage_bytes\":{},\"table_read_bytes\":{},\"disk_bytes\":{}}}",
         recovery.as_secs_f64() * 1_000.0,
         optional_number(recovery_read_bytes),
         optional_number(rss_before),
@@ -235,7 +235,7 @@ fn recover(path: &Path, blobs: u64, config: BenchmarkConfig) {
         samples.sort_unstable();
         let cache_after = db.stats();
         println!(
-            "{{\"phase\":\"fixed_lsm_concurrent_lookup_result\",\"lookups\":{lookups},\"concurrency\":{concurrency},\"hot_keys\":{hot_keys},\"elapsed_ms\":{:.3},\"throughput_mops\":{:.3},\"latency\":{},\"read_bytes\":{},\"cache_hits\":{},\"cache_misses\":{},\"cache_usage_bytes\":{},\"cache_data_bytes\":{},\"cache_metadata_bytes\":{}}}",
+            "{{\"phase\":\"index_db_concurrent_lookup_result\",\"lookups\":{lookups},\"concurrency\":{concurrency},\"hot_keys\":{hot_keys},\"elapsed_ms\":{:.3},\"throughput_mops\":{:.3},\"latency\":{},\"read_bytes\":{},\"cache_hits\":{},\"cache_misses\":{},\"cache_usage_bytes\":{},\"cache_data_bytes\":{},\"cache_metadata_bytes\":{}}}",
             elapsed.as_secs_f64() * 1_000.0,
             lookups as f64 / elapsed.as_secs_f64() / 1_000_000.0,
             latency_json(samples),
@@ -258,21 +258,21 @@ struct MixedResult {
 }
 
 fn mixed(path: &Path, blobs: u64, config: BenchmarkConfig) {
-    let operations = env_usize("FIXED_LSM_BENCH_MIXED_OPERATIONS", 8_000_000);
-    let write_percent = env_usize("FIXED_LSM_BENCH_MIXED_WRITE_PERCENT", 50);
-    let hot_access_percent = env_usize("FIXED_LSM_BENCH_HOT_ACCESS_PERCENT", 0);
-    let hotset_percent = env_usize("FIXED_LSM_BENCH_HOTSET_PERCENT", 1);
+    let operations = env_usize("INDEX_DB_BENCH_MIXED_OPERATIONS", 8_000_000);
+    let write_percent = env_usize("INDEX_DB_BENCH_MIXED_WRITE_PERCENT", 50);
+    let hot_access_percent = env_usize("INDEX_DB_BENCH_HOT_ACCESS_PERCENT", 0);
+    let hotset_percent = env_usize("INDEX_DB_BENCH_HOTSET_PERCENT", 1);
     let minimum_concurrency = minimum_concurrency();
-    let concurrency = env_usize("FIXED_LSM_BENCH_CONCURRENCY", minimum_concurrency);
-    let cold = env_bool("FIXED_LSM_BENCH_COLD", true);
-    let sync_after = env_bool("FIXED_LSM_BENCH_SYNC_AFTER", true);
-    let drain_after = env_bool("FIXED_LSM_BENCH_DRAIN_AFTER", true);
+    let concurrency = env_usize("INDEX_DB_BENCH_CONCURRENCY", minimum_concurrency);
+    let cold = env_bool("INDEX_DB_BENCH_COLD", true);
+    let sync_after = env_bool("INDEX_DB_BENCH_SYNC_AFTER", true);
+    let drain_after = env_bool("INDEX_DB_BENCH_DRAIN_AFTER", true);
     assert!(concurrency >= minimum_concurrency);
     assert!(write_percent > 0 && write_percent < 100);
     assert!(hot_access_percent <= 100 && (1..=100).contains(&hotset_percent));
     assert!(!cold || evict_directory(path));
     let rss_before = process_field("/proc/self/status", "VmRSS:");
-    let db = FixedLsm::open(path, config.options()).unwrap();
+    let db = IndexDb::open(path, config.options()).unwrap();
     let rss_after_open = process_field("/proc/self/status", "VmRSS:");
     let before = db.stats();
     let total_read_before = process_field("/proc/self/io", "read_bytes:");
@@ -298,7 +298,7 @@ fn mixed(path: &Path, blobs: u64, config: BenchmarkConfig) {
     let drain = drain_started.elapsed();
     let after = db.stats();
     println!(
-        "{{\"phase\":\"fixed_lsm_mixed_result\",\"blobs\":{blobs},\"operations\":{operations},\"concurrency\":{concurrency},\"writer_threads\":1,\"reader_threads\":{},\"write_percent\":{write_percent},\"hot_access_percent\":{hot_access_percent},\"hotset_percent\":{hotset_percent},\"elapsed_ms\":{:.3},\"throughput_mops\":{:.3},\"read_latency\":{},\"write_latency\":{},\"sync_after\":{sync_after},\"sync_ms\":{:.3},\"drain_after\":{drain_after},\"drain_ms\":{:.3},\"rss_before_kib\":{},\"rss_after_open_kib\":{},\"rss_after_kib\":{},\"peak_rss_kib\":{},\"workload_read_bytes\":{},\"workload_write_bytes\":{},\"total_read_bytes\":{},\"total_write_bytes\":{},\"cache_hits\":{},\"cache_misses\":{},\"internal_read_bytes\":{},\"point_reads\":{},\"internal_write_bytes\":{},\"maintenance\":{},\"wal_bytes\":{},\"disk_bytes\":{},\"level_files\":{},\"level_bytes\":{},\"level_tombstones\":{},\"base_level\":{},\"level_targets\":{},\"cache_usage_bytes\":{},\"cache_data_bytes\":{},\"cache_metadata_bytes\":{}}}",
+        "{{\"phase\":\"index_db_mixed_result\",\"blobs\":{blobs},\"operations\":{operations},\"concurrency\":{concurrency},\"writer_threads\":1,\"reader_threads\":{},\"write_percent\":{write_percent},\"hot_access_percent\":{hot_access_percent},\"hotset_percent\":{hotset_percent},\"elapsed_ms\":{:.3},\"throughput_mops\":{:.3},\"read_latency\":{},\"write_latency\":{},\"sync_after\":{sync_after},\"sync_ms\":{:.3},\"drain_after\":{drain_after},\"drain_ms\":{:.3},\"rss_before_kib\":{},\"rss_after_open_kib\":{},\"rss_after_kib\":{},\"peak_rss_kib\":{},\"workload_read_bytes\":{},\"workload_write_bytes\":{},\"total_read_bytes\":{},\"total_write_bytes\":{},\"cache_hits\":{},\"cache_misses\":{},\"internal_read_bytes\":{},\"point_reads\":{},\"internal_write_bytes\":{},\"maintenance\":{},\"wal_bytes\":{},\"disk_bytes\":{},\"level_files\":{},\"level_bytes\":{},\"level_tombstones\":{},\"base_level\":{},\"level_targets\":{},\"cache_usage_bytes\":{},\"cache_data_bytes\":{},\"cache_metadata_bytes\":{}}}",
         concurrency - 1,
         result.elapsed.as_secs_f64() * 1_000.0,
         operations as f64 / result.elapsed.as_secs_f64() / 1_000_000.0,
@@ -334,7 +334,7 @@ fn mixed(path: &Path, blobs: u64, config: BenchmarkConfig) {
 }
 
 fn concurrent_mixed_access(
-    db: &FixedLsm,
+    db: &IndexDb,
     blobs: u64,
     concurrency: usize,
     operations: usize,
@@ -413,12 +413,12 @@ fn concurrent_mixed_access(
 }
 
 fn churn(path: &Path, blobs: u64, config: BenchmarkConfig) {
-    let updates = env_u64("FIXED_LSM_BENCH_UPDATES");
-    let generation = env_optional_u64("FIXED_LSM_BENCH_GENERATION", 2) as u32;
-    let batch_entries = env_usize("FIXED_LSM_BENCH_BATCH_ENTRIES", DEFAULT_BATCH_ENTRIES);
-    let drain = env_bool("FIXED_LSM_BENCH_DRAIN", true);
-    let force_compact = env_bool("FIXED_LSM_BENCH_FORCE_COMPACT", false);
-    let replace = env_bool("FIXED_LSM_BENCH_REPLACE", false);
+    let updates = env_u64("INDEX_DB_BENCH_UPDATES");
+    let generation = env_optional_u64("INDEX_DB_BENCH_GENERATION", 2) as u32;
+    let batch_entries = env_usize("INDEX_DB_BENCH_BATCH_ENTRIES", DEFAULT_BATCH_ENTRIES);
+    let drain = env_bool("INDEX_DB_BENCH_DRAIN", true);
+    let force_compact = env_bool("INDEX_DB_BENCH_FORCE_COMPACT", false);
+    let replace = env_bool("INDEX_DB_BENCH_REPLACE", false);
     assert!(updates > 0 && updates <= blobs && batch_entries > 0);
     let cohort_start = if replace {
         u64::from(generation.checked_sub(2).expect("replacement generation starts at 2"))
@@ -429,7 +429,7 @@ fn churn(path: &Path, blobs: u64, config: BenchmarkConfig) {
     };
     assert!(!replace || cohort_start <= blobs - updates);
     let mutations = updates * if replace { 2 } else { 1 };
-    let db = FixedLsm::open(path, config.options()).unwrap();
+    let db = IndexDb::open(path, config.options()).unwrap();
     let stats_before = db.stats();
     let rss_before = process_field("/proc/self/status", "VmRSS:");
     let disk_before = directory_bytes(path);
@@ -481,7 +481,7 @@ fn churn(path: &Path, blobs: u64, config: BenchmarkConfig) {
     let stats_after = db.stats();
     let write_bytes = io_difference(write_before, "/proc/self/io", "write_bytes:");
     println!(
-        "{{\"phase\":\"fixed_lsm_churn_result\",\"blobs\":{blobs},\"updates\":{updates},\"mutations\":{mutations},\"generation\":{generation},\"replace\":{replace},\"batch_entries\":{batch_entries},\"drain\":{drain},\"force_compact\":{force_compact},\"publication_ms\":{:.3},\"publication_mops\":{:.3},\"publication_mutation_mops\":{:.3},\"commit_latency\":{},\"persist_ms\":{:.3},\"drain_ms\":{:.3},\"rss_before_kib\":{},\"rss_after_kib\":{},\"peak_rss_kib\":{},\"disk_bytes_before\":{disk_before},\"disk_bytes_after\":{},\"read_bytes\":{},\"write_bytes\":{},\"bytes_per_update\":{},\"bytes_per_mutation\":{},\"internal_read_bytes\":{},\"internal_write_bytes\":{},\"maintenance\":{},\"level_files\":{},\"level_bytes\":{},\"level_tombstones\":{},\"base_level\":{},\"level_targets\":{},\"cache_usage_bytes\":{}}}",
+        "{{\"phase\":\"index_db_churn_result\",\"blobs\":{blobs},\"updates\":{updates},\"mutations\":{mutations},\"generation\":{generation},\"replace\":{replace},\"batch_entries\":{batch_entries},\"drain\":{drain},\"force_compact\":{force_compact},\"publication_ms\":{:.3},\"publication_mops\":{:.3},\"publication_mutation_mops\":{:.3},\"commit_latency\":{},\"persist_ms\":{:.3},\"drain_ms\":{:.3},\"rss_before_kib\":{},\"rss_after_kib\":{},\"peak_rss_kib\":{},\"disk_bytes_before\":{disk_before},\"disk_bytes_after\":{},\"read_bytes\":{},\"write_bytes\":{},\"bytes_per_update\":{},\"bytes_per_mutation\":{},\"internal_read_bytes\":{},\"internal_write_bytes\":{},\"maintenance\":{},\"level_files\":{},\"level_bytes\":{},\"level_tombstones\":{},\"base_level\":{},\"level_targets\":{},\"cache_usage_bytes\":{}}}",
         publication.as_secs_f64() * 1_000.0,
         updates as f64 / publication.as_secs_f64() / 1_000_000.0,
         mutations as f64 / publication.as_secs_f64() / 1_000_000.0,
@@ -519,12 +519,12 @@ fn churn(path: &Path, blobs: u64, config: BenchmarkConfig) {
 }
 
 fn dirty_tail(path: &Path, blobs: u64, config: BenchmarkConfig) -> ! {
-    let updates = env_u64("FIXED_LSM_BENCH_UPDATES");
-    let generation = env_optional_u64("FIXED_LSM_BENCH_GENERATION", 2) as u32;
-    let batch_entries = env_usize("FIXED_LSM_BENCH_BATCH_ENTRIES", DEFAULT_BATCH_ENTRIES);
+    let updates = env_u64("INDEX_DB_BENCH_UPDATES");
+    let generation = env_optional_u64("INDEX_DB_BENCH_GENERATION", 2) as u32;
+    let batch_entries = env_usize("INDEX_DB_BENCH_BATCH_ENTRIES", DEFAULT_BATCH_ENTRIES);
     assert!(updates > 0 && updates <= blobs && batch_entries > 0);
 
-    let db = FixedLsm::open(path, config.options()).unwrap();
+    let db = IndexDb::open(path, config.options()).unwrap();
     let started = Instant::now();
     let mut first = 0_u64;
     while first < updates {
@@ -547,7 +547,7 @@ fn dirty_tail(path: &Path, blobs: u64, config: BenchmarkConfig) -> ! {
     }
     let stats = db.stats();
     println!(
-        "{{\"phase\":\"fixed_lsm_dirty_tail_result\",\"blobs\":{blobs},\"updates\":{updates},\"generation\":{generation},\"batch_entries\":{batch_entries},\"publication_ms\":{:.3},\"publication_mops\":{:.3},\"persist_ms\":{:.3},\"mutable_entries\":{},\"immutable_memtables\":{},\"background_running\":{},\"wal_bytes\":{},\"rss_kib\":{},\"peak_rss_kib\":{}}}",
+        "{{\"phase\":\"index_db_dirty_tail_result\",\"blobs\":{blobs},\"updates\":{updates},\"generation\":{generation},\"batch_entries\":{batch_entries},\"publication_ms\":{:.3},\"publication_mops\":{:.3},\"persist_ms\":{:.3},\"mutable_entries\":{},\"immutable_memtables\":{},\"background_running\":{},\"wal_bytes\":{},\"rss_kib\":{},\"peak_rss_kib\":{}}}",
         publication.as_secs_f64() * 1_000.0,
         updates as f64 / publication.as_secs_f64() / 1_000_000.0,
         persist.as_secs_f64() * 1_000.0,
@@ -561,15 +561,15 @@ fn dirty_tail(path: &Path, blobs: u64, config: BenchmarkConfig) -> ! {
     std::io::stdout().flush().unwrap();
 
     // Model a process crash immediately after the durability acknowledgement. In particular, do
-    // not run `FixedLsm::drop`, because it waits for an in-flight background flush.
+    // not run `IndexDb::drop`, because it waits for an in-flight background flush.
     std::process::exit(0)
 }
 
 fn checkpoint(path: &Path, config: BenchmarkConfig) {
-    let force_compact = env_bool("FIXED_LSM_BENCH_FORCE_COMPACT", false);
+    let force_compact = env_bool("INDEX_DB_BENCH_FORCE_COMPACT", false);
     let read_before = process_field("/proc/self/io", "read_bytes:");
     let write_before = process_field("/proc/self/io", "write_bytes:");
-    let db = FixedLsm::open(path, config.options()).unwrap();
+    let db = IndexDb::open(path, config.options()).unwrap();
     let started = Instant::now();
     db.flush().unwrap();
     if force_compact {
@@ -578,7 +578,7 @@ fn checkpoint(path: &Path, config: BenchmarkConfig) {
     let elapsed = started.elapsed();
     let stats = db.stats();
     println!(
-        "{{\"phase\":\"fixed_lsm_checkpoint_result\",\"force_compact\":{force_compact},\"elapsed_ms\":{:.3},\"read_bytes\":{},\"write_bytes\":{},\"disk_bytes\":{},\"level_files\":{},\"level_bytes\":{},\"level_tombstones\":{},\"base_level\":{},\"level_targets\":{},\"maintenance\":{}}}",
+        "{{\"phase\":\"index_db_checkpoint_result\",\"force_compact\":{force_compact},\"elapsed_ms\":{:.3},\"read_bytes\":{},\"write_bytes\":{},\"disk_bytes\":{},\"level_files\":{},\"level_bytes\":{},\"level_tombstones\":{},\"base_level\":{},\"level_targets\":{},\"maintenance\":{}}}",
         elapsed.as_secs_f64() * 1_000.0,
         optional_number(io_difference(read_before, "/proc/self/io", "read_bytes:")),
         optional_number(io_difference(write_before, "/proc/self/io", "write_bytes:")),
@@ -588,7 +588,7 @@ fn checkpoint(path: &Path, config: BenchmarkConfig) {
         array_json(&stats.level_tombstones),
         stats.base_level,
         array_json(&stats.level_targets),
-        maintenance_delta_json(&FixedLsmStats::default(), &stats),
+        maintenance_delta_json(&IndexDbStats::default(), &stats),
     );
 }
 
@@ -650,7 +650,7 @@ fn array_json<const N: usize>(values: &[u64; N]) -> String {
     format!("[{}]", values.iter().map(u64::to_string).collect::<Vec<_>>().join(","))
 }
 
-fn maintenance_delta_json(before: &FixedLsmStats, after: &FixedLsmStats) -> String {
+fn maintenance_delta_json(before: &IndexDbStats, after: &IndexDbStats) -> String {
     format!(
         "{{\"flush_operations\":{},\"flush_output_bytes\":{},\"compaction_operations\":{},\"compaction_input_bytes\":{},\"compaction_output_bytes\":{},\"trivial_move_operations\":{}}}",
         after.flush_operations.saturating_sub(before.flush_operations),
@@ -668,7 +668,7 @@ fn maintenance_delta_json(before: &FixedLsmStats, after: &FixedLsmStats) -> Stri
     )
 }
 
-fn point_read_delta_json(before: &FixedLsmStats, after: &FixedLsmStats) -> String {
+fn point_read_delta_json(before: &IndexDbStats, after: &IndexDbStats) -> String {
     format!(
         "{{\"filter_checks\":{},\"filter_positives\":{},\"data_cache_hits\":{},\"data_reads\":{},\"false_positives\":{}}}",
         after.point_filter_checks.saturating_sub(before.point_filter_checks),
@@ -738,16 +738,16 @@ fn evict_directory(_path: &Path) -> bool {
 }
 
 fn main() {
-    let path = PathBuf::from(env::var("FIXED_LSM_BENCH_PATH").expect("FIXED_LSM_BENCH_PATH must be set"));
+    let path = PathBuf::from(env::var("INDEX_DB_BENCH_PATH").expect("INDEX_DB_BENCH_PATH must be set"));
     assert!(path.is_absolute());
-    let blobs = env_u64("FIXED_LSM_BENCH_BLOBS");
+    let blobs = env_u64("INDEX_DB_BENCH_BLOBS");
     assert!(blobs > 0);
     let config = BenchmarkConfig::from_env();
     println!(
-        "{{\"phase\":\"fixed_lsm_config\",\"cache_mib\":{},\"write_buffer_mib\":{},\"block_kib\":8,\"bloom_bits_per_key\":14,\"buffered_io\":true,\"compression\":\"none\",\"compaction\":\"partitioned_leveled\",\"format_version\":7}}",
+        "{{\"phase\":\"index_db_config\",\"cache_mib\":{},\"write_buffer_mib\":{},\"block_kib\":8,\"bloom_bits_per_key\":14,\"buffered_io\":true,\"compression\":\"none\",\"compaction\":\"partitioned_leveled\",\"format_version\":7}}",
         config.cache_mib, config.write_buffer_mib,
     );
-    match env::var("FIXED_LSM_BENCH_MODE")
+    match env::var("INDEX_DB_BENCH_MODE")
         .unwrap_or_else(|_| "recover".to_string())
         .as_str()
     {
@@ -757,6 +757,6 @@ fn main() {
         "churn" => churn(&path, blobs, config),
         "dirty_tail" => dirty_tail(&path, blobs, config),
         "checkpoint" => checkpoint(&path, config),
-        _ => panic!("FIXED_LSM_BENCH_MODE must be generate, recover, mixed, churn, dirty_tail, or checkpoint"),
+        _ => panic!("INDEX_DB_BENCH_MODE must be generate, recover, mixed, churn, dirty_tail, or checkpoint"),
     }
 }

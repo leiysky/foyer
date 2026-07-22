@@ -600,5 +600,5 @@ jobs:
           RUSTFLAGS: "--cfg tokio_unstable --cfg madsim"
           RUST_LOG: info
         run: |-
-          # Extent and FixedLsm deliberately own blocking system threads and are not madsim-aware.
-          cargo nextest run --workspace --exclude foyer-bench --exclude examples --exclude foyer-extent --exclude foyer-fixed-lsm --no-default-features --features "runtime-madsim-tokio"
+          # Extent and IndexDB deliberately own blocking system threads and are not madsim-aware.
+          cargo nextest run --workspace --exclude foyer-bench --exclude examples --exclude foyer-extent --exclude foyer-index-db --no-default-features --features "runtime-madsim-tokio"

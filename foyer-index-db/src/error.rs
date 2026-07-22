@@ -36,25 +36,25 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidOptions(reason) => write!(f, "invalid FixedRecordLSM options: {reason}"),
+            Self::InvalidOptions(reason) => write!(f, "invalid IndexDB options: {reason}"),
             Self::AlreadyExists(path) => {
-                write!(f, "FixedRecordLSM already exists at {}", path.display())
+                write!(f, "IndexDB already exists at {}", path.display())
             }
             Self::MissingDatabase(path) => {
-                write!(f, "FixedRecordLSM does not exist at {}", path.display())
+                write!(f, "IndexDB does not exist at {}", path.display())
             }
             Self::DatabaseLocked(path) => {
-                write!(f, "FixedRecordLSM is already open at {}", path.display())
+                write!(f, "IndexDB is already open at {}", path.display())
             }
             Self::Corruption { path, reason } => {
-                write!(f, "corrupt FixedRecordLSM file {}: {reason}", path.display())
+                write!(f, "corrupt IndexDB file {}: {reason}", path.display())
             }
             Self::Background(reason) => {
-                write!(f, "FixedRecordLSM background pipeline failed: {reason}")
+                write!(f, "IndexDB background pipeline failed: {reason}")
             }
-            Self::SequenceExhausted => f.write_str("FixedRecordLSM sequence space is exhausted"),
+            Self::SequenceExhausted => f.write_str("IndexDB sequence space is exhausted"),
             Self::Io { context, source } => {
-                write!(f, "FixedRecordLSM I/O error ({context}): {source}")
+                write!(f, "IndexDB I/O error ({context}): {source}")
             }
         }
     }

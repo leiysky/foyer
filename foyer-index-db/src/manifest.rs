@@ -14,7 +14,19 @@ use crate::{
     },
 };
 
-const MANIFEST_MAGIC: [u8; 8] = *b"FXLSMM01";
+// Unlike LevelDB/RocksDB, these manifests are complete Version snapshots, not append-only
+// VersionEdit logs. Two fixed, checksummed slots act as A/B superblocks: publication replaces
+// `MANIFEST-{generation % 2}`, and recovery validates both slots and selects the newest usable
+// generation. A `CURRENT` pointer would therefore be redundant and would add another durable
+// namespace update; it is useful in LevelDB/RocksDB because their numbered manifest logs rotate.
+//
+// Rewriting the complete live-table set is intentional while the expected set remains small enough
+// for snapshot writes to be negligible: it keeps recovery independent of manifest history and
+// avoids a log parser and rotation protocol. The older slot protects the publication crash window;
+// it is not a permanent backup once obsolete SSTs have been deleted. If live SST counts grow enough
+// for snapshot writes to matter, replace this scheme as a whole with an append-only edit log plus
+// periodic snapshot/`CURRENT` rotation rather than adding `CURRENT` to the two-slot format.
+const MANIFEST_MAGIC: [u8; 8] = *b"IDXDBM01";
 const FORMAT_VERSION: u32 = 1;
 const HEADER_SIZE: usize = 96;
 const TABLE_ENTRY_SIZE: usize = 16;

@@ -14,7 +14,7 @@ pub use self::{
     entry::{EngineValue, Entry},
     error::{Error, Result},
     format::DEFAULT_ENTRY_CHARGE,
-    foyer_engine::{EngineReadStats, EngineWriteStats, ExtentEngineConfig, ExtentEngineHandle},
+    foyer_engine::{EngineReadStats, EngineWriteStats, ExtentEngineConfig, ExtentEngineHandle, ExtentEngineTestTuning},
     model::{CachePriority, MAX_KEY_SIZE},
     store::{
         CheckpointStats, DEFAULT_EXTENT_SIZE, DEFAULT_HIGH_PRIORITY_CAPACITY_PERCENT,

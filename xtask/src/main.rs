@@ -195,7 +195,7 @@ fn madsim() {
         [("RUSTFLAGS", r#"--cfg madsim --cfg tokio_unstable"#)],
     );
     run_with_env(
-        r#"cargo nextest run --workspace --exclude foyer-bench --exclude examples --exclude foyer-extent --exclude foyer-fixed-lsm --no-default-features --features "runtime-madsim-tokio""#,
+        r#"cargo nextest run --workspace --exclude foyer-bench --exclude examples --exclude foyer-extent --exclude foyer-index-db --no-default-features --features "runtime-madsim-tokio""#,
         [
             ("RUSTFLAGS", r#"--cfg madsim --cfg tokio_unstable"#),
             ("RUST_BACKTRACE", "1"),

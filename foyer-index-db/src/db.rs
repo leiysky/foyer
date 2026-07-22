@@ -38,7 +38,7 @@ const MEMTABLE_TOMBSTONE_BIT: u64 = 1_u64 << 63;
 const LOCK_FILE: &str = "LOCK";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FixedLsmOptions {
+pub struct IndexDbOptions {
     pub write_buffer_capacity: usize,
     pub cache_capacity: usize,
     /// Soft capacity target for all files in the database directory, including transient WAL,
@@ -46,7 +46,7 @@ pub struct FixedLsmOptions {
     pub max_disk_bytes: u64,
 }
 
-impl Default for FixedLsmOptions {
+impl Default for IndexDbOptions {
     fn default() -> Self {
         Self {
             write_buffer_capacity: DEFAULT_WRITE_BUFFER_CAPACITY,
@@ -56,7 +56,7 @@ impl Default for FixedLsmOptions {
     }
 }
 
-impl FixedLsmOptions {
+impl IndexDbOptions {
     fn validate(self) -> Result<Self> {
         if self.write_buffer_capacity < RECORD_SIZE {
             return Err(Error::InvalidOptions(format!(
@@ -150,7 +150,7 @@ impl WriteBatch {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct FixedLsmStats {
+pub struct IndexDbStats {
     pub manifest_generation: u64,
     pub next_sequence: u64,
     pub writes: u64,
@@ -203,17 +203,17 @@ pub struct FixedLsmStats {
 
 /// Lightweight cumulative table-read counters.
 ///
-/// Unlike [`FixedLsm::stats`], this snapshot is O(1): it does not inspect WAL files or lock the
+/// Unlike [`IndexDb::stats`], this snapshot is O(1): it does not inspect WAL files or lock the
 /// writer, version, page-cache shards, or background-maintenance state.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct FixedLsmReadStats {
+pub struct IndexDbReadStats {
     pub read_operations: u64,
     pub read_bytes: u64,
 }
 
 /// Result of a point lookup that is guaranteed not to perform table I/O.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FixedLsmMemoryLookup {
+pub enum IndexDbMemoryLookup {
     Value(Value),
     Miss,
     Unknown,
@@ -487,7 +487,7 @@ struct WriterState {
 #[derive(Debug)]
 struct Inner {
     directory: PathBuf,
-    options: FixedLsmOptions,
+    options: IndexDbOptions,
     disk_budget: DiskBudget,
     _lock: File,
     cache: Arc<BlockCache>,
@@ -527,15 +527,15 @@ struct BackgroundStatus {
 }
 
 #[derive(Debug)]
-pub struct FixedLsm {
+pub struct IndexDb {
     inner: Arc<Inner>,
     background: Arc<BackgroundStatus>,
     flush_sender: Option<mpsc::Sender<FlushTask>>,
     worker: Option<JoinHandle<()>>,
 }
 
-impl FixedLsm {
-    pub fn create(path: impl AsRef<Path>, options: FixedLsmOptions) -> Result<Self> {
+impl IndexDb {
+    pub fn create(path: impl AsRef<Path>, options: IndexDbOptions) -> Result<Self> {
         let directory = path.as_ref();
         let options = options.validate()?;
         fs::create_dir_all(directory).map_err(|error| Error::io("create database directory", error))?;
@@ -581,7 +581,7 @@ impl FixedLsm {
         })
     }
 
-    pub fn open(path: impl AsRef<Path>, options: FixedLsmOptions) -> Result<Self> {
+    pub fn open(path: impl AsRef<Path>, options: IndexDbOptions) -> Result<Self> {
         let directory = path.as_ref();
         let options = options.validate()?;
         if !directory.is_dir() {
@@ -704,7 +704,7 @@ impl FixedLsm {
     }
 
     /// Probe memtables and in-memory table ranges without issuing table I/O.
-    pub fn probe_memory(&self, key: &Key) -> Result<FixedLsmMemoryLookup> {
+    pub fn probe_memory(&self, key: &Key) -> Result<IndexDbMemoryLookup> {
         self.check_background_failure()?;
         let (mutable, immutables, version) = {
             let state = rwlock_read(&self.inner.state);
@@ -713,19 +713,19 @@ impl FixedLsm {
         if let Some(record) = mutable.get(key) {
             return Ok(record
                 .value
-                .map_or(FixedLsmMemoryLookup::Miss, FixedLsmMemoryLookup::Value));
+                .map_or(IndexDbMemoryLookup::Miss, IndexDbMemoryLookup::Value));
         }
         for immutable in immutables.iter().rev() {
             if let Some(record) = immutable.get(key) {
                 return Ok(record
                     .value
-                    .map_or(FixedLsmMemoryLookup::Miss, FixedLsmMemoryLookup::Value));
+                    .map_or(IndexDbMemoryLookup::Miss, IndexDbMemoryLookup::Value));
             }
         }
         Ok(if version.may_contain(key) {
-            FixedLsmMemoryLookup::Unknown
+            IndexDbMemoryLookup::Unknown
         } else {
-            FixedLsmMemoryLookup::Miss
+            IndexDbMemoryLookup::Miss
         })
     }
 
@@ -814,9 +814,9 @@ impl FixedLsm {
     }
 
     /// Return cumulative physical table-read counters without collecting a full database snapshot.
-    pub fn read_stats(&self) -> FixedLsmReadStats {
+    pub fn read_stats(&self) -> IndexDbReadStats {
         let io = self.inner.io.snapshot();
-        FixedLsmReadStats {
+        IndexDbReadStats {
             read_operations: io.read_operations,
             read_bytes: io.read_bytes,
         }
@@ -858,7 +858,7 @@ impl FixedLsm {
         compact_until_stable(&self.inner, true, None)
     }
 
-    pub fn stats(&self) -> FixedLsmStats {
+    pub fn stats(&self) -> IndexDbStats {
         let background = mutex_lock(&self.background.state);
         let background_running = background.busy || background.pending_flushes > 0;
         let background_failed = background.failure.is_some();
@@ -870,7 +870,7 @@ impl FixedLsm {
         let (base_level, level_targets) = dynamic_level_targets(&state.version, self.inner.options);
         let cache = self.inner.cache.stats();
         let io = self.inner.io.snapshot();
-        FixedLsmStats {
+        IndexDbStats {
             manifest_generation: writer.manifest.generation,
             next_sequence: writer.next_sequence,
             writes: self.inner.writes.load(AtomicOrdering::Relaxed),
@@ -971,7 +971,7 @@ impl FixedLsm {
         let background = Arc::new(BackgroundStatus::default());
         let (flush_sender, flush_receiver) = mpsc::channel();
         let worker = std::thread::Builder::new()
-            .name("fixed-lsm-maintenance".to_string())
+            .name("index-db-maintenance".to_string())
             .spawn({
                 let inner = inner.clone();
                 let background = background.clone();
@@ -985,7 +985,7 @@ impl FixedLsm {
                     }
                 }
             })
-            .map_err(|error| Error::io("spawn fixed-lsm maintenance worker", error))?;
+            .map_err(|error| Error::io("spawn IndexDB maintenance worker", error))?;
         Ok(Self {
             inner,
             background,
@@ -1138,7 +1138,7 @@ impl FixedLsm {
     }
 }
 
-impl Drop for FixedLsm {
+impl Drop for IndexDb {
     fn drop(&mut self) {
         let _ = self.wait_background();
         self.flush_sender.take();
@@ -1205,7 +1205,7 @@ fn flush_memtable(inner: Arc<Inner>, task: FlushTask) -> Result<()> {
     }
     let table = create_table(inner.as_ref(), task.table_id, 0, &records)?;
     #[cfg(test)]
-    crash_if_requested("fixed_lsm_after_flush_table");
+    crash_if_requested("index_db_after_flush_table");
     let table_bytes = table.meta().file_size;
     let current_version = rwlock_read(&inner.state).version.clone();
     let next_version = Arc::new(current_version.with_l0(table)?);
@@ -1220,7 +1220,7 @@ fn flush_memtable(inner: Arc<Inner>, task: FlushTask) -> Result<()> {
     };
     persist_manifest(&inner, &next_manifest)?;
     #[cfg(test)]
-    crash_if_requested("fixed_lsm_after_flush_manifest");
+    crash_if_requested("index_db_after_flush_manifest");
     {
         let mut state = rwlock_write(&inner.state);
         if !Arc::ptr_eq(&state.version, &current_version) {
@@ -1236,7 +1236,7 @@ fn flush_memtable(inner: Arc<Inner>, task: FlushTask) -> Result<()> {
     writer.manifest = next_manifest;
     drop(writer);
     #[cfg(test)]
-    crash_if_requested("fixed_lsm_after_flush_publish");
+    crash_if_requested("index_db_after_flush_publish");
     let removed_wal_bytes = cleanup_wal_files_through(&inner.directory, task.wal_id)?;
     inner.disk_budget.release(removed_wal_bytes);
     inner.maintenance_counters.record_flush(table_bytes);
@@ -1338,7 +1338,7 @@ fn run_compaction(inner: &Inner, current: Arc<Version>, plan: CompactionPlan) ->
         table.advise_dont_need();
     }
     #[cfg(test)]
-    crash_if_requested("fixed_lsm_after_compaction_tables");
+    crash_if_requested("index_db_after_compaction_tables");
     let output_bytes = outputs.iter().map(|table| table.meta().file_size).sum();
     publish_compaction(inner, current, &plan.inputs, outputs, false)?;
     inner
@@ -1372,7 +1372,7 @@ fn publish_compaction(
     persist_manifest(inner, &next_manifest)?;
     #[cfg(test)]
     if !_trivial_move {
-        crash_if_requested("fixed_lsm_after_compaction_manifest");
+        crash_if_requested("index_db_after_compaction_manifest");
     }
     {
         let mut state = rwlock_write(&inner.state);
@@ -1387,7 +1387,7 @@ fn publish_compaction(
     drop(writer);
     #[cfg(test)]
     if !_trivial_move {
-        crash_if_requested("fixed_lsm_after_compaction_publish");
+        crash_if_requested("index_db_after_compaction_publish");
     }
     let mut removed_bytes = 0_u64;
     for file_id in removed {
@@ -1454,7 +1454,7 @@ fn compaction_output_fences(version: &Version, target_level: usize) -> Vec<Key> 
         .unwrap_or_default()
 }
 
-fn compaction_plan(version: &Version, options: FixedLsmOptions, force_l0: bool) -> Option<CompactionPlan> {
+fn compaction_plan(version: &Version, options: IndexDbOptions, force_l0: bool) -> Option<CompactionPlan> {
     let (base_level, targets) = dynamic_level_targets(version, options);
     if version.levels[0].len() >= L0_COMPACTION_TRIGGER || force_l0 && !version.levels[0].is_empty() {
         if let Some(source) = version.levels[0].iter().enumerate().rev().find_map(|(index, source)| {
@@ -1545,7 +1545,7 @@ fn compaction_plan(version: &Version, options: FixedLsmOptions, force_l0: bool) 
     None
 }
 
-fn dynamic_level_targets(version: &Version, options: FixedLsmOptions) -> (usize, [u64; LEVEL_COUNT]) {
+fn dynamic_level_targets(version: &Version, options: IndexDbOptions) -> (usize, [u64; LEVEL_COUNT]) {
     let bottom_bytes = version.levels[LEVEL_COUNT - 1]
         .iter()
         .map(|table| table.meta().file_size)
@@ -1553,7 +1553,7 @@ fn dynamic_level_targets(version: &Version, options: FixedLsmOptions) -> (usize,
     dynamic_level_targets_for_bottom_bytes(bottom_bytes, options)
 }
 
-fn dynamic_level_targets_for_bottom_bytes(bottom_bytes: u64, options: FixedLsmOptions) -> (usize, [u64; LEVEL_COUNT]) {
+fn dynamic_level_targets_for_bottom_bytes(bottom_bytes: u64, options: IndexDbOptions) -> (usize, [u64; LEVEL_COUNT]) {
     let minimum_base = (options.write_buffer_capacity as u64).saturating_mul(L0_COMPACTION_TRIGGER as u64);
     let minimum_dynamic_target = minimum_base.div_ceil(LEVEL_SIZE_MULTIPLIER);
     let mut targets = [0; LEVEL_COUNT];
@@ -1755,7 +1755,7 @@ fn rwlock_write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 
 #[cfg(test)]
 fn crash_if_requested(point: &str) {
-    if std::env::var("FIXED_LSM_CRASH_AT").as_deref() == Ok(point) {
+    if std::env::var("INDEX_DB_CRASH_AT").as_deref() == Ok(point) {
         std::process::exit(86);
     }
 }
@@ -1766,7 +1766,7 @@ mod tests {
 
     use crate::{
         db::{
-            CompactionFilter, FixedLsm, FixedLsmMemoryLookup, FixedLsmOptions, MemValue, WriteBatch, WriteOptions,
+            CompactionFilter, IndexDb, IndexDbMemoryLookup, IndexDbOptions, MemValue, WriteBatch, WriteOptions,
             database_storage_bytes, dynamic_level_targets_for_bottom_bytes, mutex_lock, overlap_ratio_order,
         },
         error::Error,
@@ -1804,11 +1804,11 @@ mod tests {
         }
     }
 
-    fn test_options() -> FixedLsmOptions {
-        FixedLsmOptions {
+    fn test_options() -> IndexDbOptions {
+        IndexDbOptions {
             write_buffer_capacity: 64 * 16,
             cache_capacity: 1024 * 1024,
-            ..FixedLsmOptions::default()
+            ..IndexDbOptions::default()
         }
     }
 
@@ -1820,7 +1820,7 @@ mod tests {
     #[test]
     fn writes_flush_recover_and_delete() {
         let directory = tempfile::tempdir().unwrap();
-        let db = FixedLsm::create(directory.path(), test_options()).unwrap();
+        let db = IndexDb::create(directory.path(), test_options()).unwrap();
         let mut batch = WriteBatch::with_capacity(40);
         for index in 0..40 {
             batch.put(key(index), value(index, 1));
@@ -1836,7 +1836,7 @@ mod tests {
         assert_eq!(db.get(&key(8)).unwrap(), None);
         drop(db);
 
-        let db = FixedLsm::open(directory.path(), test_options()).unwrap();
+        let db = IndexDb::open(directory.path(), test_options()).unwrap();
         assert_eq!(db.get(&key(0)).unwrap(), Some(value(0, 1)));
         assert_eq!(db.get(&key(7)).unwrap(), Some(value(7, 2)));
         assert_eq!(db.get(&key(8)).unwrap(), None);
@@ -1846,17 +1846,17 @@ mod tests {
     #[test]
     fn repeated_reopen_removes_obsolete_empty_wals() {
         let directory = tempfile::tempdir().unwrap();
-        let db = FixedLsm::create(directory.path(), test_options()).unwrap();
+        let db = IndexDb::create(directory.path(), test_options()).unwrap();
         db.put(key(1), value(1, 1), WriteOptions::sync()).unwrap();
         drop(db);
 
-        let db = FixedLsm::open(directory.path(), test_options()).unwrap();
+        let db = IndexDb::open(directory.path(), test_options()).unwrap();
         assert_eq!(db.get(&key(1)).unwrap(), Some(value(1, 1)));
         assert!(wal_path(directory.path(), 1).is_file());
         assert!(wal_path(directory.path(), 2).is_file());
         drop(db);
 
-        let db = FixedLsm::open(directory.path(), test_options()).unwrap();
+        let db = IndexDb::open(directory.path(), test_options()).unwrap();
         assert_eq!(db.get(&key(1)).unwrap(), Some(value(1, 1)));
         assert!(wal_path(directory.path(), 1).is_file());
         assert!(!wal_path(directory.path(), 2).exists());
@@ -1866,7 +1866,7 @@ mod tests {
     #[test]
     fn open_falls_back_when_the_newest_manifest_references_a_missing_table() {
         let directory = tempfile::tempdir().unwrap();
-        let db = FixedLsm::create(directory.path(), test_options()).unwrap();
+        let db = IndexDb::create(directory.path(), test_options()).unwrap();
         db.put(key(1), value(1, 1), WriteOptions::buffered()).unwrap();
         db.flush().unwrap();
         let older = mutex_lock(&db.inner.writer).manifest.clone();
@@ -1883,7 +1883,7 @@ mod tests {
         drop(db);
 
         fs::remove_file(table_path(directory.path(), newest_only)).unwrap();
-        let reopened = FixedLsm::open(directory.path(), test_options()).unwrap();
+        let reopened = IndexDb::open(directory.path(), test_options()).unwrap();
         assert_eq!(reopened.stats().manifest_generation, older.generation);
         assert_eq!(reopened.get(&key(1)).unwrap(), Some(value(1, 1)));
         assert_eq!(reopened.get(&key(2)).unwrap(), None);
@@ -1892,30 +1892,30 @@ mod tests {
     #[test]
     fn memory_probe_distinguishes_values_misses_and_possible_table_reads() {
         let directory = tempfile::tempdir().unwrap();
-        let db = FixedLsm::create(directory.path(), test_options()).unwrap();
-        assert_eq!(db.probe_memory(&key(1)).unwrap(), FixedLsmMemoryLookup::Miss);
+        let db = IndexDb::create(directory.path(), test_options()).unwrap();
+        assert_eq!(db.probe_memory(&key(1)).unwrap(), IndexDbMemoryLookup::Miss);
 
         db.put(key(1), value(1, 1), WriteOptions::buffered()).unwrap();
         assert_eq!(
             db.probe_memory(&key(1)).unwrap(),
-            FixedLsmMemoryLookup::Value(value(1, 1))
+            IndexDbMemoryLookup::Value(value(1, 1))
         );
         db.flush().unwrap();
-        assert_eq!(db.probe_memory(&key(1)).unwrap(), FixedLsmMemoryLookup::Unknown);
-        assert_eq!(db.probe_memory(&key(2)).unwrap(), FixedLsmMemoryLookup::Miss);
+        assert_eq!(db.probe_memory(&key(1)).unwrap(), IndexDbMemoryLookup::Unknown);
+        assert_eq!(db.probe_memory(&key(2)).unwrap(), IndexDbMemoryLookup::Miss);
 
         db.delete(key(1), WriteOptions::buffered()).unwrap();
-        assert_eq!(db.probe_memory(&key(1)).unwrap(), FixedLsmMemoryLookup::Miss);
+        assert_eq!(db.probe_memory(&key(1)).unwrap(), IndexDbMemoryLookup::Miss);
     }
 
     #[test]
     fn disk_budget_soft_limit_does_not_reject_a_wal_batch() {
         let directory = tempfile::tempdir().unwrap();
-        let options = FixedLsmOptions {
+        let options = IndexDbOptions {
             max_disk_bytes: 512,
             ..test_options()
         };
-        let db = FixedLsm::create(directory.path(), options).unwrap();
+        let db = IndexDb::create(directory.path(), options).unwrap();
         let before = db.stats().disk_used_bytes;
         let mut batch = WriteBatch::with_capacity(16);
         for index in 0..16 {
@@ -1933,11 +1933,11 @@ mod tests {
     #[test]
     fn disk_budget_soft_limit_does_not_reject_compaction_output() {
         let directory = tempfile::tempdir().unwrap();
-        let options = FixedLsmOptions {
+        let options = IndexDbOptions {
             max_disk_bytes: 1,
             ..test_options()
         };
-        let db = FixedLsm::create(directory.path(), options).unwrap();
+        let db = IndexDb::create(directory.path(), options).unwrap();
         for run in 0..5 {
             let mut batch = WriteBatch::with_capacity(16);
             for index in 0..16 {
@@ -1957,7 +1957,7 @@ mod tests {
     #[test]
     fn disk_budget_matches_live_files_after_maintenance() {
         let directory = tempfile::tempdir().unwrap();
-        let db = FixedLsm::create(directory.path(), test_options()).unwrap();
+        let db = IndexDb::create(directory.path(), test_options()).unwrap();
         for run in 0..6 {
             let mut batch = WriteBatch::with_capacity(16);
             for index in run * 16..(run + 1) * 16 {
@@ -1972,21 +1972,21 @@ mod tests {
         assert_eq!(db.stats().disk_used_bytes, expected);
         drop(db);
 
-        let reopened = FixedLsm::open(directory.path(), test_options()).unwrap();
+        let reopened = IndexDb::open(directory.path(), test_options()).unwrap();
         assert_eq!(reopened.stats().disk_used_bytes, expected);
     }
 
     #[test]
     fn user_state_is_atomic_with_wal_and_manifest_publication() {
         let directory = tempfile::tempdir().unwrap();
-        let db = FixedLsm::create(directory.path(), test_options()).unwrap();
+        let db = IndexDb::create(directory.path(), test_options()).unwrap();
         let mut first = WriteBatch::default();
         first.put(key(1), value(1, 1));
         db.write_with_user_state(&first, WriteOptions::sync(), 41).unwrap();
         assert_eq!(db.user_state(), 41);
         drop(db);
 
-        let db = FixedLsm::open(directory.path(), test_options()).unwrap();
+        let db = IndexDb::open(directory.path(), test_options()).unwrap();
         assert_eq!(db.user_state(), 41);
         assert_eq!(db.get(&key(1)).unwrap(), Some(value(1, 1)));
         let mut second = WriteBatch::default();
@@ -1996,7 +1996,7 @@ mod tests {
         assert_eq!(db.user_state(), 42);
         drop(db);
 
-        let db = FixedLsm::open(directory.path(), test_options()).unwrap();
+        let db = IndexDb::open(directory.path(), test_options()).unwrap();
         assert_eq!(db.user_state(), 42);
         assert_eq!(db.get(&key(2)).unwrap(), Some(value(2, 1)));
     }
@@ -2007,12 +2007,12 @@ mod tests {
         let status = Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
             .arg("db::tests::synced_wal_survives_process_exit_child")
-            .env("FIXED_LSM_CRASH_TEST_DIRECTORY", directory.path())
+            .env("INDEX_DB_CRASH_TEST_DIRECTORY", directory.path())
             .status()
             .unwrap();
         assert!(status.success());
 
-        let db = FixedLsm::open(directory.path(), test_options()).unwrap();
+        let db = IndexDb::open(directory.path(), test_options()).unwrap();
         for index in 0..32 {
             assert_eq!(db.get(&key(index)).unwrap(), Some(value(index, 1)));
         }
@@ -2021,10 +2021,10 @@ mod tests {
 
     #[test]
     fn synced_wal_survives_process_exit_child() {
-        let Ok(directory) = std::env::var("FIXED_LSM_CRASH_TEST_DIRECTORY") else {
+        let Ok(directory) = std::env::var("INDEX_DB_CRASH_TEST_DIRECTORY") else {
             return;
         };
-        let db = FixedLsm::create(directory, test_options()).unwrap();
+        let db = IndexDb::create(directory, test_options()).unwrap();
         let _maintenance = mutex_lock(&db.inner.maintenance);
         for first in [0, 16] {
             let mut batch = WriteBatch::with_capacity(16);
@@ -2041,21 +2041,21 @@ mod tests {
     #[test]
     fn process_crash_during_flush_recovers_the_synced_batch() {
         for crash_at in [
-            "fixed_lsm_after_flush_table",
-            "fixed_lsm_after_flush_manifest",
-            "fixed_lsm_after_flush_publish",
+            "index_db_after_flush_table",
+            "index_db_after_flush_manifest",
+            "index_db_after_flush_publish",
         ] {
             let directory = tempfile::tempdir().unwrap();
             let status = Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
                 .arg("db::tests::flush_crash_child")
-                .env("FIXED_LSM_FAILPOINT_DIRECTORY", directory.path())
-                .env("FIXED_LSM_CRASH_AT", crash_at)
+                .env("INDEX_DB_FAILPOINT_DIRECTORY", directory.path())
+                .env("INDEX_DB_CRASH_AT", crash_at)
                 .status()
                 .unwrap();
             assert_eq!(status.code(), Some(86), "child did not crash at {crash_at}");
 
-            let db = FixedLsm::open(directory.path(), test_options()).unwrap();
+            let db = IndexDb::open(directory.path(), test_options()).unwrap();
             for index in 0..32 {
                 assert_eq!(db.get(&key(index)).unwrap(), Some(value(index, 1)));
             }
@@ -2064,10 +2064,10 @@ mod tests {
 
     #[test]
     fn flush_crash_child() {
-        let Ok(directory) = std::env::var("FIXED_LSM_FAILPOINT_DIRECTORY") else {
+        let Ok(directory) = std::env::var("INDEX_DB_FAILPOINT_DIRECTORY") else {
             return;
         };
-        let db = FixedLsm::create(directory, test_options()).unwrap();
+        let db = IndexDb::create(directory, test_options()).unwrap();
         let mut batch = WriteBatch::with_capacity(32);
         for index in 0..32 {
             batch.put(key(index), value(index, 1));
@@ -2080,21 +2080,21 @@ mod tests {
     #[test]
     fn process_crash_during_compaction_recovers_the_newest_values() {
         for crash_at in [
-            "fixed_lsm_after_compaction_tables",
-            "fixed_lsm_after_compaction_manifest",
-            "fixed_lsm_after_compaction_publish",
+            "index_db_after_compaction_tables",
+            "index_db_after_compaction_manifest",
+            "index_db_after_compaction_publish",
         ] {
             let directory = tempfile::tempdir().unwrap();
             let status = Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
                 .arg("db::tests::compaction_crash_child")
-                .env("FIXED_LSM_FAILPOINT_DIRECTORY", directory.path())
-                .env("FIXED_LSM_CRASH_AT", crash_at)
+                .env("INDEX_DB_FAILPOINT_DIRECTORY", directory.path())
+                .env("INDEX_DB_CRASH_AT", crash_at)
                 .status()
                 .unwrap();
             assert_eq!(status.code(), Some(86), "child did not crash at {crash_at}");
 
-            let db = FixedLsm::open(directory.path(), test_options()).unwrap();
+            let db = IndexDb::open(directory.path(), test_options()).unwrap();
             for index in 0..16 {
                 assert_eq!(
                     db.get(&key(index)).unwrap(),
@@ -2107,10 +2107,10 @@ mod tests {
 
     #[test]
     fn compaction_crash_child() {
-        let Ok(directory) = std::env::var("FIXED_LSM_FAILPOINT_DIRECTORY") else {
+        let Ok(directory) = std::env::var("INDEX_DB_FAILPOINT_DIRECTORY") else {
             return;
         };
-        let db = FixedLsm::create(directory, test_options()).unwrap();
+        let db = IndexDb::create(directory, test_options()).unwrap();
         for generation in 1..=5 {
             let mut batch = WriteBatch::with_capacity(16);
             for index in 0..16 {
@@ -2126,7 +2126,7 @@ mod tests {
     #[test]
     fn upper_tombstone_stops_before_reading_an_older_level() {
         let directory = tempfile::tempdir().unwrap();
-        let db = FixedLsm::create(directory.path(), test_options()).unwrap();
+        let db = IndexDb::create(directory.path(), test_options()).unwrap();
         db.put(key(1), value(1, 1), WriteOptions::buffered()).unwrap();
         db.flush().unwrap();
         db.compact().unwrap();
@@ -2146,7 +2146,7 @@ mod tests {
     #[test]
     fn bottom_compaction_purges_tombstone_and_older_value() {
         let directory = tempfile::tempdir().unwrap();
-        let db = FixedLsm::create(directory.path(), test_options()).unwrap();
+        let db = IndexDb::create(directory.path(), test_options()).unwrap();
         db.put(key(1), value(1, 1), WriteOptions::buffered()).unwrap();
         db.flush().unwrap();
         db.compact().unwrap();
@@ -2158,7 +2158,7 @@ mod tests {
         assert_eq!(db.stats().level_files.iter().sum::<u64>(), 0);
         drop(db);
 
-        let db = FixedLsm::open(directory.path(), test_options()).unwrap();
+        let db = IndexDb::open(directory.path(), test_options()).unwrap();
         assert_eq!(db.get(&key(1)).unwrap(), None);
         assert_eq!(db.stats().level_files.iter().sum::<u64>(), 0);
     }
@@ -2166,7 +2166,7 @@ mod tests {
     #[test]
     fn compaction_filter_tombstones_stale_values_without_resurrecting_older_versions() {
         let directory = tempfile::tempdir().unwrap();
-        let db = FixedLsm::create(directory.path(), test_options()).unwrap();
+        let db = IndexDb::create(directory.path(), test_options()).unwrap();
         db.set_compaction_filter(Some(Arc::new(DiscardKey(key(3)))));
         for generation in 1..=5 {
             let mut batch = WriteBatch::with_capacity(16);
@@ -2188,7 +2188,7 @@ mod tests {
     #[test]
     fn nonoverlapping_tombstone_is_rewritten_before_bottom_level() {
         let directory = tempfile::tempdir().unwrap();
-        let db = FixedLsm::create(directory.path(), test_options()).unwrap();
+        let db = IndexDb::create(directory.path(), test_options()).unwrap();
         db.delete(key(1), WriteOptions::buffered()).unwrap();
         db.flush().unwrap();
         assert_eq!(db.stats().level_files[0], 1);
@@ -2201,7 +2201,7 @@ mod tests {
     #[test]
     fn compaction_keeps_the_newest_sequence_under_concurrent_reads() {
         let directory = tempfile::tempdir().unwrap();
-        let db = Arc::new(FixedLsm::create(directory.path(), test_options()).unwrap());
+        let db = Arc::new(IndexDb::create(directory.path(), test_options()).unwrap());
         for generation in 1..=6 {
             let mut batch = WriteBatch::with_capacity(16);
             for index in 0..16 {
@@ -2227,12 +2227,12 @@ mod tests {
     #[test]
     fn l0_trivial_move_never_inverts_overlapping_table_precedence() {
         let directory = tempfile::tempdir().unwrap();
-        let options = FixedLsmOptions {
+        let options = IndexDbOptions {
             write_buffer_capacity: 64 * 1024,
             cache_capacity: 1024 * 1024,
-            ..FixedLsmOptions::default()
+            ..IndexDbOptions::default()
         };
-        let db = FixedLsm::create(directory.path(), options).unwrap();
+        let db = IndexDb::create(directory.path(), options).unwrap();
 
         let mut oldest = WriteBatch::with_capacity(16_000);
         for index in 0..16_000 {
@@ -2259,14 +2259,14 @@ mod tests {
         assert_eq!(db.get(&prefixed_key(3, 0)).unwrap(), Some(value(0, 2)));
         drop(db);
 
-        let reopened = FixedLsm::open(directory.path(), options).unwrap();
+        let reopened = IndexDb::open(directory.path(), options).unwrap();
         assert_eq!(reopened.get(&prefixed_key(3, 0)).unwrap(), Some(value(0, 2)));
     }
 
     #[test]
     fn background_flush_keeps_newer_active_writes_visible() {
         let directory = tempfile::tempdir().unwrap();
-        let db = FixedLsm::create(directory.path(), test_options()).unwrap();
+        let db = IndexDb::create(directory.path(), test_options()).unwrap();
         let mut first = WriteBatch::with_capacity(32);
         for index in 0..32 {
             first.put(key(index), value(index, 1));
@@ -2283,9 +2283,9 @@ mod tests {
     #[test]
     fn database_directory_has_single_process_ownership() {
         let directory = tempfile::tempdir().unwrap();
-        let _db = FixedLsm::create(directory.path(), test_options()).unwrap();
+        let _db = IndexDb::create(directory.path(), test_options()).unwrap();
         assert!(matches!(
-            FixedLsm::open(directory.path(), test_options()),
+            IndexDb::open(directory.path(), test_options()),
             Err(Error::DatabaseLocked(_))
         ));
     }
@@ -2293,7 +2293,7 @@ mod tests {
     #[test]
     fn non_overlapping_tables_change_levels_without_rewrite() {
         let directory = tempfile::tempdir().unwrap();
-        let db = FixedLsm::create(directory.path(), test_options()).unwrap();
+        let db = IndexDb::create(directory.path(), test_options()).unwrap();
         for run in 0..8 {
             let mut batch = WriteBatch::with_capacity(16);
             for index in run * 16..(run + 1) * 16 {
@@ -2308,7 +2308,7 @@ mod tests {
         assert!(stats.level_files[1..].iter().sum::<u64>() > 0);
         drop(db);
 
-        let db = FixedLsm::open(directory.path(), test_options()).unwrap();
+        let db = IndexDb::open(directory.path(), test_options()).unwrap();
         assert_eq!(db.get(&key(0)).unwrap(), Some(value(0, 1)));
         assert_eq!(db.get(&key(127)).unwrap(), Some(value(127, 1)));
     }
@@ -2322,7 +2322,7 @@ mod tests {
 
     #[test]
     fn dynamic_levels_keep_a_small_base_above_the_large_levels() {
-        let options = FixedLsmOptions::default();
+        let options = IndexDbOptions::default();
         let total = 6_560_000_000;
         let (base, targets) = dynamic_level_targets_for_bottom_bytes(total, options);
         assert_eq!(base, 4);

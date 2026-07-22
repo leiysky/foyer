@@ -6,7 +6,7 @@ members = [
   "foyer-bench",
   "foyer-common",
   "foyer-extent",
-  "foyer-fixed-lsm",
+  "foyer-index-db",
   "foyer-memory",
   "foyer-storage",
   "foyer-tokio",
@@ -46,7 +46,7 @@ equivalent = "1"
 fastant = { version = "0.1.11" }
 fastrace = { version = "0.7.18" }
 fastrace-opentelemetry = { version = "0.18.1" }
-fixed-lsm = { package = "foyer-fixed-lsm", path = "foyer-fixed-lsm" }
+index-db = { package = "foyer-index-db", path = "foyer-index-db" }
 foyer = { version = "0.23.0-dev", path = "foyer", default-features = false }
 foyer-common = { version = "0.23.0-dev", path = "foyer-common", default-features = false }
 foyer-memory = { version = "0.23.0-dev", path = "foyer-memory", default-features = false }

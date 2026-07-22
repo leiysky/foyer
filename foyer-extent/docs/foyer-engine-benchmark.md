@@ -116,7 +116,7 @@ in the second half. It directly checks that normal demand can recover its protec
 allowing later normal churn to erase high-priority occupancy in the shared-capacity region.
 
 Reported Extent read bytes and I/O operations include both payload reads recorded through Foyer's
-device statistics and FixedRecordLSM reads. The separate `extent_read` and `extent_index_read`
+device statistics and IndexDB reads. The separate `extent_read` and `extent_index_read`
 records provide that total's phase-local decomposition; warmup work is subtracted before the
 primary measured-read record. Extent write statistics include the final metadata checkpoint
 performed by `wait` or close.
@@ -137,7 +137,7 @@ controls the optional sparse-arrival data-write microbatch window and defaults t
 nonzero candidate with zero under the same seeds and alternating run order before enabling it. The
 `extent_layout` record separates payload capacity from the soft Index target. The write record also
 splits index WAL, SST, and manifest calls/bytes/syncs and reports compaction input/output bytes;
-these counters describe userspace and FixedRecordLSM operations rather than device-internal write
+these counters describe userspace and IndexDB operations rather than device-internal write
 amplification. `extent_reclaim` reports invalidated extents/bytes, time waiting for an already
 captured checkpoint, generation-invalidation time, and total time. A correct normal reclaim shows no
 increase in index reads/writes beyond unrelated background maintenance.
@@ -234,14 +234,14 @@ exceed 100.
 
 ## Index-only hot path
 
-`index_hot_path` compares the FixedLSM point-lookup path with the block engine's real sharded
-in-memory index. Copy a populated FixedLSM directory before opening it because every database open
+`index_hot_path` compares the IndexDB point-lookup path with the block engine's real sharded
+in-memory index. Copy a populated IndexDB directory before opening it because every database open
 creates a fresh WAL generation:
 
 ```shell
-cp -a --reflink=auto /path/to/extent-engine/index-lsm /path/to/index-profile
+cp -a --reflink=auto /path/to/extent-engine/index /path/to/index-profile
 
-INDEX_BENCH_ENGINE=fixed \
+INDEX_BENCH_ENGINE=index-db \
 INDEX_BENCH_PATH=/path/to/index-profile \
 INDEX_BENCH_ENTRIES=10000000 \
 INDEX_BENCH_HOTSET=10000 \
@@ -256,6 +256,6 @@ cargo bench -p foyer-extent --bench index_hot_path
 
 Both modes prepare their index before warmup and use the same deterministic lookup stream.
 `INDEX_BENCH_CONCURRENCY` defaults to twice the detected core count. Set
-`INDEX_BENCH_CACHE_MIB=0` to isolate a page-cache-only FixedLSM path. For an external profiler,
+`INDEX_BENCH_CACHE_MIB=0` to isolate a page-cache-only IndexDB path. For an external profiler,
 `INDEX_BENCH_PROFILE_DELAY_SECONDS` inserts a delay after warmup and immediately before the measured
 phase; preparation and recovery therefore remain outside the captured lookup window.

@@ -8,7 +8,7 @@ use crate::{
 };
 
 pub const LOCATION_RECORD_SIZE: usize = 32;
-const STATE_ENTRY_SIZE: usize = 24;
+const STATE_ENTRY_SIZE: usize = 21;
 const STATE_HEADER_SIZE: usize = 64;
 const STATE_CHECKSUM_SIZE: usize = size_of::<u32>();
 const STATE_MAGIC: [u8; 8] = *b"FOYEXT01";
@@ -19,14 +19,14 @@ const STATE_MAGIC: [u8; 8] = *b"FOYEXT01";
 /// layout derivation, record encoding, or an incompatible format in the embedded fixed-record index.
 pub const EXTENT_FORMAT_VERSION: u32 = 1;
 const NO_EXTENT: u32 = u32::MAX;
-const FIXED_LSM_INDEX_BYTES_PER_ENTRY: u64 = 76;
+const INDEX_DB_BYTES_PER_ENTRY: u64 = 76;
 // One steady-state copy, one atomic compaction output, and one bounded WAL/L0 write tail.
-const FIXED_LSM_INDEX_CAPACITY_COPIES: u64 = 3;
-const FIXED_LSM_INDEX_OVERHEAD_PER_ENTRY: u64 = 16;
+const INDEX_DB_CAPACITY_COPIES: u64 = 3;
+const INDEX_DB_OVERHEAD_PER_ENTRY: u64 = 16;
 // Small indexes still need page-aligned WAL, manifest, input SST, and atomic compaction-output
 // headroom while capacity-pressure batches cross extent boundaries.
-const FIXED_LSM_INDEX_MINIMUM_OVERHEAD: u64 = 256 * 1024;
-const FIXED_LSM_INDEX_MAXIMUM_OVERHEAD: u64 = 16 * 1024 * 1024;
+const INDEX_DB_MINIMUM_OVERHEAD: u64 = 256 * 1024;
+const INDEX_DB_MAXIMUM_OVERHEAD: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreLayout {
@@ -87,7 +87,7 @@ impl StoreLayout {
                 .ok_or_else(|| invalid_layout("extent data file size overflows u64"))?;
             let state_copy_size = state_copy_size(extent_count)?;
             // The EntryIndex capacity is a soft planning target. It is deliberately excluded here:
-            // FixedRecordLSM may overcommit it and cache payload must not be reduced as if the
+            // IndexDB may overcommit it and cache payload must not be reduced as if the
             // worst-case index were already allocated.
             let total_file_size = data_file_size
                 .checked_add((state_copy_size * 2) as u64)
@@ -175,16 +175,16 @@ impl StoreLayout {
 
 fn index_capacity_for_entries(entries: u64) -> Result<u64> {
     let overhead = entries
-        .checked_mul(FIXED_LSM_INDEX_OVERHEAD_PER_ENTRY)
-        .map(|bytes| bytes.clamp(FIXED_LSM_INDEX_MINIMUM_OVERHEAD, FIXED_LSM_INDEX_MAXIMUM_OVERHEAD))
-        .ok_or_else(|| invalid_layout("fixed LSM index overhead overflows u64"))?;
+        .checked_mul(INDEX_DB_OVERHEAD_PER_ENTRY)
+        .map(|bytes| bytes.clamp(INDEX_DB_MINIMUM_OVERHEAD, INDEX_DB_MAXIMUM_OVERHEAD))
+        .ok_or_else(|| invalid_layout("IndexDB index overhead overflows u64"))?;
     entries
-        .checked_mul(FIXED_LSM_INDEX_BYTES_PER_ENTRY)
-        .and_then(|bytes| bytes.checked_mul(FIXED_LSM_INDEX_CAPACITY_COPIES))
+        .checked_mul(INDEX_DB_BYTES_PER_ENTRY)
+        .and_then(|bytes| bytes.checked_mul(INDEX_DB_CAPACITY_COPIES))
         .and_then(|bytes| bytes.checked_add(overhead))
         .and_then(|bytes| bytes.checked_add(PAGE_SIZE as u64 - 1))
         .map(|bytes| bytes / PAGE_SIZE as u64 * PAGE_SIZE as u64)
-        .ok_or_else(|| invalid_layout("fixed LSM index capacity overflows u64"))
+        .ok_or_else(|| invalid_layout("IndexDB index capacity overflows u64"))
 }
 
 fn state_copy_size(extent_count: u32) -> Result<usize> {
@@ -200,32 +200,12 @@ fn invalid_layout(message: &str) -> Error {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ExtentRole {
-    Free = 0,
-    Current = 1,
-    Sealed = 2,
-}
-
-impl ExtentRole {
-    fn from_byte(value: u8) -> Option<Self> {
-        match value {
-            0 => Some(Self::Free),
-            1 => Some(Self::Current),
-            2 => Some(Self::Sealed),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExtentState {
     pub generation: u32,
     pub used_bytes: u32,
     pub entries: u32,
     pub activation_sequence: u64,
     pub priority: CachePriority,
-    pub role: ExtentRole,
 }
 
 impl ExtentState {
@@ -236,8 +216,11 @@ impl ExtentState {
             entries: 0,
             activation_sequence: 0,
             priority: CachePriority::Low,
-            role: ExtentRole::Free,
         }
+    }
+
+    pub(super) const fn is_free(self) -> bool {
+        self.activation_sequence == 0
     }
 }
 
@@ -289,8 +272,7 @@ impl ExtentPoolState {
             put_u32(&mut output, offset + 4, state.used_bytes);
             put_u64(&mut output, offset + 8, state.activation_sequence);
             output[offset + 16] = state.priority.to_byte();
-            output[offset + 17] = state.role as u8;
-            put_u32(&mut output, offset + 20, state.entries);
+            put_u32(&mut output, offset + 17, state.entries);
         }
         let checksum_offset = output.len() - STATE_CHECKSUM_SIZE;
         let checksum = checksum(&output[..checksum_offset]);
@@ -320,10 +302,9 @@ impl ExtentPoolState {
             extents.push(ExtentState {
                 generation: get_u32(input, offset),
                 used_bytes: get_u32(input, offset + 4),
-                entries: get_u32(input, offset + 20),
+                entries: get_u32(input, offset + 17),
                 activation_sequence: get_u64(input, offset + 8),
                 priority: CachePriority::from_byte(input[offset + 16])?,
-                role: ExtentRole::from_byte(input[offset + 17])?,
             });
         }
         let state = Self {
@@ -346,7 +327,7 @@ impl ExtentPoolState {
         if self.extents.len() != layout.extent_count as usize {
             return Err(invalid_layout("extent allocator length is invalid"));
         }
-        for (extent, state) in self.extents.iter().enumerate() {
+        for state in &self.extents {
             if state.generation == 0
                 || state.used_bytes as usize > layout.extent_size
                 || !(state.used_bytes as usize).is_multiple_of(PAGE_SIZE)
@@ -354,30 +335,15 @@ impl ExtentPoolState {
             {
                 return Err(invalid_layout("extent allocator entry is invalid"));
             }
-            match state.role {
-                ExtentRole::Free => {
-                    if state.used_bytes != 0
-                        || state.entries != 0
-                        || state.activation_sequence != 0
-                        || state.priority != CachePriority::Low
-                    {
-                        return Err(invalid_layout("free extent carries allocated state"));
-                    }
+            if state.is_free() {
+                if state.used_bytes != 0 || state.entries != 0 || state.priority != CachePriority::Low {
+                    return Err(invalid_layout("free extent carries allocated state"));
                 }
-                ExtentRole::Current | ExtentRole::Sealed => {
-                    if state.used_bytes == 0
-                        || state.entries == 0
-                        || state.activation_sequence == 0
-                        || state.activation_sequence >= self.next_activation_sequence
-                    {
-                        return Err(invalid_layout("allocated extent state is invalid"));
-                    }
-                    if state.role == ExtentRole::Current
-                        && self.current[state.priority.to_byte() as usize] != Some(extent as u32)
-                    {
-                        return Err(invalid_layout("extent current pointer is inconsistent"));
-                    }
-                }
+            } else if state.used_bytes == 0
+                || state.entries == 0
+                || state.activation_sequence >= self.next_activation_sequence
+            {
+                return Err(invalid_layout("allocated extent state is invalid"));
             }
         }
         for (priority, current) in self.current.iter().enumerate() {
@@ -385,7 +351,7 @@ impl ExtentPoolState {
                 let Some(state) = self.extents.get(*extent as usize) else {
                     return Err(invalid_layout("extent current pointer is out of range"));
                 };
-                if state.role != ExtentRole::Current || state.priority.to_byte() as usize != priority {
+                if state.is_free() || state.priority.to_byte() as usize != priority {
                     return Err(invalid_layout("extent current pointer has the wrong class"));
                 }
             }
@@ -515,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_index_capacity_is_page_aligned_and_checks_rounding_overflow() {
+    fn index_db_capacity_is_page_aligned_and_checks_rounding_overflow() {
         let capacity = index_capacity_for_entries(1).unwrap();
         assert_eq!(capacity % PAGE_SIZE as u64, 0);
         assert!(index_capacity_for_entries(u64::MAX).is_err());
@@ -524,9 +490,26 @@ mod tests {
     #[test]
     fn allocator_state_roundtrips_and_rejects_corruption() {
         let layout = layout();
-        let state = ExtentPoolState::empty(layout);
+        let mut state = ExtentPoolState::empty(layout);
+        state.extents[0] = ExtentState {
+            generation: 1,
+            used_bytes: PAGE_SIZE as u32,
+            entries: 2,
+            activation_sequence: 1,
+            priority: CachePriority::Normal,
+        };
+        state.extents[1] = ExtentState {
+            generation: 3,
+            used_bytes: (PAGE_SIZE * 2) as u32,
+            entries: 1,
+            activation_sequence: 2,
+            priority: CachePriority::High,
+        };
+        state.current[CachePriority::Normal as usize] = Some(0);
+        state.next_activation_sequence = 3;
         let mut encoded = state.encode(layout).unwrap();
         assert_eq!(ExtentPoolState::decode(&encoded, layout, 0), Some(state));
+        assert_eq!(STATE_ENTRY_SIZE, 21);
 
         assert_eq!(
             StoreLayout::discover(&encoded, layout.data_file_size, (layout.state_copy_size * 2) as u64),

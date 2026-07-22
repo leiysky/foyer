@@ -42,7 +42,18 @@ The store directory contains:
 | --- | --- |
 | `data` | Preallocated packed Stored Entry bytes |
 | `state` | Two alternating checksummed allocator-state copies |
-| `index-lsm/` | FixedRecordLSM WAL, manifests, and SSTs |
+| `index/` | IndexDB WAL, manifests, and SSTs |
+
+Each allocator copy contains a 64-byte format/layout header, one packed 21-byte record per cache
+extent, padding to a 4 KiB boundary, and a trailing checksum. The header carries the allocator
+generation, next activation sequence, and the current cache extent for each priority. Each
+cache-extent record carries generation, used-byte high water, activation sequence, priority, and
+physical Entry count.
+
+Lifecycle is derived rather than stored twice: activation sequence zero means free, a nonzero
+cache extent named by its priority's current pointer is current, and every other activated cache
+extent is sealed. This preserves an explicit “no current cache extent” state without a persisted
+role byte or a role/pointer consistency problem.
 
 Exact key and value validation live in the Stored Entry and `EntryLocation`; recovery intentionally
 discards allocations newer than the last allocator/index checkpoint instead of maintaining a
@@ -61,7 +72,7 @@ Entry-count bound follows from the smallest valid Stored Entry, while small Entr
 planned cardinality without being rejected. EntryIndex usage can also exceed its planning target,
 and that overcommit is reported as pressure rather than converted into a cache-health boundary. The
 host filesystem remains the real allocation limit. Index reservations include transient overlap
-and release obsolete bytes only after unlink and FixedRecordLSM directory sync, preserving exact
+and release obsolete bytes only after unlink and IndexDB directory sync, preserving exact
 usage accounting.
 
 ## Lookup
@@ -84,7 +95,7 @@ does not add ownership-sidecar I/O. Any stale, torn, or mismatched location is a
 never an unverified hit. There is deliberately no second batch-read implementation beside Foyer's
 point-load interface.
 
-Recovery loads one of two bounded allocator copies plus FixedRecordLSM metadata and its bounded WAL
+Recovery loads one of two bounded allocator copies plus IndexDB metadata and its bounded WAL
 tail. It never scans payload. Allocations and overlay mutations newer than the last complete
 checkpoint are discarded as ordinary cache loss. Reclaim is a metadata-only generation transition
 and contributes no index or payload reads.
@@ -109,9 +120,9 @@ hard cap. A zero interval bypasses admission and accounting entirely.
 The scheduler does not own buffers, reorder durability steps, or alter the disk format. Default
 single-concurrency writes execute inline with one reusable aligned buffer; explicitly parallel
 writes use an ExtentPool-owned persistent bounded worker pool. Allocator-state persistence
-and FixedRecordLSM remain outside this policy: allocator writes are serialized recovery-critical
+and IndexDB remain outside this policy: allocator writes are serialized recovery-critical
 transitions, while an index lookup may be satisfied by its memory overlay or block cache without a
-physical I/O. Extending admission into FixedRecordLSM requires evidence of metadata-I/O contention,
+physical I/O. Extending admission into IndexDB requires evidence of metadata-I/O contention,
 not a scheduler call around a high-level lookup.
 
 `IoSchedulerStats` reports enabled policy, current readers/writers, scheduled write operations,
@@ -140,7 +151,7 @@ Durable checkpoint order is:
 ```text
 data-file sync
   -> alternating allocator-state copy
-  -> synced FixedRecordLSM batch + indexed-cardinality upper bound
+  -> synced IndexDB batch + indexed-cardinality upper bound
   -> frozen-overlay retirement
 ```
 
@@ -149,7 +160,7 @@ has no per-insert strict mode. Published-byte and periodic triggers feed the sam
 checkpoint worker. Data sync and image capture serialize briefly with mutations, while allocator
 and index persistence proceed after the lock is released and later mutations may continue. A
 checkpoint error becomes sticky and subsequent mutations fail rather than continuing with an
-unknown durability state. Graceful `sync` and close wait for the latest epoch and already-scheduled FixedRecordLSM
+unknown durability state. Graceful `sync` and close wait for the latest epoch and already-scheduled IndexDB
 maintenance, so a late flush or compaction failure cannot be hidden by an earlier WAL durability
 acknowledgement.
 
@@ -227,7 +238,7 @@ behind a runtime switch in Format 1.
 
 The durable index supports fixed 24-byte digests and 32-byte locations, atomic put/delete batches,
 point lookup, WAL recovery, and one opaque `u64` application state. ExtentStore supplies no range or
-payload-layout knowledge to it. Overlay concurrency, FixedRecordLSM policy, recovery, cache
+payload-layout knowledge to it. Overlay concurrency, IndexDB policy, recovery, cache
 accounting, and rejected index implementations are specified in
 [EntryIndex design](entry-index.md).
 

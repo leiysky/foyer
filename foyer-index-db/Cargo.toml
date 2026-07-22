@@ -1,6 +1,6 @@
 [package]
-name = "foyer-fixed-lsm"
-description = "Fixed-record LSM index vendored for foyer-extent"
+name = "foyer-index-db"
+description = "Specialized durable point index for foyer-extent"
 version.workspace = true
 edition = "2024"
 rust-version.workspace = true
@@ -12,7 +12,7 @@ readme = "README.md"
 publish = false
 
 [lib]
-name = "fixed_lsm"
+name = "index_db"
 
 [dependencies]
 crc-fast = { workspace = true }

@@ -6,7 +6,7 @@ EntryIndex is ExtentStore's exact mapping from a fixed key digest to one physica
 provides crash-safe point lookup and atomic mutation batches without owning payload placement,
 cache priority policy, range assembly, or the public cache API.
 
-The accepted durable implementation is the workspace-private, Rust-native `foyer-fixed-lsm` crate.
+The accepted durable implementation is the workspace-private, Rust-native `foyer-index-db` crate.
 There is no runtime index selector. RocksDB remains available only behind a benchmark feature as an
 industrial comparison and fallback design.
 
@@ -24,7 +24,7 @@ collisions can cause only replacement or a miss, never a wrong value.
 
 `EntryLocation` identifies one complete Stored Entry by byte offset, encoded length, an 88-bit
 value-content digest, priority, and cache-extent generation. Its 32-byte encoding has an independent
-CRC. FixedRecordLSM treats the value as opaque; EntryIndex decodes it for foreground validation and
+CRC. IndexDB treats the value as opaque; EntryIndex decodes it for foreground validation and
 the liveness compaction filter. The index also stores one opaque `u64`
 application state used by ExtentStore for a durable indexed-cardinality upper bound. Generation
 invalidation can make locations stale without mutating the index, so this count is telemetry only;
@@ -36,7 +36,7 @@ EntryIndex has three logical lookup layers:
 
 1. an active overlay containing mutations published since the latest checkpoint capture;
 2. one immutable frozen overlay being persisted; and
-3. the durable FixedRecordLSM base.
+3. the durable IndexDB base.
 
 Overlays contain exact puts and tombstones. Checkpoint capture rotates the active overlay into the
 frozen position while holding the ExtentStore mutation order, then releases that order before
@@ -60,7 +60,7 @@ consulted only for the unknown case.
 
 ## Durable engine
 
-FixedRecordLSM is deliberately narrower than a general-purpose database. It supports fixed keys and
+IndexDB is deliberately narrower than a general-purpose database. It supports fixed keys and
 values, point lookup, atomic put/delete batches, a checksummed WAL, immutable SSTs, Bloom filters, a
 bounded block cache, partitioned leveled compaction, alternating checksummed manifests, and one
 opaque application state.
@@ -77,7 +77,7 @@ EntryIndex durability follows the ExtentStore publication order:
 ```text
 data-file sync
   -> allocator state
-  -> synced FixedRecordLSM mutation batch + indexed-cardinality upper bound
+  -> synced IndexDB mutation batch + indexed-cardinality upper bound
   -> frozen-overlay retirement
 ```
 
@@ -116,7 +116,7 @@ allocator transition into index lookups, WAL writes, and an index checkpoint. St
 harmless because ExtentPool rejects their generation before payload I/O.
 
 Captured overlay debt is removed at the next ordinary checkpoint by the liveness check described
-above. Older SST debt is removed only as a side effect of work FixedRecordLSM already has to
+above. Older SST debt is removed only as a side effect of work IndexDB already has to
 perform. During a non-trivial compaction, the newest value for each key is decoded and checked
 against the same table. An invalid location is emitted as a tombstone so an older lower-level value
 cannot reappear; bottom-level compaction may omit the tombstone. A trivial move never rewrites an
@@ -130,7 +130,7 @@ eighth is a bounded table-local pinned-Bloom budget; the remainder is a shared e
 Bloom pages become lock-free after their first validated load. The internal split, Bloom shape,
 block format, level topology, and compaction style are fixed policy rather than runtime knobs.
 
-FixedRecordLSM exposes two observation levels:
+IndexDB exposes two observation levels:
 
 - lightweight cumulative table-read counters for foreground reconciliation; and
 - a full explicit snapshot covering database, WAL, cache, and maintenance state.
@@ -173,7 +173,7 @@ boundary.
 This division keeps index validation narrow while preserving the public invariant that every hit
 belongs to the requested complete key.
 
-## Why FixedRecordLSM
+## Why IndexDB
 
 The selected design was compared with the following alternatives:
 
@@ -189,10 +189,10 @@ The selected design was compared with the following alternatives:
 - **Tag plus owner pointer** appeared compact until exact-key validation required another owner
   lookup, coupling index correctness to payload placement and losing the apparent advantage.
 - **Selectable backends** would preserve unvalidated code paths and multiply recovery testing. A
-  materially better implementation must replace FixedRecordLSM behind the narrow boundary rather
+  materially better implementation must replace IndexDB behind the narrow boundary rather
   than become another permanent mode.
 
-FixedRecordLSM is accepted because it bounds recovery by metadata and WAL tail, remains exact under
+IndexDB is accepted because it bounds recovery by metadata and WAL tail, remains exact under
 high churn, integrates without a C++ runtime, and keeps its responsibilities narrow. It does not
 claim to dominate RocksDB on every index-only latency, space, or amplification metric.
 

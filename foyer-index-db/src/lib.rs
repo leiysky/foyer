@@ -10,8 +10,8 @@ mod wal;
 
 pub use self::{
     db::{
-        CompactionFilter, Durability, FixedLsm, FixedLsmMemoryLookup, FixedLsmOptions, FixedLsmReadStats,
-        FixedLsmStats, WriteBatch, WriteOptions,
+        CompactionFilter, Durability, IndexDb, IndexDbMemoryLookup, IndexDbOptions, IndexDbReadStats, IndexDbStats,
+        WriteBatch, WriteOptions,
     },
     error::{Error, Result},
     format::{KEY_SIZE, Key, VALUE_SIZE, Value},

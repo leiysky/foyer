@@ -23,7 +23,7 @@ use crate::{
     },
     model::{CachePriority, EntryKey},
     store::{
-        format::{EntryLocation, ExtentPoolState, ExtentRole, StoreLayout},
+        format::{EntryLocation, ExtentPoolState, StoreLayout},
         io::{IoSchedulerStats, PayloadIoScheduler},
         stats::{ExtentOccupancy, PhysicalWriteStats},
     },
@@ -354,12 +354,11 @@ impl ExtentPool {
                         priority,
                     }));
                 }
-                state.extents[entry_index].role = ExtentRole::Sealed;
                 state.current[priority_index] = None;
                 continue;
             }
 
-            let Some(extent) = state.extents.iter().position(|extent| extent.role == ExtentRole::Free) else {
+            let Some(extent) = state.extents.iter().position(|extent| extent.is_free()) else {
                 return Ok(AllocationResult::ReclaimRequired);
             };
             let extent = u32::try_from(extent).map_err(|_| invalid_state("free extent index does not fit u32"))?;
@@ -373,7 +372,6 @@ impl ExtentPool {
             extent_state.entries = 0;
             extent_state.activation_sequence = activation_sequence;
             extent_state.priority = priority;
-            extent_state.role = ExtentRole::Current;
             state.current[priority_index] = Some(extent);
 
             // Normal allocator transitions are folded into the next coordinated checkpoint.
@@ -422,7 +420,7 @@ impl ExtentPool {
                 if extent.generation != allocation.extent_generation
                     || extent.priority != allocation.priority
                     || extent.used_bytes < allocation.extent_offset.saturating_add(allocation.stored_len)
-                    || !matches!(extent.role, ExtentRole::Current | ExtentRole::Sealed)
+                    || extent.is_free()
                 {
                     return Err(invalid_state("extent allocation is no longer writable"));
                 }
@@ -568,17 +566,19 @@ impl ExtentPool {
         let state = mutex_lock(&self.state);
         let mut candidates = ReclaimCandidates::default();
         for (index, extent) in state.extents.iter().enumerate() {
-            let priority = extent.priority as usize;
-            if matches!(extent.role, ExtentRole::Current | ExtentRole::Sealed) {
-                candidates.occupied_extents[priority] = candidates.occupied_extents[priority].saturating_add(1);
+            if extent.is_free() {
+                continue;
             }
-            let target = match extent.role {
-                ExtentRole::Current => &mut candidates.current[priority],
-                ExtentRole::Sealed => &mut candidates.sealed[priority],
-                _ => continue,
+            let priority = extent.priority as usize;
+            candidates.occupied_extents[priority] = candidates.occupied_extents[priority].saturating_add(1);
+            let extent_index = u32::try_from(index).expect("extent index must fit u32");
+            let target = if state.current[priority] == Some(extent_index) {
+                &mut candidates.current[priority]
+            } else {
+                &mut candidates.sealed[priority]
             };
             let victim = ExtentVictim {
-                extent: u32::try_from(index).expect("extent index must fit u32"),
+                extent: extent_index,
                 generation: extent.generation,
                 used_bytes: extent.used_bytes,
                 entries: extent.entries,
@@ -600,7 +600,7 @@ impl ExtentPool {
         let mut used_entries = [0u64; 3];
         let mut used_bytes = [0u64; 3];
         for extent in &state.extents {
-            if !matches!(extent.role, ExtentRole::Current | ExtentRole::Sealed) {
+            if extent.is_free() {
                 continue;
             }
             let priority = extent.priority as usize;
@@ -626,7 +626,7 @@ impl ExtentPool {
             .copied()
             .ok_or_else(|| invalid_state("current reclaim victim is out of range"))?;
         let priority = usize::from(victim.priority.to_byte());
-        if extent.role != ExtentRole::Current
+        if extent.is_free()
             || extent.generation != victim.generation
             || extent.used_bytes != victim.used_bytes
             || extent.entries != victim.entries
@@ -636,7 +636,6 @@ impl ExtentPool {
         {
             return Err(invalid_state("current reclaim victim changed before seal"));
         }
-        state.extents[victim.extent as usize].role = ExtentRole::Sealed;
         state.current[priority] = None;
         Ok(victim)
     }
@@ -644,10 +643,14 @@ impl ExtentPool {
     pub fn release(&self, victim: ExtentVictim) -> Result<()> {
         let mut state = mutex_lock(&self.state);
         let extent = &state.extents[victim.extent as usize];
-        if extent.role != ExtentRole::Sealed
+        let priority = usize::from(extent.priority.to_byte());
+        if extent.is_free()
+            || state.current[priority] == Some(victim.extent)
             || extent.generation != victim.generation
             || extent.used_bytes != victim.used_bytes
             || extent.entries != victim.entries
+            || extent.priority != victim.priority
+            || extent.activation_sequence != victim.activation_sequence
         {
             return Err(invalid_state("extent victim changed during reclamation"));
         }
@@ -661,7 +664,6 @@ impl ExtentPool {
         extent.entries = 0;
         extent.activation_sequence = 0;
         extent.priority = CachePriority::Low;
-        extent.role = ExtentRole::Free;
         self.persist_state_locked(&mut next)?;
         *state = next;
         self.publish_liveness(victim.extent, state.extents[victim.extent as usize]);

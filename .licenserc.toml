@@ -1,7 +1,7 @@
 headerPath = "Apache-2.0.txt"
 
 includes = ['**/*.rs']
-excludes = ['foyer-extent/**/*.rs', 'foyer-fixed-lsm/**/*.rs']
+excludes = ['foyer-extent/**/*.rs', 'foyer-index-db/**/*.rs']
 
 [properties]
 copyrightOwner = "foyer Project Authors"

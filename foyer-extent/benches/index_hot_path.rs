@@ -11,9 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use fixed_lsm::{FixedLsm, FixedLsmOptions, Key};
 use foyer::DefaultHasher;
 use foyer_storage::test_utils::BenchBlockIndexer;
+use index_db::{IndexDb, IndexDbOptions, Key};
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
@@ -26,16 +26,16 @@ type AnyResult<T> = Result<T, Box<dyn Error>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EngineKind {
-    Fixed,
+    IndexDb,
     Memory,
 }
 
 impl EngineKind {
     fn from_env() -> AnyResult<Self> {
         match env::var("INDEX_BENCH_ENGINE") {
-            Ok(value) if value == "fixed" => Ok(Self::Fixed),
+            Ok(value) if value == "index-db" => Ok(Self::IndexDb),
             Ok(value) if value == "memory" => Ok(Self::Memory),
-            Ok(_) => Err(invalid("INDEX_BENCH_ENGINE accepts fixed or memory").into()),
+            Ok(_) => Err(invalid("INDEX_BENCH_ENGINE accepts index-db or memory").into()),
             Err(env::VarError::NotPresent) => Err(invalid("INDEX_BENCH_ENGINE must be set").into()),
             Err(error) => Err(error.into()),
         }
@@ -43,7 +43,7 @@ impl EngineKind {
 
     const fn label(self) -> &'static str {
         match self {
-            Self::Fixed => "fixed",
+            Self::IndexDb => "index-db",
             Self::Memory => "memory",
         }
     }
@@ -76,8 +76,8 @@ impl Config {
             return Err(invalid("INDEX_BENCH_CONCURRENCY must be positive").into());
         }
         let path = env::var_os("INDEX_BENCH_PATH").map(PathBuf::from);
-        if engine == EngineKind::Fixed && path.is_none() {
-            return Err(invalid("INDEX_BENCH_PATH is required for the fixed engine").into());
+        if engine == EngineKind::IndexDb && path.is_none() {
+            return Err(invalid("INDEX_BENCH_PATH is required for IndexDB").into());
         }
         Ok(Self {
             engine,
@@ -95,29 +95,29 @@ impl Config {
 
 #[derive(Debug, Clone, Copy)]
 struct Query {
-    fixed: Key,
+    index_key: Key,
     memory: u64,
 }
 
 #[derive(Debug)]
 enum BenchIndex {
-    Fixed(FixedLsm),
+    IndexDb(IndexDb),
     Memory(BenchBlockIndexer),
 }
 
 impl BenchIndex {
     fn open(config: &Config) -> AnyResult<Self> {
         match config.engine {
-            EngineKind::Fixed => {
-                let database = FixedLsm::open(
+            EngineKind::IndexDb => {
+                let database = IndexDb::open(
                     config.path.as_ref().unwrap(),
-                    FixedLsmOptions {
+                    IndexDbOptions {
                         write_buffer_capacity: 64 * MIB,
                         cache_capacity: config.cache_capacity,
                         max_disk_bytes: u64::MAX,
                     },
                 )?;
-                Ok(Self::Fixed(database))
+                Ok(Self::IndexDb(database))
             }
             EngineKind::Memory => {
                 let indexer = BenchBlockIndexer::new(config.concurrency.next_power_of_two());
@@ -139,16 +139,16 @@ impl BenchIndex {
     #[inline]
     fn get(&self, query: Query) -> bool {
         match self {
-            Self::Fixed(database) => database
-                .get(&query.fixed)
-                .expect("fixed-lsm lookup must succeed")
+            Self::IndexDb(database) => database
+                .get(&query.index_key)
+                .expect("IndexDB lookup must succeed")
                 .is_some(),
             Self::Memory(indexer) => indexer.contains(query.memory),
         }
     }
 
     fn print_stats(&self) {
-        if let Self::Fixed(database) = self {
+        if let Self::IndexDb(database) = self {
             let stats = database.stats();
             println!(
                 "phase=index_stats level_files={:?} base_level={} cache_hits={} cache_misses={} cache_resident_mib={:.1} cache_data_mib={:.1} cache_metadata_mib={:.1} table_read_ops={} table_read_mib={:.1} filter_checks={} filter_positives={} data_cache_hits={} data_reads={}",
@@ -313,10 +313,10 @@ fn build_queries(hotset: u64) -> Vec<Query> {
         .map(|index| {
             let key = make_key(index, KEY_SIZES[index as usize % KEY_SIZES.len()]);
             let digest = blake3::hash(&key);
-            let mut fixed = [0; fixed_lsm::KEY_SIZE];
-            fixed.copy_from_slice(&digest.as_bytes()[..fixed_lsm::KEY_SIZE]);
+            let mut index_key = [0; index_db::KEY_SIZE];
+            index_key.copy_from_slice(&digest.as_bytes()[..index_db::KEY_SIZE]);
             Query {
-                fixed,
+                index_key,
                 memory: hasher.hash_one(&key),
             }
         })

@@ -8,7 +8,7 @@ use foyer::{
     BlockEngineConfig, DeviceBuilder, EngineConfig, FsDeviceBuilder, Hint, HybridCache, HybridCachePolicy,
     HybridCacheProperties, PsyncIoEngineConfig, RecoverMode,
 };
-use foyer_extent::{Cache, CachePriority, EngineValue, Entry, ExtentEngineConfig};
+use foyer_extent::{Cache, CachePriority, EngineValue, Entry, ExtentEngineConfig, ExtentEngineTestTuning};
 
 const PAGE_SIZE: usize = 4 * 1024;
 const DISK_CAPACITY: usize = 16 * 1024 * 1024;
@@ -24,29 +24,35 @@ enum DiskEngine {
 
 fn engine_config(path: &std::path::Path) -> ExtentEngineConfig {
     ExtentEngineConfig::new(path, DISK_CAPACITY as u64)
-        .with_test_layout(PAGE_SIZE, PAGE_SIZE * 8)
-        .with_read_run_size(PAGE_SIZE)
-        .with_write_run_size(PAGE_SIZE * 8)
-        .with_index_write_buffer_size(PAGE_SIZE * 16)
+        .with_test_tuning(ExtentEngineTestTuning {
+            layout: Some((PAGE_SIZE, PAGE_SIZE * 8)),
+            read_run_size: Some(PAGE_SIZE),
+            write_run_size: Some(PAGE_SIZE * 8),
+            index_write_buffer_size: Some(PAGE_SIZE * 16),
+            checkpoint_bytes: Some(8),
+            queue_capacity_bytes: Some(1024 * 1024),
+            queue_capacity_entries: Some(128),
+            write_batch_bytes: Some(128 * 1024),
+            write_batch_entries: Some(32),
+            ..Default::default()
+        })
         .with_index_cache_size(1024 * 1024)
-        .with_checkpoint_bytes(8)
-        .with_queue_capacity_bytes(1024 * 1024)
-        .with_queue_capacity_entries(128)
-        .with_write_batch_bytes(128 * 1024)
-        .with_write_batch_entries(32)
 }
 
 fn close_flush_engine_config(path: &Path) -> ExtentEngineConfig {
     ExtentEngineConfig::new(path, 32 * 1024 * 1024)
-        .with_test_layout(PAGE_SIZE, PAGE_SIZE * 8)
-        .with_read_run_size(PAGE_SIZE)
-        .with_write_run_size(PAGE_SIZE * 8)
-        .with_index_write_buffer_size(PAGE_SIZE * 16)
+        .with_test_tuning(ExtentEngineTestTuning {
+            layout: Some((PAGE_SIZE, PAGE_SIZE * 8)),
+            read_run_size: Some(PAGE_SIZE),
+            write_run_size: Some(PAGE_SIZE * 8),
+            index_write_buffer_size: Some(PAGE_SIZE * 16),
+            queue_capacity_bytes: Some(8 * 1024 * 1024),
+            queue_capacity_entries: Some(256),
+            write_batch_bytes: Some(PAGE_SIZE),
+            write_batch_entries: Some(1),
+            ..Default::default()
+        })
         .with_index_cache_size(1024 * 1024)
-        .with_queue_capacity_bytes(8 * 1024 * 1024)
-        .with_queue_capacity_entries(256)
-        .with_write_batch_bytes(PAGE_SIZE)
-        .with_write_batch_entries(1)
 }
 
 fn block_engine_config(path: &Path) -> Box<dyn EngineConfig<Bytes, EngineValue, HybridCacheProperties>> {
@@ -302,9 +308,12 @@ async fn extent_reports_complete_physical_write_statistics_to_foyer() {
 #[tokio::test]
 async fn periodic_checkpoint_bounds_the_recovery_frontier() {
     let directory = tempfile::tempdir().unwrap();
-    let config = engine_config(&directory.path().join("periodic-checkpoint"))
-        .with_checkpoint_bytes(usize::MAX)
-        .with_checkpoint_interval(Duration::from_millis(20));
+    let config =
+        engine_config(&directory.path().join("periodic-checkpoint")).with_test_tuning(ExtentEngineTestTuning {
+            checkpoint_bytes: Some(usize::MAX),
+            checkpoint_interval: Some(Duration::from_millis(20)),
+            ..Default::default()
+        });
     let handle = config.handle();
     let cache = Cache::builder(MEMORY_CAPACITY, config)
         .with_recover_mode(RecoverMode::None)

@@ -1,7 +1,7 @@
 # foyer-extent
 
 The `foyer-extent` package provides `ExtentEngine`, a Foyer disk engine backed by `ExtentStore` and
-FixedRecordLSM. The project name comes from the cache extent: the fixed-size append, seal,
+IndexDB. The project name comes from the cache extent: the fixed-size append, seal,
 generation, and reclaim unit owned by `ExtentPool`.
 
 The public cache object is `Entry`: a complete variable-length opaque key of at most 1 KiB, a
@@ -12,16 +12,16 @@ publication, and checkpoint coordination; its concrete `Reclaimer` owns allocati
 generation-reuse fencing, and priority-aware reclaim.
 
 The balanced engine defaults use a 256 MiB submission budget, 128 MiB idle write batches, an 8 MiB
-write batch while reads are active, and a one-second periodic checkpoint request in addition to
+write batch while reads are active, and a 30-second periodic checkpoint request in addition to
 the 256 MiB published-byte trigger. High and normal priorities have borrowable 10% and 70% logical
 extent capacity floors; low priority uses unprotected capacity. Durable-index and payload reads use
-independent hard, non-waiting `2 * available_parallelism` admission limits. The synchronous payload
-I/O scheduler gives an active entry-payload read a bounded 2 ms head start over newly admitted
-writes; reads never wait behind writes, and
+independent hard, non-waiting `min(2 * available_parallelism, 64)` admission limits. The synchronous
+payload I/O scheduler gives an active entry-payload read a bounded 2 ms head start over newly
+admitted writes; reads never wait behind writes, and
 writes proceed after the bound so sustained reads cannot starve publication. This is a cooperative
 admission layer: reads, syncs, and default single-concurrency writes execute on the calling thread;
 parallel-write configurations use one persistent bounded pool rather than per-batch OS threads.
-No io_uring dependency is involved. Set the read-priority duration to zero for a full runtime bypass.
+No io_uring dependency is involved.
 
 Low- and normal-priority writes are progressively shed before the queue is full, with earlier
 shedding while reads are active; high-priority puts retain the hard queue budget. Puts and deletes
@@ -50,11 +50,11 @@ The Foyer-facing queue, pipeline, and recovery state is also exported through it
 `foyer_storage_engine_recovery_total`, and `foyer_storage_engine_healthy`. Queue gauges are updated
 at reservation ownership changes; the worker refreshes checkpoint frontiers on every batch and
 periodic checkpoint tick. `storage_usage()` is an O(1) snapshot over a fixed file set: it combines
-allocated blocks for the preallocated data/state files with FixedRecordLSM's atomic disk-budget
+allocated blocks for the preallocated data/state files with IndexDB's atomic disk-budget
 counter.
 The shared physical-I/O counters include both payload and index reads, including reads that finish
 as a validated cache miss, and all payload, checkpoint, and index writes. Index counters split WAL,
-SST, and manifest writes/syncs and report flush and compaction bytes. Cumulative FixedRecordLSM
+SST, and manifest writes/syncs and report flush and compaction bytes. Cumulative IndexDB
 counters are reconciled exactly once so concurrent lookups cannot double-count index I/O.
 
 Stored Entries occupy contiguous byte ranges packed within cache extents. Adjacent allocations in
@@ -72,9 +72,12 @@ derivation, record encoding, or an incompatible embedded-index format after the 
 freeze requires an `EXTENT_FORMAT_VERSION` bump. Before that freeze, Format 1 may be replaced in
 place and development cache images remain expendable.
 Layout overrides remain available only as a test and benchmark escape hatch. Runtime I/O, queue,
-batching, checkpoint, priority-floor, and index-memory settings can change across reopens.
+batching, checkpoint, priority-floor, and index-memory settings can change across reopens. The
+production builder exposes only operational policy: direct I/O, index-cache and read-admission
+budgets, priority floors, and the engine throttle. Implementation-level queue, batching, write-run,
+and checkpoint overrides are grouped under the explicitly non-production test tuning object.
 
-The durable exact index is the workspace-private `foyer-fixed-lsm` crate. RocksDB support is gated
+The durable exact index is the workspace-private `foyer-index-db` crate. RocksDB support is gated
 behind the `rocksdb-benchmark` feature and exists only as an industrial comparison point.
 
 `foyer-extent` must be resolved with `foyer` from the same fork revision. A compile-time
@@ -109,7 +112,7 @@ Design documentation is organized by boundary:
   lifecycle, and observability;
 - [`docs/extent-store.md`](docs/extent-store.md) — stable format 1 physical layout, checkpoint, reclaim, and
   failure model; and
-- [`docs/entry-index.md`](docs/entry-index.md) — overlays, FixedRecordLSM, recovery, and index-space
+- [`docs/entry-index.md`](docs/entry-index.md) — overlays, IndexDB, recovery, and index-space
   accounting.
 
 [`docs/foyer-engine-benchmark.md`](docs/foyer-engine-benchmark.md) defines the BlockEngine

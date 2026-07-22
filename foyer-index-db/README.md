@@ -1,6 +1,6 @@
-# FixedRecordLSM
+# IndexDB
 
-`foyer-fixed-lsm` is the specialized durable index for Extent's `ExtentStore`. It is deliberately
+`foyer-index-db` is the specialized durable index for Extent's `ExtentStore`. It is deliberately
 not a general-purpose key/value database. Its performance and operational reference is RocksDB under
 Extent's exact 24-byte key, 32-byte location, high-churn point-lookup workload.
 
@@ -76,7 +76,7 @@ levels remain empty. This is one static dynamic-level policy, not a user-selecta
 ## ExtentStore integration
 
 The ExtentStore adapter keeps an active mutation overlay and at most one immutable frozen overlay in
-front of `FixedLsm`. Reads check active, frozen, and durable state in that order. Retiring a
+front of `IndexDb`. Reads check active, frozen, and durable state in that order. Retiring a
 persisted frozen overlay increments a base revision; a durable lookup rechecks the overlays and
 revision after I/O so a concurrent checkpoint cannot expose a stale base result. Ordinary active
 mutations are caught by the overlay recheck without invalidating unrelated reads.
@@ -93,7 +93,7 @@ location into a tombstone, and lets bottom-level compaction drop it. Trivial mov
 metadata-only, so garbage collection never schedules extra SST I/O.
 
 ExtentPool remains an ordinary physical payload store. It neither exposes range semantics to the index
-nor derives its payload layout from an index file. FixedRecordLSM is the sole EntryIndex backend;
+nor derives its payload layout from an index file. IndexDB is the sole EntryIndex backend;
 RocksDB is retained only as an isolated benchmark reference.
 
 ## Measured evidence
@@ -101,7 +101,7 @@ RocksDB is retained only as an isolated benchmark reference.
 The matched 100M-entry tests used RocksDB 10.4.2 as the industrial reference, buffered I/O, a
 512 MiB metadata-cache budget, and four clients on the two-core i8g.large instance-store SSD.
 
-| Workload | FixedRecordLSM | RocksDB | FixedRecordLSM result |
+| Workload | IndexDB | RocksDB | IndexDB result |
 | --- | ---: | ---: | ---: |
 | Uniform 50/50 mixed throughput | 0.272 Mops/s | 0.228 Mops/s | +19% |
 | 90%/1% hot-set mixed throughput | 0.586 Mops/s | 0.438 Mops/s | +34% |

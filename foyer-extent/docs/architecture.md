@@ -36,7 +36,7 @@ Cache API
   -> Foyer integration
     -> ExtentStore
       -> ExtentPool + EntryIndex
-        -> files + FixedRecordLSM
+        -> files + IndexDB
 ```
 
 1. **Cache API** — `Cache`, `CacheBuilder`, `Entry`, and `CachePriority` define the best-effort blob
@@ -47,7 +47,7 @@ Cache API
 3. **ExtentStore** — owns ordered disk publication, checkpoint frontiers, EntryIndex coordination,
    and invocation of the concrete Reclaimer.
 4. **Persistence** — `ExtentPool` owns the payload and allocator files. `EntryIndex` owns
-   digest-to-location lookup through FixedRecordLSM.
+   digest-to-location lookup through IndexDB.
    Neither component knows about public API semantics or application key structure.
 
 These are concrete module boundaries rather than interchangeable backend traits. A new abstraction
@@ -88,7 +88,7 @@ recovery to discard the uncheckpointed tail without a per-Entry ownership sideca
 
 ### Keep the durable index narrow
 
-FixedRecordLSM implements only the fixed-record point-index features Extent needs. Its recovery
+IndexDB implements only the fixed-record point-index features Extent needs. Its recovery
 opens manifests, fence summaries, and a bounded WAL tail; it does not scan payload data or rebuild a
 full live map. The index capacity value is a soft planning target, while usage accounting remains
 exact. Checkpoint capture tombstones stale overlay locations; older SST debt is discarded only when
@@ -121,7 +121,7 @@ every hit must pass location, generation, value-content-digest, and complete-key
 ## Compatibility policy
 
 The disk format is versioned as one layout: payload representation, allocator state, and
-FixedRecordLSM compatibility move together. Format 1 may be replaced in place before its first
+IndexDB compatibility move together. Format 1 may be replaced in place before its first
 production freeze because development cache images are expendable. After that freeze, an
 incompatible change advances `EXTENT_FORMAT_VERSION`; Extent rejects the old cache and may recreate
 it because the authoritative copy remains outside the cache. The family magic and format number
@@ -138,12 +138,9 @@ the workspace-pinned Foyer fork are upgraded together.
   and observability.
 - [ExtentStore design](extent-store.md) — stable format 1 physical layout, checkpoint, reclaim, and failure
   model.
-- [EntryIndex design](entry-index.md) — overlays, FixedRecordLSM, recovery, accounting, and rejected
+- [EntryIndex design](entry-index.md) — overlays, IndexDB, recovery, accounting, and rejected
   index shapes.
 - [Foyer engine benchmark](foyer-engine-benchmark.md) — reproducible validation procedure.
-
-`CONTEXT.md` is the domain-language design for these documents. It defines the stable terms and
-discouraged aliases used to keep ownership boundaries explicit.
 
 ## Deliberate non-goals
 

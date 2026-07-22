@@ -12,7 +12,7 @@ use crate::{
     },
 };
 
-const WAL_MAGIC: [u8; 8] = *b"FXLSMW02";
+const WAL_MAGIC: [u8; 8] = *b"IDXDBW02";
 const FORMAT_VERSION: u32 = 2;
 const HEADER_SIZE: usize = 48;
 const PAYLOAD_CHECKSUM_OFFSET: usize = 40;

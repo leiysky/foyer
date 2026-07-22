@@ -48,11 +48,44 @@ const DEFAULT_WRITE_BATCH_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_WRITE_BATCH_ENTRIES: usize = 4_096;
 const DEFAULT_READ_BUSY_WRITE_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_WRITE_BATCH_DELAY: Duration = Duration::ZERO;
-const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
+const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
+const MAX_DEFAULT_READ_CONCURRENCY: usize = 64;
 const OPEN: u8 = 0;
 const CLOSING: u8 = 1;
 const CLOSED: u8 = 2;
 type ExtentPiece = PieceRef<Bytes, EngineValue, HybridCacheProperties>;
+
+/// Low-level overrides reserved for tests and benchmarks.
+///
+/// These values are intentionally kept out of the production builder surface. They describe
+/// implementation details rather than stable operational policy and may change without notice.
+#[doc(hidden)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ExtentEngineTestTuning {
+    pub layout: Option<(usize, usize)>,
+    pub write_concurrency: Option<usize>,
+    pub io_read_priority_duration: Option<Duration>,
+    pub read_run_size: Option<usize>,
+    pub write_run_size: Option<usize>,
+    pub index_write_buffer_size: Option<usize>,
+    pub checkpoint_bytes: Option<usize>,
+    pub checkpoint_interval: Option<Duration>,
+    pub queue_capacity_bytes: Option<usize>,
+    pub queue_capacity_entries: Option<usize>,
+    pub write_batch_bytes: Option<usize>,
+    pub write_batch_entries: Option<usize>,
+    pub read_busy_write_batch_bytes: Option<usize>,
+    pub write_batch_delay: Option<Duration>,
+}
+
+fn default_read_concurrency() -> usize {
+    let parallelism = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    default_read_concurrency_for(parallelism)
+}
+
+fn default_read_concurrency_for(parallelism: usize) -> usize {
+    parallelism.saturating_mul(2).clamp(1, MAX_DEFAULT_READ_CONCURRENCY)
+}
 
 /// Configuration for installing Extent as a Foyer disk engine.
 ///
@@ -87,69 +120,65 @@ impl ExtentEngineConfig {
             write_batch_entries: DEFAULT_WRITE_BATCH_ENTRIES,
             read_busy_write_batch_bytes: DEFAULT_READ_BUSY_WRITE_BATCH_BYTES,
             write_batch_delay: DEFAULT_WRITE_BATCH_DELAY,
-            read_concurrency: std::thread::available_parallelism()
-                .map_or(2, |parallelism| parallelism.get().saturating_mul(2)),
+            read_concurrency: default_read_concurrency(),
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
             throttle: Throttle::default(),
             handle: ExtentEngineHandle::default(),
         }
     }
 
-    /// Override the format-owned layout for tests and benchmarks.
-    ///
-    /// Production integrations must use the balanced layout selected by [`Self::new`].
+    /// Apply low-level overrides for a test or benchmark.
     #[doc(hidden)]
-    pub fn with_test_layout(mut self, entry_charge: usize, extent_size: usize) -> Self {
-        self.store.entry_charge = entry_charge;
-        self.store.options.extent_size = extent_size;
+    pub fn with_test_tuning(mut self, tuning: ExtentEngineTestTuning) -> Self {
+        if let Some((entry_charge, extent_size)) = tuning.layout {
+            self.store.entry_charge = entry_charge;
+            self.store.options.extent_size = extent_size;
+        }
+        if let Some(value) = tuning.write_concurrency {
+            self.store.options.write_concurrency = value;
+        }
+        if let Some(value) = tuning.io_read_priority_duration {
+            self.store.options.io_read_priority_duration = value;
+        }
+        if let Some(value) = tuning.read_run_size {
+            self.store.options.read_run_size = value;
+        }
+        if let Some(value) = tuning.write_run_size {
+            self.store.options.write_run_size = value;
+        }
+        if let Some(value) = tuning.index_write_buffer_size {
+            self.store.options.index_write_buffer_size = value;
+        }
+        if let Some(value) = tuning.checkpoint_bytes {
+            self.store.options.checkpoint_bytes = value;
+        }
+        if let Some(value) = tuning.checkpoint_interval {
+            self.checkpoint_interval = value;
+        }
+        if let Some(value) = tuning.queue_capacity_bytes {
+            self.queue_capacity_bytes = value;
+        }
+        if let Some(value) = tuning.queue_capacity_entries {
+            self.queue_capacity_entries = value;
+        }
+        if let Some(value) = tuning.write_batch_bytes {
+            self.write_batch_bytes = value;
+        }
+        if let Some(value) = tuning.write_batch_entries {
+            self.write_batch_entries = value;
+        }
+        if let Some(value) = tuning.read_busy_write_batch_bytes {
+            self.read_busy_write_batch_bytes = value;
+        }
+        if let Some(value) = tuning.write_batch_delay {
+            self.write_batch_delay = value;
+        }
         self
     }
 
-    /// Set the number of concurrent data-file write runs.
-    pub fn with_write_concurrency(mut self, concurrency: usize) -> Self {
-        self.store.options.write_concurrency = concurrency;
-        self
-    }
-
-    /// Set how long physical writes yield to continuously active payload reads.
-    pub fn with_io_read_priority_duration(mut self, duration: Duration) -> Self {
-        self.store.options.io_read_priority_duration = duration;
-        self
-    }
-
-    /// Bound one coalesced data read without changing the persistent layout.
-    pub fn with_read_run_size(mut self, bytes: usize) -> Self {
-        self.store.options.read_run_size = bytes;
-        self
-    }
-
-    /// Bound one coalesced data write without changing the persistent layout.
-    pub fn with_write_run_size(mut self, bytes: usize) -> Self {
-        self.store.options.write_run_size = bytes;
-        self
-    }
-
-    /// Set the FixedRecordLSM mutable write-buffer budget.
-    pub fn with_index_write_buffer_size(mut self, bytes: usize) -> Self {
-        self.store.options.index_write_buffer_size = bytes;
-        self
-    }
-
-    /// Set the FixedRecordLSM index page-cache budget.
+    /// Set the IndexDB index page-cache budget.
     pub fn with_index_cache_size(mut self, bytes: usize) -> Self {
         self.store.options.index_cache_size = bytes;
-        self
-    }
-
-    /// Set the published Stored Entry byte budget between background checkpoint requests.
-    pub fn with_checkpoint_bytes(mut self, bytes: usize) -> Self {
-        self.store.options.checkpoint_bytes = bytes;
-        self
-    }
-
-    /// Set the maximum interval between metadata checkpoint requests.
-    pub fn with_checkpoint_interval(mut self, interval: Duration) -> Self {
-        self.checkpoint_interval = interval;
         self
     }
 
@@ -166,46 +195,6 @@ impl ExtentEngineConfig {
     /// Select direct data-file I/O on supported Linux filesystems.
     pub fn with_direct_io(mut self, direct_io: bool) -> Self {
         self.store.options.direct_io = direct_io;
-        self
-    }
-
-    /// Set the hard byte limit for queued and currently flushing commands.
-    pub fn with_queue_capacity_bytes(mut self, capacity: usize) -> Self {
-        self.queue_capacity_bytes = capacity;
-        self
-    }
-
-    /// Set the hard entry limit for queued and currently flushing commands.
-    pub fn with_queue_capacity_entries(mut self, capacity: usize) -> Self {
-        self.queue_capacity_entries = capacity;
-        self
-    }
-
-    /// Set the target logical bytes collected into one storage batch.
-    ///
-    /// A single entry larger than this target is still written as one batch.
-    pub fn with_write_batch_bytes(mut self, bytes: usize) -> Self {
-        self.write_batch_bytes = bytes;
-        self
-    }
-
-    /// Set the maximum number of commands collected into one storage batch.
-    pub fn with_write_batch_entries(mut self, entries: usize) -> Self {
-        self.write_batch_entries = entries;
-        self
-    }
-
-    /// Bound a write batch while physical reads are active.
-    pub fn with_read_busy_write_batch_bytes(mut self, bytes: usize) -> Self {
-        self.read_busy_write_batch_bytes = bytes;
-        self
-    }
-
-    /// Wait briefly after the first queued command so sparse arrivals can share page-aligned data
-    /// write runs. Durability is grouped independently by checkpoints. A zero duration restores
-    /// immediate draining.
-    pub fn with_write_batch_delay(mut self, delay: Duration) -> Self {
-        self.write_batch_delay = delay;
         self
     }
 
@@ -910,15 +899,30 @@ mod tests {
 
     type TestCache = HybridCache<Bytes, EngineValue>;
 
+    fn test_tuning() -> ExtentEngineTestTuning {
+        ExtentEngineTestTuning {
+            layout: Some((4 * 1024, 32 * 1024)),
+            index_write_buffer_size: Some(64 * 1024),
+            queue_capacity_bytes: Some(1024 * 1024),
+            queue_capacity_entries: Some(128),
+            write_batch_bytes: Some(128 * 1024),
+            write_batch_entries: Some(32),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn default_read_concurrency_scales_but_stays_bounded() {
+        assert_eq!(default_read_concurrency_for(1), 2);
+        assert_eq!(default_read_concurrency_for(16), 32);
+        assert_eq!(default_read_concurrency_for(32), MAX_DEFAULT_READ_CONCURRENCY);
+        assert_eq!(default_read_concurrency_for(128), MAX_DEFAULT_READ_CONCURRENCY);
+    }
+
     async fn cache(path: &std::path::Path) -> (TestCache, ExtentEngineHandle) {
         let config = ExtentEngineConfig::new(path, 16 * 1024 * 1024)
-            .with_test_layout(4 * 1024, 32 * 1024)
-            .with_index_write_buffer_size(64 * 1024)
-            .with_index_cache_size(1024 * 1024)
-            .with_queue_capacity_bytes(1024 * 1024)
-            .with_queue_capacity_entries(128)
-            .with_write_batch_bytes(128 * 1024)
-            .with_write_batch_entries(32);
+            .with_test_tuning(test_tuning())
+            .with_index_cache_size(1024 * 1024);
         let handle = config.handle();
         let cache = HybridCache::builder()
             .with_name("extent-fault-injection")
@@ -983,14 +987,11 @@ mod tests {
     async fn write_batch_delay_coalesces_sparse_arrivals_into_one_data_batch() {
         let directory = tempfile::tempdir().unwrap();
         let config = ExtentEngineConfig::new(directory.path(), 16 * 1024 * 1024)
-            .with_test_layout(4 * 1024, 32 * 1024)
-            .with_index_write_buffer_size(64 * 1024)
-            .with_index_cache_size(1024 * 1024)
-            .with_queue_capacity_bytes(1024 * 1024)
-            .with_queue_capacity_entries(128)
-            .with_write_batch_bytes(128 * 1024)
-            .with_write_batch_entries(32)
-            .with_write_batch_delay(Duration::from_millis(250));
+            .with_test_tuning(ExtentEngineTestTuning {
+                write_batch_delay: Some(Duration::from_millis(250)),
+                ..test_tuning()
+            })
+            .with_index_cache_size(1024 * 1024);
         let handle = config.handle();
         let cache = HybridCache::builder()
             .with_name("extent-sparse-write-batch")
@@ -1022,14 +1023,11 @@ mod tests {
     async fn mixed_batch_persists_only_the_last_command_per_key() {
         let directory = tempfile::tempdir().unwrap();
         let config = ExtentEngineConfig::new(directory.path(), 16 * 1024 * 1024)
-            .with_test_layout(4 * 1024, 32 * 1024)
-            .with_index_write_buffer_size(64 * 1024)
-            .with_index_cache_size(1024 * 1024)
-            .with_queue_capacity_bytes(1024 * 1024)
-            .with_queue_capacity_entries(128)
-            .with_write_batch_bytes(128 * 1024)
-            .with_write_batch_entries(32)
-            .with_write_batch_delay(Duration::from_millis(250));
+            .with_test_tuning(ExtentEngineTestTuning {
+                write_batch_delay: Some(Duration::from_millis(250)),
+                ..test_tuning()
+            })
+            .with_index_cache_size(1024 * 1024);
         let store_config = config.store;
         let handle = config.handle();
         let cache = HybridCache::builder()
@@ -1096,13 +1094,12 @@ mod tests {
     async fn close_discards_only_unstarted_commands_and_leaves_a_recoverable_prefix() {
         let directory = tempfile::tempdir().unwrap();
         let config = ExtentEngineConfig::new(directory.path(), 16 * 1024 * 1024)
-            .with_test_layout(4 * 1024, 32 * 1024)
-            .with_index_write_buffer_size(64 * 1024)
+            .with_test_tuning(ExtentEngineTestTuning {
+                write_batch_bytes: Some(8 * 1024),
+                write_batch_entries: Some(1),
+                ..test_tuning()
+            })
             .with_index_cache_size(1024 * 1024)
-            .with_queue_capacity_bytes(1024 * 1024)
-            .with_queue_capacity_entries(128)
-            .with_write_batch_bytes(8 * 1024)
-            .with_write_batch_entries(1)
             .with_throttle(Throttle::new().with_write_throughput(1));
         let store_config = config.store;
         let handle = config.handle();

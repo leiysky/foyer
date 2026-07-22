@@ -52,7 +52,7 @@ impl DiskBudget {
         let result = self
             .used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| used.checked_sub(bytes));
-        assert!(result.is_ok(), "fixed-lsm disk budget release underflow");
+        assert!(result.is_ok(), "IndexDB disk budget release underflow");
     }
 }
 
