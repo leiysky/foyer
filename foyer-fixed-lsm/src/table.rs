@@ -42,6 +42,7 @@ pub struct TableIoStats {
     pub read_bytes: u64,
     pub write_operations: u64,
     pub write_bytes: u64,
+    pub sync_operations: u64,
     pub point_data_reads: u64,
     pub point_false_positives: u64,
 }
@@ -62,10 +63,15 @@ impl TableIoCounters {
         stats.read_bytes = stats.read_bytes.saturating_add(bytes as u64);
     }
 
-    fn record_write(&self, bytes: u64) {
+    fn record_write(&self, bytes: usize) {
         let mut stats = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         stats.write_operations = stats.write_operations.saturating_add(1);
-        stats.write_bytes = stats.write_bytes.saturating_add(bytes);
+        stats.write_bytes = stats.write_bytes.saturating_add(bytes as u64);
+    }
+
+    fn record_sync(&self) {
+        let mut stats = self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        stats.sync_operations = stats.sync_operations.saturating_add(1);
     }
 
     fn record_point_data_read(&self) {
@@ -119,7 +125,7 @@ impl Table {
         validate_records(directory, records)?;
         let final_path = table_path(directory, file_id);
         let temporary_path = temporary_table_path(directory, file_id);
-        let result = write_table(&temporary_path, file_id, level, records);
+        let result = write_table(&temporary_path, file_id, level, records, io.as_ref());
         let written = match result {
             Ok(written) => written,
             Err(error) => {
@@ -129,7 +135,6 @@ impl Table {
         };
         fs::rename(&temporary_path, &final_path).map_err(|error| Error::io("publish SST file", error))?;
         sync_directory(directory)?;
-        io.record_write(written.meta.file_size);
         let file = File::open(&final_path).map_err(|error| Error::io("open new SST file", error))?;
         let fence_pages = fence_page_slots(written.top_fences.len());
         let filter_pages = filter_page_slots(written.meta.block_count);
@@ -145,6 +150,16 @@ impl Table {
             cache,
             io,
         }))
+    }
+
+    pub(crate) fn advise_sequential(&self) {
+        #[cfg(target_os = "linux")]
+        let _ = rustix::fs::fadvise(&self.file, 0, None, rustix::fs::Advice::Sequential);
+    }
+
+    pub(crate) fn advise_dont_need(&self) {
+        #[cfg(target_os = "linux")]
+        let _ = rustix::fs::fadvise(&self.file, 0, None, rustix::fs::Advice::DontNeed);
     }
 
     pub fn open(
@@ -421,13 +436,19 @@ pub fn table_file_size(record_count: usize) -> Option<u64> {
     checked_align_up(filters_offset.checked_add(filter_page_bytes)?, ALIGNMENT)?.checked_add(TABLE_FOOTER_SIZE as u64)
 }
 
-fn write_table(path: &Path, file_id: u64, level: u32, records: &[Record]) -> Result<WrittenTable> {
+fn write_table(
+    path: &Path,
+    file_id: u64,
+    level: u32,
+    records: &[Record],
+    io: &TableIoCounters,
+) -> Result<WrittenTable> {
     let file = OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(path)
         .map_err(|error| Error::io("create temporary SST file", error))?;
-    let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+    let mut writer = BufWriter::with_capacity(1024 * 1024, CountingWriter { file, io });
     let mut fences = Vec::with_capacity(records.len().div_ceil(RECORDS_PER_BLOCK));
     let mut filters = Vec::with_capacity(fences.capacity() * FILTER_BYTES);
     let mut min_sequence = MAX_SEQUENCE;
@@ -514,16 +535,37 @@ fn write_table(path: &Path, file_id: u64, level: u32, records: &[Record]) -> Res
         .write_all(&footer)
         .and_then(|_| writer.flush())
         .map_err(|error| Error::io("finish SST file", error))?;
-    let file = writer
+    let writer = writer
         .into_inner()
         .map_err(|error| Error::io("finish SST buffer", error.into_error()))?;
+    let file = writer.file;
     file.sync_data().map_err(|error| Error::io("sync SST file", error))?;
+    io.record_sync();
     Ok(WrittenTable {
         meta,
         top_fences,
         fences_offset,
         filters_offset,
     })
+}
+
+struct CountingWriter<'a> {
+    file: File,
+    io: &'a TableIoCounters,
+}
+
+impl Write for CountingWriter<'_> {
+    fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+        let written = self.file.write(input)?;
+        if written > 0 {
+            self.io.record_write(written);
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
 }
 
 fn encode_footer(

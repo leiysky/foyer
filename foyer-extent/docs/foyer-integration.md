@@ -38,14 +38,20 @@ per-put result. Deletes share the same ordered stream but may overcommit the put
 delete after rejecting an update would expose the older value. The caller still never blocks, and
 pending entry/byte gauges rise above their capacity gauges while this control debt is outstanding.
 
-One worker owns write order and groups commands into physical store batches. It uses a larger idle
-batch and a smaller read-busy batch so already admitted writes make progress without monopolizing
-the device. Immediate draining is the default. An optional microbatch window can wait for sparse
-arrivals to join the same batch; the deadline is measured from the first command's enqueue time, so
-an already-backlogged command receives no extra delay. This can amortize data and directory
-durability fences without changing their order or delaying a batch that has already reached its
-byte/entry target. Completion is reported to
-Foyer's pending-write keeper with the command generation;
+One worker owns write order and groups commands into physical store batches. Before publication it
+keeps only the final command for each complete key, writes all surviving puts in one store batch,
+and applies final deletes together. A rejected replacement also installs a tombstone so an older
+disk value cannot reappear after the memory entry leaves Foyer. This removes superseded payload
+writes and prevents put/delete interleaving from multiplying the ordinary batch payload fence;
+reclaim can still add recovery-critical fences before generation reuse.
+
+The worker uses a larger idle batch and a smaller read-busy batch so already admitted writes make
+progress without monopolizing the device. Immediate draining is the default. An optional
+microbatch window can wait for sparse arrivals to join the same batch; the deadline is measured
+from the first command's enqueue time, so an already-backlogged command receives no extra delay.
+This can amortize data and directory durability fences without changing their order or delaying a
+batch that has already reached its byte/entry target. Completion is reported to Foyer's
+pending-write keeper with the command generation;
 completion of an older same-key write cannot erase a newer pending value.
 
 The first write-worker or checkpoint failure is sticky. Later submissions are shed, existing reads
@@ -82,8 +88,10 @@ after that bound a write proceeds even while reads remain active. Existing write
 still the hard cap, so sustained reads cannot starve publication, reclaim, sync, or close. A zero
 duration bypasses this policy and its accounting.
 
-Admission does not own buffers, execute work on another thread, or emulate an asynchronous I/O
-queue. The caller retains its buffer and performs `pread`, `pwrite`, or `fdatasync`. Allocator-state
+Admission does not own buffers or emulate an asynchronous I/O queue. With the default write
+concurrency of one, the caller reuses one aligned buffer and executes `pwrite` inline. Configurations
+above one use a persistent bounded worker pool rather than creating and joining OS threads for each
+batch. Reads and `fdatasync` remain on the admitted caller. Allocator-state
 and FixedRecordLSM operations remain outside the payload scheduler because their operation classes
 and durability requirements differ.
 
@@ -123,9 +131,11 @@ reference engines and environment parsing remain outside production modules.
 ## Observability
 
 `ExtentEngineHandle` is a read-only view over the same state used by the engine. It exposes queue
-ownership, asynchronous outcomes, publication and durable frontiers, live Entry count, physical
-I/O, per-file sync counts, immutable layout planning, sparse-directory reads, reclaim substage
-timing, frequency-sketch size, scheduler waits, and the first background failure. It is not a
+ownership, asynchronous outcomes, publication and durable frontiers, physical-record occupancy and
+the indexed-cardinality upper bound, physical
+I/O, per-file sync counts, separate index WAL/SST/manifest writes and syncs, index flush/compaction
+bytes, lazy stale-location checks/discards, immutable layout planning, sparse-directory reads,
+checkpoint-wait and generation-invalidation reclaim timing, scheduler waits, and the first background failure. It is not a
 second control plane or a write receipt.
 
 The shared Foyer registry exports the corresponding counters, gauges, and latency histograms.

@@ -4,7 +4,6 @@ mod error;
 mod file;
 mod format;
 mod foyer_engine;
-mod frequency;
 mod model;
 mod store;
 

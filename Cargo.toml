@@ -78,6 +78,7 @@ pin-project = "1"
 prometheus = "0.14"
 rand = { version = "0.10.0", default-features = false }
 rand_distr = { version = "0.6.0" }
+rayon = "1"
 rocksdb = { version = "0.24.0", default-features = false, features = [
   "bindgen-runtime",
 ] }

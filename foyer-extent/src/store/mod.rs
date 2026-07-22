@@ -24,7 +24,7 @@ pub use self::{
     stats::{DirectoryReadStats, ExtentLayoutStats, ExtentOccupancy, PhysicalWriteStats, ReclaimStats},
 };
 #[cfg(test)]
-pub(crate) use self::{config::ExtentStoreOptions, core::InjectedFault};
+pub(crate) use self::{config::ExtentStoreOptions, core::InjectedFault, format::ENTRY_OWNER_SIZE};
 pub(crate) use self::{
     config::PriorityCapacityFloors,
     core::PreparedGet,

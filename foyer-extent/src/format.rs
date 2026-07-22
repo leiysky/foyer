@@ -98,14 +98,6 @@ pub(crate) fn decode_entry_value(stored: Vec<u8>, expected_key: &EntryKey) -> Op
     extract_value(stored, value_offset, value_len)
 }
 
-pub(crate) fn decode_stored_entry(stored: Vec<u8>) -> Option<(EntryKey, Vec<u8>)> {
-    let (key_len, value_len) = decode_stored_entry_header(&stored)?;
-    let value_offset = STORED_ENTRY_HEADER_SIZE.checked_add(key_len)?;
-    let key = EntryKey::new(stored.get(STORED_ENTRY_HEADER_SIZE..value_offset)?).ok()?;
-    let value = extract_value(stored, value_offset, value_len)?;
-    Some((key, value))
-}
-
 fn stored_entry_header(key: &EntryKey, value: &[u8]) -> [u8; STORED_ENTRY_HEADER_SIZE] {
     let mut header = [0; STORED_ENTRY_HEADER_SIZE];
     header[..4].copy_from_slice(&STORED_ENTRY_MAGIC);

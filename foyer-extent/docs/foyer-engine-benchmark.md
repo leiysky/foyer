@@ -112,8 +112,8 @@ switches are disabled by default and do not affect normal comparison runs.
 
 `EXTENT_BENCH_PRIORITY_WORKLOAD=scopedb` is the default mixed workload. The
 `historical-high` validation mode writes high-priority entries in the first half and normal entries
-in the second half. It directly checks that historical high occupancy above its floor is returned
-to normal demand instead of permanently starving it.
+in the second half. It directly checks that normal demand can recover its protected floor without
+allowing later normal churn to erase high-priority occupancy in the shared-capacity region.
 
 Reported Extent read bytes and I/O operations include both payload reads recorded through Foyer's
 device statistics and FixedRecordLSM reads. The separate `extent_read` and `extent_index_read`
@@ -136,9 +136,14 @@ experiment does not attribute metadata calls to payload splitting. `EXTENT_BENCH
 controls the optional sparse-arrival microbatch window and defaults to zero; compare a nonzero
 candidate with zero under the same seeds and alternating run order before enabling it. The
 `extent_layout` record separates usable payload from planned
-directory bytes, sparse logical directory size, and the soft Index target. `extent_reclaim` reports
-directory runs/bytes and directory-versus-index lookup time, while `extent_index` reports frequency
-memory and its aging window.
+directory bytes, sparse logical directory size, and the soft Index target. The write record also
+splits index WAL, SST, and manifest calls/bytes/syncs and reports compaction input/output bytes;
+these counters describe userspace and FixedRecordLSM operations rather than device-internal write
+amplification. `extent_reclaim` reports invalidated extents/bytes, time waiting for an already
+captured checkpoint, generation-invalidation time, and total time. A correct normal reclaim shows no
+increase in `extent_directory_read` or index reads/writes beyond unrelated background maintenance.
+`extent_index` reports its indexed-cardinality upper bound and the cumulative number of stale
+locations checked and discarded by ordinary compaction.
 
 ## 300 GiB buffered-I/O run
 

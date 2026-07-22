@@ -4,10 +4,12 @@ use std::{
     path::Path,
     sync::{
         Mutex, MutexGuard,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
+
+use rayon::prelude::*;
 
 use crate::{
     error::{Error, Result},
@@ -16,8 +18,8 @@ use crate::{
         reserve_cache_file, write_all_at,
     },
     format::{
-        ContentDigest, PAGE_SIZE, copy_stored_entry_range, decode_entry_value, decode_stored_entry,
-        encoded_entry_value_digest, stored_entry_len,
+        ContentDigest, PAGE_SIZE, copy_stored_entry_range, decode_entry_value, encoded_entry_value_digest,
+        stored_entry_len,
     },
     model::{CachePriority, EntryKey, KeyDigest},
     store::{
@@ -149,10 +151,12 @@ pub struct ExtentPool {
     layout: StoreLayout,
     direct_io: bool,
     write_concurrency: usize,
+    write_pool: Option<rayon::ThreadPool>,
     read_run_size: usize,
     write_run_size: usize,
     payload_dirty: AtomicBool,
     state: Mutex<ExtentPoolState>,
+    liveness: Box<[AtomicU64]>,
     reads: PoolReadCounters,
     writes: PoolWriteCounters,
 }
@@ -238,6 +242,7 @@ impl ExtentPool {
             .map_err(|error| Error::io("reserve extent state file", error))?;
 
         let state = ExtentPoolState::empty(layout);
+        let liveness = liveness_table(&state);
         write_all_at(&state_file, &state.encode(layout)?, 0)
             .map_err(|error| Error::io("write initial extent state", error))?;
         state_file
@@ -245,6 +250,7 @@ impl ExtentPool {
             .map_err(|error| Error::io("sync initial extent state", error))?;
         let io = PayloadIoScheduler::new(write_concurrency, io_read_priority_duration)
             .map_err(|error| Error::io("configure extent I/O scheduler", error))?;
+        let write_pool = data_write_pool(write_concurrency)?;
         Ok(Self {
             data,
             entry_directory,
@@ -253,10 +259,12 @@ impl ExtentPool {
             layout,
             direct_io,
             write_concurrency,
+            write_pool,
             read_run_size,
             write_run_size,
             payload_dirty: AtomicBool::new(false),
             state: Mutex::new(state),
+            liveness,
             reads: PoolReadCounters::default(),
             writes: PoolWriteCounters::default(),
         })
@@ -327,7 +335,9 @@ impl ExtentPool {
             .map_err(|error| Error::io("verify extent state reservation", error))?;
         let io = PayloadIoScheduler::new(write_concurrency, io_read_priority_duration)
             .map_err(|error| Error::io("configure extent I/O scheduler", error))?;
+        let write_pool = data_write_pool(write_concurrency)?;
 
+        let liveness = liveness_table(&state);
         let pool = Self {
             data,
             entry_directory,
@@ -336,14 +346,17 @@ impl ExtentPool {
             layout,
             direct_io,
             write_concurrency,
+            write_pool,
             read_run_size,
             write_run_size,
             payload_dirty: AtomicBool::new(false),
             state: Mutex::new(state),
+            liveness,
             reads: PoolReadCounters::default(),
             writes: PoolWriteCounters::default(),
         };
         pool.recover_current_tails()?;
+        pool.publish_all_liveness();
         Ok(pool)
     }
 
@@ -395,6 +408,7 @@ impl ExtentPool {
                     let extent_generation = state.extents[entry_index].generation;
                     state.extents[entry_index].used_bytes += stored_len;
                     state.extents[entry_index].entries += 1;
+                    let extent_state = state.extents[entry_index];
                     let sequence = state.next_sequence;
                     state.next_sequence = state
                         .next_sequence
@@ -404,6 +418,7 @@ impl ExtentPool {
                         .layout
                         .data_offset(extent, extent_offset)
                         .expect("current extent byte offset must be in the layout");
+                    self.publish_liveness(extent, extent_state);
                     return Ok(AllocationResult::Allocated(EntryAllocation {
                         data_offset,
                         extent,
@@ -541,15 +556,19 @@ impl ExtentPool {
         ((extent_offset as usize).checked_add(len)? <= self.layout.extent_size).then_some((extent, extent_offset))
     }
 
+    pub fn location_is_live(&self, location: EntryLocation) -> bool {
+        let Some((extent, extent_offset)) = self.location_range(location) else {
+            return false;
+        };
+        let extent_end = extent_offset.saturating_add(location.stored_len);
+        let (generation, used_bytes) = decode_liveness(self.liveness[extent as usize].load(Ordering::Acquire));
+        generation == location.extent_generation && used_bytes >= extent_end
+    }
+
     pub fn read_entry(&self, key: &EntryKey, location: EntryLocation) -> Result<StoredEntryRead> {
         let mut result = self.read_encoded_entry(location)?;
         result.value = result.value.and_then(|stored| decode_entry_value(stored, key));
         Ok(result)
-    }
-
-    pub fn read_stored_entry(&self, location: EntryLocation) -> Result<Option<(EntryKey, Vec<u8>)>> {
-        let result = self.read_encoded_entry(location)?;
-        Ok(result.value.and_then(decode_stored_entry))
     }
 
     fn read_encoded_entry(&self, location: EntryLocation) -> Result<StoredEntryRead> {
@@ -569,12 +588,9 @@ impl ExtentPool {
             return Ok(result);
         };
         let extent_end = extent_offset.saturating_add(location.stored_len);
-        {
-            let state = mutex_lock(&self.state);
-            let state = state.extents[extent as usize];
-            if state.generation != location.extent_generation || state.used_bytes < extent_end {
-                return Ok(result);
-            }
+        let (generation, used_bytes) = decode_liveness(self.liveness[extent as usize].load(Ordering::Acquire));
+        if generation != location.extent_generation || used_bytes < extent_end {
+            return Ok(result);
         }
         after_validation()?;
 
@@ -619,10 +635,8 @@ impl ExtentPool {
             Ok(())
         })?;
         result.data_frames = (extent_offset as usize % PAGE_SIZE + location.stored_len as usize).div_ceil(PAGE_SIZE);
-        let generation_matches = {
-            let state = mutex_lock(&self.state);
-            state.extents[extent as usize].generation == location.extent_generation
-        };
+        let (generation, _) = decode_liveness(self.liveness[extent as usize].load(Ordering::Acquire));
+        let generation_matches = generation == location.extent_generation;
         if encoded_entry_value_digest(&value) != Some(location.content_digest) || !generation_matches {
             return Ok(result);
         }
@@ -711,6 +725,7 @@ impl ExtentPool {
         Ok(victim)
     }
 
+    #[cfg(test)]
     pub fn begin_reclaim(&self, victim: ExtentVictim) -> Result<ReclaimTransaction> {
         let mut state = mutex_lock(&self.state);
         let source = state
@@ -733,16 +748,21 @@ impl ExtentPool {
             return Err(invalid_state("reclaim target reserve is invalid"));
         }
 
-        state.extents[victim.extent as usize].role = ExtentRole::ReclaimSource;
-        let sequence = state.next_sequence;
-        let target_state = &mut state.extents[target as usize];
+        // Build the complete next image separately. If metadata I/O fails, the live allocator and
+        // lock-free liveness table must continue to describe the last successfully published
+        // image rather than a half-applied transition.
+        let mut next = state.clone();
+        next.extents[victim.extent as usize].role = ExtentRole::ReclaimSource;
+        let sequence = next.next_sequence;
+        let target_state = &mut next.extents[target as usize];
         target_state.used_bytes = 0;
         target_state.entries = 0;
         target_state.sequence = sequence;
         target_state.priority = victim.priority;
         target_state.role = ExtentRole::ReclaimTarget;
         let target_generation = target_state.generation;
-        self.persist_state_locked(&mut state)?;
+        self.persist_state_locked(&mut next)?;
+        *state = next;
         Ok(ReclaimTransaction {
             source: victim,
             target,
@@ -778,55 +798,6 @@ impl ExtentPool {
         })
     }
 
-    pub fn allocate_reclaim_target(
-        &self,
-        transaction: ReclaimTransaction,
-        stored_len: usize,
-    ) -> Result<Option<EntryAllocation>> {
-        if stored_len == 0 || stored_len > self.layout.extent_size {
-            return Err(invalid_state(
-                "reclaim allocation must fit completely within one extent",
-            ));
-        }
-        let stored_len =
-            u32::try_from(stored_len).map_err(|_| invalid_state("reclaim allocation length does not fit u32"))?;
-        let mut state = mutex_lock(&self.state);
-        let target = &mut state.extents[transaction.target as usize];
-        if target.role != ExtentRole::ReclaimTarget
-            || target.generation != transaction.target_generation
-            || target.priority != transaction.priority
-        {
-            return Err(invalid_state("reclaim target changed during compaction"));
-        }
-        if (self.layout.extent_size as u32).saturating_sub(target.used_bytes) < stored_len
-            || target.entries >= self.layout.directory_entries_per_extent
-        {
-            return Ok(None);
-        }
-        let extent_offset = target.used_bytes;
-        let directory_entry = target.entries;
-        target.used_bytes += stored_len;
-        target.entries += 1;
-        let sequence = state.next_sequence;
-        state.next_sequence = state
-            .next_sequence
-            .checked_add(1)
-            .ok_or_else(|| invalid_state("extent allocation sequence is exhausted"))?;
-        Ok(Some(EntryAllocation {
-            data_offset: self
-                .layout
-                .data_offset(transaction.target, extent_offset)
-                .expect("reclaim target byte offset must be in the layout"),
-            extent: transaction.target,
-            extent_offset,
-            directory_entry,
-            stored_len,
-            extent_generation: transaction.target_generation,
-            priority: transaction.priority,
-            sequence,
-        }))
-    }
-
     pub fn finish_reclaim(&self, transaction: ReclaimTransaction) -> Result<()> {
         let mut state = mutex_lock(&self.state);
         let source = state.extents[transaction.source.extent as usize];
@@ -840,7 +811,8 @@ impl ExtentPool {
             return Err(invalid_state("reclaim transaction changed before commit"));
         }
 
-        let source = &mut state.extents[transaction.source.extent as usize];
+        let mut next = state.clone();
+        let source = &mut next.extents[transaction.source.extent as usize];
         source.generation = source
             .generation
             .checked_add(1)
@@ -850,27 +822,39 @@ impl ExtentPool {
         source.sequence = 0;
         source.priority = CachePriority::Low;
         source.role = ExtentRole::Reserve;
-        state.reserve = transaction.source.extent;
+        next.reserve = transaction.source.extent;
 
-        let target = &mut state.extents[transaction.target as usize];
+        let target = &mut next.extents[transaction.target as usize];
         if (target.used_bytes as usize) < self.layout.extent_size
             && target.entries < self.layout.directory_entries_per_extent
         {
             target.role = ExtentRole::Current;
-            state.current[usize::from(transaction.priority.to_byte())] = Some(transaction.target);
+            next.current[usize::from(transaction.priority.to_byte())] = Some(transaction.target);
         } else {
             target.role = ExtentRole::Sealed;
         }
-        self.persist_state_locked(&mut state)
+        self.persist_state_locked(&mut next)?;
+        *state = next;
+        self.publish_liveness(
+            transaction.source.extent,
+            state.extents[transaction.source.extent as usize],
+        );
+        self.publish_liveness(transaction.target, state.extents[transaction.target as usize]);
+        Ok(())
     }
 
-    pub fn entry_owners(&self, victim: ExtentVictim) -> Result<Vec<(u64, EntryOwner)>> {
-        let mut owners = Vec::with_capacity(victim.entries as usize);
+    #[cfg(test)]
+    pub fn visit_entry_owner_chunks(
+        &self,
+        victim: ExtentVictim,
+        mut visit: impl FnMut(&[(u64, EntryOwner)]) -> Result<()>,
+    ) -> Result<()> {
         let mut previous_end = 0u32;
         let mut previous_sequence = 0u64;
         let mut first_entry = 0u32;
         while first_entry < victim.entries {
             let count = (victim.entries - first_entry).min(DIRECTORY_READ_RECORDS);
+            let mut owners = Vec::with_capacity(count as usize);
             for owner in self.read_entry_owner_chunk(victim.extent, first_entry, count)? {
                 let owner =
                     owner.ok_or_else(|| invalid_state("occupied extent contains an invalid entry-directory record"))?;
@@ -900,14 +884,25 @@ impl ExtentPool {
                 previous_end = end;
                 previous_sequence = owner.sequence;
             }
+            visit(&owners)?;
             first_entry += count;
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn entry_owners(&self, victim: ExtentVictim) -> Result<Vec<(u64, EntryOwner)>> {
+        let mut owners = Vec::with_capacity(victim.entries as usize);
+        self.visit_entry_owner_chunks(victim, |chunk| {
+            owners.extend_from_slice(chunk);
+            Ok(())
+        })?;
         Ok(owners)
     }
 
     pub fn release(&self, victim: ExtentVictim) -> Result<()> {
         let mut state = mutex_lock(&self.state);
-        let extent = &mut state.extents[victim.extent as usize];
+        let extent = &state.extents[victim.extent as usize];
         if extent.role != ExtentRole::Sealed
             || extent.generation != victim.generation
             || extent.used_bytes != victim.used_bytes
@@ -915,6 +910,8 @@ impl ExtentPool {
         {
             return Err(invalid_state("extent victim changed during reclamation"));
         }
+        let mut next = state.clone();
+        let extent = &mut next.extents[victim.extent as usize];
         extent.generation = extent
             .generation
             .checked_add(1)
@@ -924,7 +921,10 @@ impl ExtentPool {
         extent.sequence = 0;
         extent.priority = CachePriority::Low;
         extent.role = ExtentRole::Free;
-        self.persist_state_locked(&mut state)
+        self.persist_state_locked(&mut next)?;
+        *state = next;
+        self.publish_liveness(victim.extent, state.extents[victim.extent as usize]);
+        Ok(())
     }
 
     pub fn sync_payload(&self) -> Result<()> {
@@ -953,6 +953,7 @@ impl ExtentPool {
         self.payload_dirty.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub fn checkpoint_state(&self) -> Result<()> {
         let checkpoint = self.prepare_checkpoint_state()?;
         self.persist_checkpoint_state(&checkpoint)
@@ -1125,46 +1126,57 @@ impl ExtentPool {
     }
 
     fn write_data_runs(&self, writes: &[EntryWrite<'_>], runs: &[DataWriteRun]) -> Result<()> {
-        let next = AtomicUsize::new(0);
-        let concurrency = self.write_concurrency.min(runs.len());
-        std::thread::scope(|scope| {
-            let mut workers = Vec::with_capacity(concurrency);
-            for _ in 0..concurrency {
-                workers.push(scope.spawn(|| -> Result<()> {
-                    loop {
-                        let index = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(run) = runs.get(index) else {
-                            return Ok(());
-                        };
-                        let mut output = AlignedBuffer::new(run.len);
-                        for piece in &run.pieces {
-                            let write = writes[piece.index];
-                            let output_end = piece
-                                .run_offset
-                                .checked_add(piece.len)
-                                .ok_or_else(|| invalid_state("extent write output overflows"))?;
-                            if !copy_stored_entry_range(
-                                write.key,
-                                write.value,
-                                piece.write_offset,
-                                &mut output.as_mut_slice()[piece.run_offset..output_end],
-                            ) {
-                                return Err(invalid_state("extent stored entry slice is invalid"));
-                            }
-                        }
-                        self.io
-                            .write(|| write_all_at(&self.data, output.as_slice(), run.data_offset))
-                            .map_err(|error| Error::io("write extent data batch", error))?;
-                        self.writes.data_runs.fetch_add(1, Ordering::Relaxed);
-                        self.writes.data_bytes.fetch_add(run.len as u64, Ordering::Relaxed);
-                    }
-                }));
+        if runs.is_empty() {
+            return Ok(());
+        }
+        let maximum_run_size = runs
+            .iter()
+            .map(|run| run.len)
+            .max()
+            .expect("a non-empty run set must have a maximum size");
+        if self.write_concurrency == 1 || runs.len() == 1 {
+            let mut output = AlignedBuffer::new(maximum_run_size);
+            for run in runs {
+                self.write_data_run(writes, run, &mut output.as_mut_slice()[..run.len])?;
             }
-            for worker in workers {
-                worker.join().expect("extent data writer must not panic")?;
+            return Ok(());
+        }
+
+        self.write_pool
+            .as_ref()
+            .expect("write concurrency above one must have a persistent data-write pool")
+            .install(|| {
+                runs.par_iter().try_for_each_init(
+                    || AlignedBuffer::new(maximum_run_size),
+                    |output, run| self.write_data_run(writes, run, &mut output.as_mut_slice()[..run.len]),
+                )
+            })
+    }
+
+    fn write_data_run(&self, writes: &[EntryWrite<'_>], run: &DataWriteRun, output: &mut [u8]) -> Result<()> {
+        debug_assert_eq!(output.len(), run.len);
+        output.fill(0);
+        for piece in &run.pieces {
+            let write = writes[piece.index];
+            let output_end = piece
+                .run_offset
+                .checked_add(piece.len)
+                .ok_or_else(|| invalid_state("extent write output overflows"))?;
+            if !copy_stored_entry_range(
+                write.key,
+                write.value,
+                piece.write_offset,
+                &mut output[piece.run_offset..output_end],
+            ) {
+                return Err(invalid_state("extent stored entry slice is invalid"));
             }
-            Ok(())
-        })
+        }
+        self.io
+            .write(|| write_all_at(&self.data, output, run.data_offset))
+            .map_err(|error| Error::io("write extent data batch", error))?;
+        self.writes.data_runs.fetch_add(1, Ordering::Relaxed);
+        self.writes.data_bytes.fetch_add(run.len as u64, Ordering::Relaxed);
+        Ok(())
     }
 
     fn write_entry_directory_runs(&self, writes: &[EntryWrite<'_>]) -> Result<usize> {
@@ -1241,8 +1253,20 @@ impl ExtentPool {
                 .next_multiple_of(PAGE_SIZE)
                 .min(self.layout.extent_size);
             extent_state.used_bytes = u32::try_from(aligned).expect("extent size must fit u32");
+            self.publish_liveness(extent, *extent_state);
         }
         Ok(())
+    }
+
+    fn publish_all_liveness(&self) {
+        let state = mutex_lock(&self.state);
+        for (extent, extent_state) in state.extents.iter().copied().enumerate() {
+            self.publish_liveness(extent as u32, extent_state);
+        }
+    }
+
+    fn publish_liveness(&self, extent: u32, state: crate::store::format::ExtentState) {
+        self.liveness[extent as usize].store(encode_liveness(state.generation, state.used_bytes), Ordering::Release);
     }
 
     fn persist_state_locked(&self, state: &mut ExtentPoolState) -> Result<()> {
@@ -1270,6 +1294,22 @@ impl ExtentPool {
         *state = next;
         Ok(())
     }
+}
+
+fn liveness_table(state: &ExtentPoolState) -> Box<[AtomicU64]> {
+    state
+        .extents
+        .iter()
+        .map(|state| AtomicU64::new(encode_liveness(state.generation, state.used_bytes)))
+        .collect()
+}
+
+const fn encode_liveness(generation: u32, used_bytes: u32) -> u64 {
+    (generation as u64) << 32 | used_bytes as u64
+}
+
+const fn decode_liveness(word: u64) -> (u32, u32) {
+    ((word >> 32) as u32, word as u32)
 }
 
 #[derive(Debug)]
@@ -1369,6 +1409,18 @@ fn state_file_size(layout: StoreLayout) -> Result<u64> {
 
 fn invalid_state(message: &str) -> Error {
     Error::InvalidSuperblock(format!("extent state: {message}"))
+}
+
+fn data_write_pool(concurrency: usize) -> Result<Option<rayon::ThreadPool>> {
+    if concurrency <= 1 {
+        return Ok(None);
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(concurrency)
+        .thread_name(|index| format!("extent-data-{index}"))
+        .build()
+        .map(Some)
+        .map_err(|error| Error::InvalidConfig(format!("create extent data-write pool: {error}")))
 }
 
 fn mutex_lock<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {

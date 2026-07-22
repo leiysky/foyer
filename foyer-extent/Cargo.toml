@@ -27,10 +27,11 @@ crc-fast = { workspace = true }
 fixed-lsm = { workspace = true }
 foyer = { workspace = true }
 futures-core = { workspace = true }
+rayon = { workspace = true }
 rocksdb = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
-twox-hash = { workspace = true, features = ["xxhash3_128", "xxhash3_64"] }
+twox-hash = { workspace = true, features = ["xxhash3_128"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { workspace = true }

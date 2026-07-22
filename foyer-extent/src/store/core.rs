@@ -11,8 +11,6 @@ use std::{
 use crate::format::stored_entry_checksum;
 #[cfg(test)]
 use crate::model::CachePriority;
-#[cfg(test)]
-use crate::store::reclaim::promotion_limit;
 use crate::{
     error::{Error, Result},
     format::{ContentDigest, stored_entry_len, value_digest},
@@ -69,7 +67,6 @@ impl ExtentStore {
         fs::create_dir_all(root).map_err(|error| Error::io("create extent store directory", error))?;
         let index = EntryIndex::create(
             root,
-            layout.maximum_entries,
             layout.index_capacity_bytes,
             config.options.index_write_buffer_size,
             config.options.index_cache_size,
@@ -110,16 +107,10 @@ impl ExtentStore {
         validate_layout_options(pool.layout(), options)?;
         let index = EntryIndex::open(
             root,
-            pool.layout().maximum_entries,
             pool.layout().index_capacity_bytes,
             options.index_write_buffer_size,
             options.index_cache_size,
         )?;
-        if index.file_size() != pool.layout().index_capacity_bytes {
-            return Err(Error::InvalidSuperblock(
-                "EntryIndex layout does not match allocator state".to_string(),
-            ));
-        }
         let store = Self::from_parts(index, pool, options)?;
         store.reclaimer().recover_pending()?;
         Ok(store)
@@ -129,6 +120,7 @@ impl ExtentStore {
         let layout = pool.layout();
         let index = Arc::new(index);
         let pool = Arc::new(pool);
+        index.install_liveness_filter(pool.clone());
         let mutations = Arc::new(Mutex::new(()));
         let dirty_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let checkpoints = CheckpointCoordinator::new(index.clone(), pool.clone(), mutations.clone(), dirty_bytes)?;
@@ -312,13 +304,15 @@ impl ExtentStore {
                             && insert.key == known.key,
                     )
                 } else {
-                    let (current, would_admit) = self.index.probe(key_digest, insert.priority)?;
-                    let exact_match = current.is_some_and(|current| {
-                        current.stored_len as usize == stored_len
-                            && current.content_digest == content_digest
-                            && insert.priority == current.priority
-                    });
-                    (would_admit, exact_match)
+                    let exact_match = matches!(
+                        self.index.lookup_memory(key_digest)?,
+                        EntryIndexMemoryLookup::Location(current)
+                            if self.pool.location_is_live(current)
+                                && current.stored_len as usize == stored_len
+                                && current.content_digest == content_digest
+                                && insert.priority == current.priority
+                    );
+                    (true, exact_match)
                 };
                 if exact_match {
                     outcomes[input_index] = Some(InsertOutcome::Updated);
@@ -455,17 +449,27 @@ impl ExtentStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn remove(&self, key: &EntryKey) -> Result<bool> {
+        Ok(self.remove_batch(std::slice::from_ref(key))? == 1)
+    }
+
+    pub fn remove_batch(&self, keys: &[EntryKey]) -> Result<usize> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
         let mutation = mutex_lock(&self.mutations);
         self.checkpoints.ensure_healthy()?;
-        let removed = self.index.remove(KeyDigest::for_key(key))?;
-        if removed {
-            let target = self.checkpoints.record_publication(self.layout.entry_charge)?;
+        let digests = keys.iter().map(KeyDigest::for_key).collect::<Vec<_>>();
+        let removed = self.index.remove_batch(&digests)?;
+        if removed > 0 {
+            let published_bytes = removed.saturating_mul(self.layout.entry_charge);
+            let target = self.checkpoints.record_publication(published_bytes)?;
             if self.checkpoints.dirty_bytes() >= self.options.checkpoint_bytes {
                 self.checkpoints.request_background(target)?;
             }
-            drop(mutation);
         }
+        drop(mutation);
         Ok(removed)
     }
 
@@ -537,14 +541,7 @@ impl ExtentStore {
     }
 
     fn reclaimer(&self) -> Reclaimer<'_> {
-        Reclaimer::new(
-            &self.index,
-            &self.pool,
-            &self.checkpoints,
-            self.priority_capacity_floors(),
-            self.options.hot_frequency,
-            self.options.low_hot_frequency,
-        )
+        Reclaimer::new(&self.pool, &self.checkpoints, self.priority_capacity_floors())
     }
 
     fn priority_capacity_floors(&self) -> [u32; 3] {
@@ -621,16 +618,6 @@ fn validate_options(options: ExtentStoreOptions) -> Result<()> {
     if options.index_cache_size == 0 {
         return Err(Error::InvalidConfig(
             "extent index_cache_size must be greater than zero".to_string(),
-        ));
-    }
-    if !(1..=15).contains(&options.hot_frequency) {
-        return Err(Error::InvalidConfig(
-            "extent hot_frequency must be between 1 and 15".to_string(),
-        ));
-    }
-    if !(1..=15).contains(&options.low_hot_frequency) {
-        return Err(Error::InvalidConfig(
-            "extent low_hot_frequency must be between 1 and 15".to_string(),
         ));
     }
     let priority_capacity_floors = options.priority_capacity_floors;
@@ -852,7 +839,7 @@ mod tests {
             InsertOutcome::Inserted
         );
         store.checkpoint().unwrap();
-        assert_eq!(store.entry_index_stats().live_entries, 2);
+        assert_eq!(store.entry_index_stats().indexed_entries_upper_bound, 2);
         drop(store);
 
         let store = ExtentStore::open_with_options(
@@ -866,7 +853,7 @@ mod tests {
         assert_eq!(store.get(&key(2)).unwrap(), Some(vec![2; PAGE_SIZE + 17]));
         assert!(store.remove(&key(1)).unwrap());
         store.checkpoint().unwrap();
-        assert_eq!(store.entry_index_stats().live_entries, 1);
+        assert_eq!(store.entry_index_stats().indexed_entries_upper_bound, 1);
         drop(store);
 
         let store = ExtentStore::open_with_options(
@@ -1069,9 +1056,9 @@ mod tests {
 
         store.checkpoints.pause_after_capture();
         let updated = full_frame_value(8);
-        assert_eq!(
+        assert_ne!(
             store.insert(&key(0), &updated, CachePriority::Low).unwrap(),
-            InsertOutcome::Updated
+            InsertOutcome::Rejected
         );
         store
             .checkpoints
@@ -1157,6 +1144,11 @@ mod tests {
         assert!(after_checkpoint.index_runs > 0);
         assert!(after_checkpoint.index_bytes > 0);
         assert_eq!(after_checkpoint.index_syncs, 1);
+        assert_eq!(after_checkpoint.index_wal_runs, 1);
+        assert!(after_checkpoint.index_wal_bytes > 0);
+        assert_eq!(after_checkpoint.index_wal_syncs, 1);
+        assert_eq!(after_checkpoint.index_sst_runs, 0);
+        assert_eq!(after_checkpoint.index_manifest_runs, 0);
         assert_eq!(after_checkpoint.allocator_runs, 1);
         assert_eq!(after_checkpoint.allocator_syncs, 1);
         assert_eq!(
@@ -1170,6 +1162,7 @@ mod tests {
                 + after_checkpoint.index_bytes
                 + after_checkpoint.allocator_bytes
         );
+        assert_eq!(after_checkpoint.total_syncs(), 4);
     }
 
     #[cfg(target_os = "linux")]
@@ -1342,6 +1335,76 @@ mod tests {
     }
 
     #[test]
+    fn randomized_churn_never_returns_a_stale_or_wrong_value() {
+        const KEY_COUNT: usize = 64;
+        const OPERATIONS: usize = 384;
+
+        fn random(state: &mut u64) -> u64 {
+            let mut value = *state;
+            value ^= value << 13;
+            value ^= value >> 7;
+            value ^= value << 17;
+            *state = value;
+            value
+        }
+
+        fn assert_valid_hit(store: &ExtentStore, model: &[Option<Vec<u8>>], index: usize) {
+            if let Some(actual) = store.get(&key(index as u64)).unwrap() {
+                let expected = model[index]
+                    .as_ref()
+                    .expect("a removed or never-inserted key returned a value");
+                assert_eq!(&actual, expected, "key {index} returned a stale value");
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let mut store = store(dir.path(), 512 * 1024);
+        let mut model = vec![None; KEY_COUNT];
+        let mut rng = 0x243f_6a88_85a3_08d3_u64;
+
+        for operation in 0..OPERATIONS {
+            if operation == OPERATIONS / 2 {
+                store.sync().unwrap();
+                drop(store);
+                store = ExtentStore::open_with_options(dir.path(), options()).unwrap();
+            }
+
+            let index = random(&mut rng) as usize % KEY_COUNT;
+            match random(&mut rng) % 10 {
+                0..=6 => {
+                    let len = 16 + random(&mut rng) as usize % (PAGE_SIZE * 2);
+                    let mut value = vec![random(&mut rng) as u8; len];
+                    value[..8].copy_from_slice(&(operation as u64).to_le_bytes());
+                    let priority = match random(&mut rng) % 10 {
+                        0 => CachePriority::High,
+                        1..=6 => CachePriority::Normal,
+                        _ => CachePriority::Low,
+                    };
+                    if store.insert(&key(index as u64), &value, priority).unwrap() != InsertOutcome::Rejected {
+                        model[index] = Some(value);
+                    }
+                }
+                7 => {
+                    store.remove(&key(index as u64)).unwrap();
+                    model[index] = None;
+                }
+                _ => assert_valid_hit(&store, &model, index),
+            }
+
+            assert_valid_hit(&store, &model, index);
+            assert_valid_hit(&store, &model, random(&mut rng) as usize % KEY_COUNT);
+            if operation % 48 == 47 {
+                store.checkpoint().unwrap();
+            }
+        }
+
+        store.sync().unwrap();
+        for index in 0..KEY_COUNT {
+            assert_valid_hit(&store, &model, index);
+        }
+    }
+
+    #[test]
     fn low_priority_cannot_reclaim_protected_data() {
         let dir = tempdir().unwrap();
         let store = store(dir.path(), 2 * 1024 * 1024);
@@ -1361,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn priority_capacity_is_borrowed_and_repaid_without_starvation() {
+    fn priority_floors_prevent_starvation_and_shared_capacity_prefers_high() {
         let dir = tempdir().unwrap();
         let store = ExtentStore::create(
             dir.path(),
@@ -1387,27 +1450,10 @@ mod tests {
             usable_extents
         );
 
-        let normal_extents = usable_extents - high_floor;
-        for index in 0..normal_extents as usize {
+        for index in 0..normal_floor as usize {
             assert_ne!(
                 store
                     .insert(&key(100_000 + index as u64), &value, CachePriority::Normal)
-                    .unwrap(),
-                InsertOutcome::Rejected
-            );
-        }
-        let occupancy = store.extent_occupancy();
-        assert_eq!(occupancy.occupied_extents(CachePriority::High), high_floor);
-        assert_eq!(
-            occupancy.occupied_extents(CachePriority::Normal),
-            usable_extents - high_floor
-        );
-
-        let high_extents = usable_extents - normal_floor - high_floor;
-        for index in 0..high_extents as usize {
-            assert_ne!(
-                store
-                    .insert(&key(200_000 + index as u64), &value, CachePriority::High)
                     .unwrap(),
                 InsertOutcome::Rejected
             );
@@ -1418,6 +1464,49 @@ mod tests {
             occupancy.occupied_extents(CachePriority::High),
             usable_extents - normal_floor
         );
+
+        assert_ne!(
+            store.insert(&key(300_000), &value, CachePriority::Normal).unwrap(),
+            InsertOutcome::Rejected
+        );
+        let occupancy = store.extent_occupancy();
+        assert_eq!(occupancy.occupied_extents(CachePriority::Normal), normal_floor);
+        assert_eq!(
+            occupancy.occupied_extents(CachePriority::High),
+            usable_extents - normal_floor
+        );
+
+        let second = tempdir().unwrap();
+        let store = ExtentStore::create(
+            second.path(),
+            ExtentStoreConfig::new(2 * 1024 * 1024)
+                .with_entry_charge(PAGE_SIZE)
+                .with_options(options().with_priority_capacity_floors(25, 50)),
+        )
+        .unwrap();
+        for index in 0..usable_extents as usize {
+            assert_ne!(
+                store
+                    .insert(&key(400_000 + index as u64), &value, CachePriority::Normal)
+                    .unwrap(),
+                InsertOutcome::Rejected
+            );
+        }
+        for index in 0..(usable_extents - normal_floor) as usize {
+            assert_ne!(
+                store
+                    .insert(&key(500_000 + index as u64), &value, CachePriority::High)
+                    .unwrap(),
+                InsertOutcome::Rejected
+            );
+        }
+        let occupancy = store.extent_occupancy();
+        assert_eq!(occupancy.occupied_extents(CachePriority::Normal), normal_floor);
+        assert_eq!(
+            occupancy.occupied_extents(CachePriority::High),
+            usable_extents - normal_floor
+        );
+        assert!(high_floor <= occupancy.occupied_extents(CachePriority::High));
     }
 
     #[test]
@@ -1464,14 +1553,14 @@ mod tests {
                 .all(|outcome| *outcome != InsertOutcome::Rejected)
         );
         assert_eq!(result.reclaim.reclaimed_extents(CachePriority::Low), 1);
-        assert_eq!(result.reclaim.evicted_entries(CachePriority::Low), 1);
-        assert_eq!(result.reclaim.evicted_bytes(CachePriority::Low), 16);
+        assert!(result.reclaim.invalidated_entries(CachePriority::Low) >= 1);
+        assert!(result.reclaim.invalidated_bytes(CachePriority::Low) >= PAGE_SIZE);
         assert_eq!(store.get(&key(0)).unwrap(), None);
         assert_eq!(store.get(&key(1)).unwrap(), Some(vec![2; 16]));
     }
 
     #[test]
-    fn same_priority_reclaim_promotes_hot_entries() {
+    fn reclaim_invalidates_a_whole_extent_without_reading_or_copying_it() {
         let dir = tempdir().unwrap();
         let store = store(dir.path(), 2 * 1024 * 1024);
         let layout = store.pool.layout();
@@ -1488,123 +1577,31 @@ mod tests {
             assert_eq!(store.get(&key(0)).unwrap(), Some(vec![5; 16]));
         }
 
+        let directory_before = store.directory_read_stats();
+        let index_reads_before = store.entry_index_io_read_stats();
+        let writes_before = store.physical_write_stats();
         let incoming = key(entries as u64);
         let result = store
             .insert_batch_with_stats(&[EntryInsert::new(&incoming, &[6; 16], CachePriority::Normal)])
             .unwrap();
+        let directory_after = store.directory_read_stats();
+        let index_reads_after = store.entry_index_io_read_stats();
+        let writes_after = store.physical_write_stats();
+
         assert_ne!(result.outcomes[0], InsertOutcome::Rejected);
         assert_eq!(result.reclaim.total_reclaimed_extents(), 1);
-        assert_eq!(result.reclaim.total_promoted_entries(), 1);
-        assert_eq!(result.reclaim.total_promoted_bytes(), 16);
         assert_eq!(
-            result.reclaim.total_evicted_entries(),
-            layout.planned_entries_per_extent as usize - 1
+            result.reclaim.total_invalidated_entries(),
+            layout.planned_entries_per_extent as usize
         );
-        assert_eq!(
-            result.reclaim.total_evicted_bytes(),
-            (layout.planned_entries_per_extent as usize - 1) * 16
-        );
-        assert_eq!(store.get(&key(0)).unwrap(), Some(vec![5; 16]));
-    }
-
-    #[test]
-    fn low_priority_hot_frequency_can_be_raised() {
-        let dir = tempdir().unwrap();
-        let store = ExtentStore::create(
-            dir.path(),
-            ExtentStoreConfig::new(2 * 1024 * 1024)
-                .with_entry_charge(PAGE_SIZE)
-                .with_options(options().with_low_hot_frequency(15)),
-        )
-        .unwrap();
-        let entries = store.pool.layout().planned_max_entries as usize;
-        for index in 0..entries {
-            assert_ne!(
-                store.insert(&key(index as u64), &[5; 16], CachePriority::Low).unwrap(),
-                InsertOutcome::Rejected
-            );
-        }
-        for _ in 0..3 {
-            assert_eq!(store.get(&key(0)).unwrap(), Some(vec![5; 16]));
-        }
-
-        let incoming = key(entries as u64);
-        let result = store
-            .insert_batch_with_stats(&[EntryInsert::new(&incoming, &[6; 16], CachePriority::Low)])
-            .unwrap();
-        assert_ne!(result.outcomes[0], InsertOutcome::Rejected);
-        assert_eq!(result.reclaim.total_reclaimed_extents(), 1);
-        assert_eq!(result.reclaim.total_promoted_entries(), 0);
+        assert_eq!(result.reclaim.total_invalidated_bytes(), layout.extent_size);
+        assert_eq!(directory_after, directory_before);
+        assert_eq!(index_reads_after, index_reads_before);
+        assert_eq!(writes_after.allocator_runs - writes_before.allocator_runs, 1);
+        assert_eq!(writes_after.allocator_syncs - writes_before.allocator_syncs, 1);
+        assert_eq!(writes_after.index_runs - writes_before.index_runs, 0);
         assert_eq!(store.get(&key(0)).unwrap(), None);
-    }
-
-    #[test]
-    fn low_priority_hot_frequency_is_independent() {
-        let dir = tempdir().unwrap();
-        let store = ExtentStore::create(
-            dir.path(),
-            ExtentStoreConfig::new(2 * 1024 * 1024)
-                .with_entry_charge(PAGE_SIZE)
-                .with_options(options().with_hot_frequency(15).with_low_hot_frequency(2)),
-        )
-        .unwrap();
-        let entries = store.pool.layout().planned_max_entries as usize;
-        for index in 0..entries {
-            assert_ne!(
-                store.insert(&key(index as u64), &[5; 16], CachePriority::Low).unwrap(),
-                InsertOutcome::Rejected
-            );
-        }
-        for _ in 0..3 {
-            assert_eq!(store.get(&key(0)).unwrap(), Some(vec![5; 16]));
-        }
-
-        let incoming = key(entries as u64);
-        let result = store
-            .insert_batch_with_stats(&[EntryInsert::new(&incoming, &[6; 16], CachePriority::Low)])
-            .unwrap();
-        assert_ne!(result.outcomes[0], InsertOutcome::Rejected);
-        assert_eq!(result.reclaim.total_promoted_entries(), 1);
-        assert_eq!(store.get(&key(0)).unwrap(), Some(vec![5; 16]));
-    }
-
-    #[test]
-    fn same_priority_reclaim_caps_hot_promotion() {
-        let dir = tempdir().unwrap();
-        let store = store(dir.path(), 2 * 1024 * 1024);
-        let layout = store.pool.layout();
-        let entries = layout.planned_max_entries as usize;
-        for index in 0..entries {
-            assert_ne!(
-                store
-                    .insert(&key(index as u64), &[5; 16], CachePriority::Normal)
-                    .unwrap(),
-                InsertOutcome::Rejected
-            );
-        }
-        for index in 0..entries {
-            for _ in 0..3 {
-                assert_eq!(store.get(&key(index as u64)).unwrap(), Some(vec![5; 16]));
-            }
-        }
-
-        let incoming = key(entries as u64);
-        let result = store
-            .insert_batch_with_stats(&[EntryInsert::new(&incoming, &[6; 16], CachePriority::Normal)])
-            .unwrap();
-        let promoted = promotion_limit(layout.extent_size) / layout.entry_charge;
-        assert_ne!(result.outcomes[0], InsertOutcome::Rejected);
-        assert_eq!(result.reclaim.total_reclaimed_extents(), 1);
-        assert_eq!(result.reclaim.total_promoted_entries(), promoted);
-        assert_eq!(result.reclaim.total_promoted_bytes(), promoted * 16);
-        assert_eq!(
-            result.reclaim.total_evicted_entries(),
-            layout.planned_entries_per_extent as usize - promoted
-        );
-        assert_eq!(
-            result.reclaim.total_evicted_bytes(),
-            (layout.planned_entries_per_extent as usize - promoted) * 16
-        );
+        assert_eq!(store.get(&incoming).unwrap(), Some(vec![6; 16]));
     }
 
     #[test]
@@ -1690,47 +1687,41 @@ mod tests {
     }
 
     #[test]
-    fn process_crash_during_compacting_reclaim_recovers_a_valid_engine() {
-        for crash_at in [
-            "extent_reclaim_after_begin",
-            "extent_reclaim_after_payload_sync",
-            "extent_reclaim_after_index_checkpoint",
-        ] {
-            let dir = tempdir().unwrap();
-            let store = store(dir.path(), 2 * 1024 * 1024);
-            let entries = store.pool.layout().planned_max_entries;
-            for index in 0..entries {
-                assert_ne!(
-                    store.insert(&key(index), &[7; 16], CachePriority::Normal).unwrap(),
-                    InsertOutcome::Rejected
-                );
-            }
-            store.sync().unwrap();
-            drop(store);
-
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .arg("--exact")
-                .arg("store::core::tests::reclaim_crash_child")
-                .arg("--nocapture")
-                .env("EXTENT_STORE_CRASH_AT", crash_at)
-                .env("EXTENT_STORE_CRASH_PATH", dir.path())
-                .output()
-                .unwrap();
-            assert!(!output.status.success(), "child did not crash at {crash_at}");
-
-            let reopened = ExtentStore::open_with_options(dir.path(), options()).unwrap();
-            assert!(reopened.pool.pending_reclaim().is_none());
-            for index in 0..entries {
-                let recovered = reopened.get(&key(index)).unwrap();
-                assert!(recovered.is_none() || recovered == Some(vec![7; 16]));
-            }
+    fn process_crash_after_generation_invalidation_recovers_a_valid_store() {
+        let dir = tempdir().unwrap();
+        let store = store(dir.path(), 2 * 1024 * 1024);
+        let entries = store.pool.layout().planned_max_entries;
+        for index in 0..entries {
             assert_ne!(
-                reopened.insert(&key(200_000), &[9; 16], CachePriority::Normal).unwrap(),
+                store.insert(&key(index), &[7; 16], CachePriority::Normal).unwrap(),
                 InsertOutcome::Rejected
             );
-            reopened.sync().unwrap();
-            assert_eq!(reopened.get(&key(200_000)).unwrap(), Some(vec![9; 16]));
         }
+        store.sync().unwrap();
+        drop(store);
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("store::core::tests::reclaim_crash_child")
+            .arg("--nocapture")
+            .env("EXTENT_STORE_CRASH_AT", "extent_reclaim_after_generation_invalidation")
+            .env("EXTENT_STORE_CRASH_PATH", dir.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "child did not crash after invalidation");
+
+        let reopened = ExtentStore::open_with_options(dir.path(), options()).unwrap();
+        assert!(reopened.pool.pending_reclaim().is_none());
+        for index in 0..entries {
+            let recovered = reopened.get(&key(index)).unwrap();
+            assert!(recovered.is_none() || recovered == Some(vec![7; 16]));
+        }
+        assert_ne!(
+            reopened.insert(&key(200_000), &[9; 16], CachePriority::Normal).unwrap(),
+            InsertOutcome::Rejected
+        );
+        reopened.sync().unwrap();
+        assert_eq!(reopened.get(&key(200_000)).unwrap(), Some(vec![9; 16]));
     }
 
     #[test]
@@ -1739,63 +1730,7 @@ mod tests {
             return;
         };
         let store = ExtentStore::open_with_options(path, options()).unwrap();
-        for _ in 0..3 {
-            assert_eq!(store.get(&key(0)).unwrap(), Some(vec![7; 16]));
-        }
         store.insert(&key(100_000), &[8; 16], CachePriority::Normal).unwrap();
-        panic!("crash failpoint was not reached");
-    }
-
-    #[test]
-    fn process_crash_during_whole_extent_eviction_recovers_a_valid_store() {
-        for crash_at in [
-            "extent_evict_after_allocator_state",
-            "extent_evict_after_index_checkpoint",
-            "extent_evict_after_release",
-        ] {
-            let dir = tempdir().unwrap();
-            let store = store(dir.path(), 2 * 1024 * 1024);
-            let entries = store.pool.layout().planned_max_entries;
-            for index in 0..entries {
-                assert_ne!(
-                    store.insert(&key(index), &[5; 16], CachePriority::Low).unwrap(),
-                    InsertOutcome::Rejected
-                );
-            }
-            store.sync().unwrap();
-            drop(store);
-
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .arg("--exact")
-                .arg("store::core::tests::whole_extent_eviction_crash_child")
-                .arg("--nocapture")
-                .env("EXTENT_STORE_CRASH_AT", crash_at)
-                .env("EXTENT_STORE_CRASH_PATH", dir.path())
-                .output()
-                .unwrap();
-            assert!(!output.status.success(), "child did not crash at {crash_at}");
-
-            let reopened = ExtentStore::open_with_options(dir.path(), options()).unwrap();
-            for index in 0..entries {
-                let recovered = reopened.get(&key(index)).unwrap();
-                assert!(recovered.is_none() || recovered == Some(vec![5; 16]));
-            }
-            assert_ne!(
-                reopened.insert(&key(300_000), &[6; 16], CachePriority::High).unwrap(),
-                InsertOutcome::Rejected
-            );
-            reopened.sync().unwrap();
-            assert_eq!(reopened.get(&key(300_000)).unwrap(), Some(vec![6; 16]));
-        }
-    }
-
-    #[test]
-    fn whole_extent_eviction_crash_child() {
-        let Ok(path) = std::env::var("EXTENT_STORE_CRASH_PATH") else {
-            return;
-        };
-        let store = ExtentStore::open_with_options(path, options()).unwrap();
-        store.insert(&key(100_000), &[8; 16], CachePriority::High).unwrap();
         panic!("crash failpoint was not reached");
     }
 }

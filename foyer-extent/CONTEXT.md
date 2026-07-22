@@ -1,9 +1,16 @@
-# Extent
+# Domain language design
+
+## Purpose
+
+This document defines the ubiquitous language used by Extent's code and design documents. The
+preferred names encode ownership and abstraction boundaries; discouraged aliases are recorded
+where they would blur those boundaries. Behavioral decisions and rationale remain in the linked
+design documents under `docs/`.
+
+## Terms
 
 Extent is a standalone, non-authoritative blob cache for local SSDs. Its language keeps the public
 cache contract, Foyer integration, logical disk store, and physical extent pool distinct.
-
-## Language
 
 ### Public cache contract
 
@@ -77,7 +84,7 @@ _Avoid_: Hard index limit, index quota
 
 **Reclaimer**:
 The ExtentStore component that resolves allocation pressure by choosing a cache extent, fencing
-generation reuse, evicting entries, and optionally promoting a bounded hot subset.
+generation reuse, and invalidating the complete old extent without reading or copying its Entries.
 _Avoid_: LSM compactor, generic garbage collector, background eviction service
 
 ### Physical storage
@@ -102,8 +109,8 @@ priority, and extent generation. Its compact record is independently checksummed
 _Avoid_: Extent location, blob address, index entry
 
 **Entry directory**:
-The per-cache-extent sequence of fixed records identifying its Stored Entries for tail recovery and
-reclaim without reading payload bytes.
+The per-cache-extent sequence of fixed records identifying its Stored Entries for bounded current-tail
+recovery without reading payload bytes. Normal reclaim does not read it.
 _Avoid_: Slot owners, EntryIndex, public index
 
 **I/O frame**:
@@ -112,8 +119,8 @@ reclaim unit, and multiple Stored Entries may share one frame.
 _Avoid_: Allocation slot, cache extent, block
 
 **Entry charge**:
-The minimum accounting weight of one Entry used to bound directory and EntryIndex cardinality. It
-does not round the Entry allocation or describe physical bytes written.
+The planning weight of one Entry used to derive soft directory and EntryIndex capacity targets. It
+does not bound cardinality, round the Entry allocation, or describe physical bytes written.
 _Avoid_: Slot size, Entry size, frame size
 
 **Extent generation**:
@@ -128,8 +135,9 @@ A caller-assigned protection class expressing an Entry's relative business impor
 _Avoid_: Temperature, hotness
 
 **Cache temperature**:
-A volatile estimate of observed Entry reuse, independent of cache priority.
-_Avoid_: Priority
+The caller's hot/warm/cold classification expressed through cache priority; Extent does not infer a
+second temperature from reads.
+_Avoid_: Frequency sketch, reclaim promotion score
 
 **Priority capacity floor**:
 The minimum cache-extent capacity protected for one priority while unused capacity remains

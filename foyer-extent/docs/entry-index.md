@@ -24,8 +24,11 @@ collisions can cause only replacement or a miss, never a wrong value.
 
 `EntryLocation` identifies one complete Stored Entry by byte offset, encoded length, an 88-bit
 value-content digest, priority, and cache-extent generation. Its 32-byte encoding has an independent
-CRC, and EntryIndex does not interpret any of those fields. It also stores one opaque `u64`
-application state used by ExtentStore for the durable live-entry count.
+CRC. FixedRecordLSM treats the value as opaque; EntryIndex decodes it for foreground validation and
+the liveness compaction filter. The index also stores one opaque `u64`
+application state used by ExtentStore for a durable indexed-cardinality upper bound. Generation
+invalidation can make locations stale without mutating the index, so this count is telemetry only;
+it is neither an admission limit nor an exact live-Entry count.
 
 ## Volatile overlays
 
@@ -74,7 +77,7 @@ EntryIndex durability follows the ExtentStore publication order:
 ```text
 payload + Entry directory
   -> allocator state
-  -> synced FixedRecordLSM mutation batch + live-entry state
+  -> synced FixedRecordLSM mutation batch + indexed-cardinality upper bound
   -> frozen-overlay retirement
 ```
 
@@ -98,13 +101,23 @@ removed only after the live version is established. Obsolete WAL generations are
 their records are covered; obsolete empty WALs from repeated recovery are also cleaned so
 observation cost and directory size cannot grow per reopen.
 
-The live-entry count is recovered from application state rather than an all-key scan.
+The indexed-cardinality upper bound is recovered from application state rather than an all-key
+scan. ExtentPool's bounded allocator state is the authoritative liveness source: every location is
+checked against its extent generation before payload I/O. Recovery therefore does not need to
+enumerate stale index keys.
 
-The volatile frequency sketch is sized from that recovered live count rather than the theoretical
-layout maximum. It grows at power-of-two cardinality boundaries and shrinks only after a fourfold
-drop, keeping both memory and the aging window proportional to the active set without resize
-churn. Resizing may discard temperature history; temperature is a best-effort reclaim heuristic,
-not durable state. Explicit stats report counter count, bytes, and sample window.
+## Generation garbage collection
+
+Whole-extent reclaim deliberately does not install per-key tombstones. Doing so would turn one
+allocator transition into directory reads, index lookups, WAL writes, and an index checkpoint.
+Stale locations are harmless because ExtentPool rejects their generation before payload I/O.
+
+FixedRecordLSM removes that metadata debt only as a side effect of work it already has to perform.
+During a non-trivial compaction, the newest value for each key is decoded and checked against the
+lock-free extent-liveness table. An invalid location is emitted as a tombstone so an older lower-level
+value cannot reappear; bottom-level compaction may omit the tombstone. A trivial move never rewrites
+an SST just to run this filter. Cumulative check and discard counters expose cleanup progress without
+creating a separate garbage-collection job or recovery scan.
 
 ## Read cache and accounting
 
@@ -135,8 +148,16 @@ store unhealthy. The host filesystem is the real allocation boundary. Reservatio
 transient input/output overlap and release bytes only after obsolete files are unlinked and the
 directory update is synchronized, so the reported usage remains exact.
 
+The mutation path likewise never issues an SST point lookup merely to classify cardinality. It
+uses the active overlay, memtables, and in-memory SST ranges. A possible SST match is conservatively
+charged again on insert, while delete installs a tombstone without decrementing an uncertain
+charge. This can only overestimate indexed cardinality; it removes read-before-write I/O from a
+telemetry value and cannot change lookup correctness.
+
 This separates planning from correctness: an estimate cannot turn temporary LSM amplification into
-a cache-health failure.
+a cache-health failure. Unique-key churn can temporarily raise both disk usage and the indexed
+cardinality upper bound until ordinary leveled compaction reaches those records; neither value is
+used to reject payload publication.
 
 ## Corruption and miss policy
 

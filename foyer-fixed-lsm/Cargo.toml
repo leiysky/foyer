@@ -19,11 +19,11 @@ crc-fast = { workspace = true }
 fs4 = { workspace = true, features = ["sync"] }
 twox-hash = { workspace = true, features = ["xxhash3_64"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-rustix = { workspace = true }
 
 [lints.rust]
 unsafe_code = "deny"

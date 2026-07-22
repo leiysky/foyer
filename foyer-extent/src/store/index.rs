@@ -1,37 +1,33 @@
 use std::{
     collections::HashMap,
-    mem::size_of,
     path::Path,
     sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
 use fixed_lsm::{FixedLsm, FixedLsmMemoryLookup, FixedLsmOptions, WriteBatch, WriteOptions};
-use twox_hash::XxHash3_64;
 
 #[cfg(test)]
 use crate::format::PAGE_SIZE;
+#[cfg(test)]
+use crate::model::CachePriority;
 use crate::{
     error::{Error, Result},
-    frequency::FrequencySketch,
-    model::{CachePriority, KeyDigest},
+    model::KeyDigest,
     store::{
         format::EntryLocation,
         operation::{BatchInsertResult, InsertOutcome},
+        pool::ExtentPool,
         stats::PhysicalWriteStats,
     },
 };
 
 pub(crate) const INDEX_DIRECTORY: &str = "index-lsm";
 
-const HASH_SEED: u64 = 0xd6e8_feb8_6659_fd93;
-const MIN_FREQUENCY_COUNTERS: usize = 4 * 1024;
-const MAX_FREQUENCY_COUNTERS: usize = 16 * 1024 * 1024;
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EntryIndexStats {
     pub manifest_generation: u64,
     pub last_sequence: u64,
-    pub live_entries: u64,
+    pub indexed_entries_upper_bound: u64,
     pub pending_changes: u64,
     pub disk_capacity_bytes: u64,
     pub disk_used_bytes: u64,
@@ -41,9 +37,8 @@ pub struct EntryIndexStats {
     pub mutable_entries: u64,
     pub immutable_memtables: u64,
     pub cache_resident_bytes: u64,
-    pub frequency_counters: u64,
-    pub frequency_bytes: u64,
-    pub frequency_sample_window: u64,
+    pub stale_location_checks: u64,
+    pub stale_location_discards: u64,
     pub background_running: bool,
     pub background_failed: bool,
 }
@@ -88,30 +83,26 @@ impl Mutation {
 struct RuntimeState {
     active: HashMap<KeyDigest, Mutation>,
     frozen: Option<Arc<HashMap<KeyDigest, Mutation>>>,
-    live_count: u64,
+    indexed_count: u64,
     base_revision: u64,
 }
 
 #[derive(Debug)]
 pub struct IndexCheckpoint {
     frozen: Arc<HashMap<KeyDigest, Mutation>>,
-    live_count: u64,
+    indexed_count: u64,
 }
 
 #[derive(Debug)]
 pub struct EntryIndex {
     database: FixedLsm,
-    live_capacity: u64,
-    capacity_bytes: u64,
     state: RwLock<RuntimeState>,
     mutations: Mutex<()>,
-    frequency: RwLock<FrequencySketch>,
 }
 
 impl EntryIndex {
     pub fn create(
         root: &Path,
-        live_capacity: u64,
         capacity_bytes: u64,
         write_buffer_capacity: usize,
         cache_capacity: usize,
@@ -126,16 +117,10 @@ impl EntryIndex {
             },
         )
         .map_err(|error| fixed_error("create", error))?;
-        Ok(Self::from_parts(database, live_capacity, capacity_bytes))
+        Ok(Self::from_parts(database))
     }
 
-    pub fn open(
-        root: &Path,
-        live_capacity: u64,
-        capacity_bytes: u64,
-        write_buffer_capacity: usize,
-        cache_capacity: usize,
-    ) -> Result<Self> {
+    pub fn open(root: &Path, capacity_bytes: u64, write_buffer_capacity: usize, cache_capacity: usize) -> Result<Self> {
         let directory = root.join(INDEX_DIRECTORY);
         let database = FixedLsm::open(
             &directory,
@@ -146,33 +131,24 @@ impl EntryIndex {
             },
         )
         .map_err(|error| fixed_error("open", error))?;
-        if database.user_state() > live_capacity {
-            return Err(Error::InvalidSuperblock(format!(
-                "EntryIndex live count {} exceeds capacity {live_capacity}",
-                database.user_state()
-            )));
-        }
-        Ok(Self::from_parts(database, live_capacity, capacity_bytes))
+        Ok(Self::from_parts(database))
     }
 
-    fn from_parts(database: FixedLsm, live_capacity: u64, capacity_bytes: u64) -> Self {
-        let live_count = database.user_state();
-        let frequency_counters = frequency_counters_for_entries(live_count);
+    fn from_parts(database: FixedLsm) -> Self {
+        let indexed_count = database.user_state();
         Self {
             database,
-            live_capacity,
-            capacity_bytes,
             state: RwLock::new(RuntimeState {
-                live_count,
+                indexed_count,
                 ..RuntimeState::default()
             }),
             mutations: Mutex::new(()),
-            frequency: RwLock::new(FrequencySketch::new(frequency_counters)),
         }
     }
 
-    pub const fn file_size(&self) -> u64 {
-        self.capacity_bytes
+    pub fn install_liveness_filter(&self, pool: Arc<ExtentPool>) {
+        self.database
+            .set_compaction_filter(Some(Arc::new(StaleLocationFilter { pool })));
     }
 
     pub fn allocated_size(&self) -> Result<u64> {
@@ -181,13 +157,35 @@ impl EntryIndex {
 
     pub fn physical_write_stats(&self) -> PhysicalWriteStats {
         let stats = self.database.stats();
+        let index_runs = stats
+            .wal_write_operations
+            .saturating_add(stats.table_write_operations)
+            .saturating_add(stats.manifest_write_operations);
+        let index_bytes = stats
+            .wal_write_bytes
+            .saturating_add(stats.table_write_bytes)
+            .saturating_add(stats.manifest_write_bytes);
+        let index_syncs = stats
+            .wal_sync_operations
+            .saturating_add(stats.table_sync_operations)
+            .saturating_add(stats.manifest_sync_operations);
         PhysicalWriteStats {
-            index_runs: stats.table_write_operations.saturating_add(stats.wal_write_operations),
-            index_bytes: stats.table_write_bytes.saturating_add(stats.wal_write_bytes),
-            // Extent checkpoints always append the WAL with synchronous durability, so each WAL
-            // write operation is one foreground Index durability fence. Background SST/manifest
-            // maintenance has separate structural counters and is not folded into this number.
-            index_syncs: stats.wal_write_operations,
+            index_runs,
+            index_bytes,
+            index_syncs,
+            index_wal_runs: stats.wal_write_operations,
+            index_wal_bytes: stats.wal_write_bytes,
+            index_wal_syncs: stats.wal_sync_operations,
+            index_sst_runs: stats.table_write_operations,
+            index_sst_bytes: stats.table_write_bytes,
+            index_sst_syncs: stats.table_sync_operations,
+            index_manifest_runs: stats.manifest_write_operations,
+            index_manifest_bytes: stats.manifest_write_bytes,
+            index_manifest_syncs: stats.manifest_sync_operations,
+            index_flushes: stats.flush_operations,
+            index_compactions: stats.compaction_operations,
+            index_compaction_input_bytes: stats.compaction_input_bytes,
+            index_compaction_output_bytes: stats.compaction_output_bytes,
             ..PhysicalWriteStats::default()
         }
     }
@@ -218,7 +216,6 @@ impl EntryIndex {
     pub fn stats(&self) -> EntryIndexStats {
         let database = self.database.stats();
         let state = read_lock(&self.state);
-        let frequency = read_lock(&self.frequency);
         let pending_changes = state
             .active
             .len()
@@ -227,7 +224,7 @@ impl EntryIndex {
         EntryIndexStats {
             manifest_generation: database.manifest_generation,
             last_sequence: database.next_sequence.saturating_sub(1),
-            live_entries: state.live_count,
+            indexed_entries_upper_bound: state.indexed_count,
             pending_changes,
             disk_capacity_bytes: database.disk_capacity_bytes,
             disk_used_bytes: database.disk_used_bytes,
@@ -237,9 +234,8 @@ impl EntryIndex {
             mutable_entries: database.mutable_entries,
             immutable_memtables: database.immutable_memtables,
             cache_resident_bytes: database.cache_resident_bytes,
-            frequency_counters: frequency.counters() as u64,
-            frequency_bytes: (frequency.counters() * size_of::<u64>()) as u64,
-            frequency_sample_window: frequency.sample_window(),
+            stale_location_checks: database.compaction_filter_checks,
+            stale_location_discards: database.compaction_filter_discards,
             background_running: database.background_running,
             background_failed: database.background_failed,
         }
@@ -258,7 +254,6 @@ impl EntryIndex {
     }
 
     pub fn lookup_memory(&self, key: KeyDigest) -> Result<EntryIndexMemoryLookup> {
-        read_lock(&self.frequency).record(key_hash(key));
         loop {
             let base_revision = {
                 let state = read_lock(&self.state);
@@ -291,15 +286,6 @@ impl EntryIndex {
 
     pub fn peek(&self, key: KeyDigest) -> Result<Option<EntryLocation>> {
         self.lookup(key)
-    }
-
-    pub fn probe(&self, key: KeyDigest, _priority: CachePriority) -> Result<(Option<EntryLocation>, bool)> {
-        read_lock(&self.frequency).record(key_hash(key));
-        Ok((self.lookup(key)?, true))
-    }
-
-    pub fn estimated_frequency(&self, key: KeyDigest) -> u8 {
-        read_lock(&self.frequency).estimate(key_hash(key))
     }
 
     fn lookup(&self, key: KeyDigest) -> Result<Option<EntryLocation>> {
@@ -338,27 +324,24 @@ impl EntryIndex {
         let mutation = mutex_lock(&self.mutations);
         let mut outcomes = Vec::with_capacity(inserts.len());
         for (key, location) in inserts.iter().copied() {
-            let existing = self.lookup(key)?;
-            if existing == Some(location) {
+            // Cardinality is a soft upper bound, so classifying a write must never turn it into an
+            // SST point read. Unknown means a table range may contain the key; conservatively
+            // charge another indexed entry and let normal compaction reconcile stale locations.
+            let existing = self.lookup_memory(key)?;
+            if existing == EntryIndexMemoryLookup::Location(location) {
                 outcomes.push(InsertOutcome::Updated);
                 continue;
             }
             let mut state = write_lock(&self.state);
-            if existing.is_none() && state.live_count >= self.live_capacity {
-                return Err(Error::InvalidSuperblock(
-                    "EntryIndex reached data capacity before allocation reclaimed an extent".to_string(),
-                ));
-            }
             state.active.insert(key, Mutation::insert(location));
-            if existing.is_none() {
-                state.live_count += 1;
-                outcomes.push(InsertOutcome::Inserted);
-            } else {
-                outcomes.push(InsertOutcome::Updated);
+            match existing {
+                EntryIndexMemoryLookup::Location(_) => outcomes.push(InsertOutcome::Updated),
+                EntryIndexMemoryLookup::Miss | EntryIndexMemoryLookup::Unknown => {
+                    state.indexed_count = state.indexed_count.saturating_add(1);
+                    outcomes.push(InsertOutcome::Inserted);
+                }
             }
         }
-        let live_count = read_lock(&self.state).live_count;
-        self.maybe_resize_frequency(live_count);
         drop(mutation);
         Ok(BatchInsertResult {
             outcomes,
@@ -366,28 +349,29 @@ impl EntryIndex {
         })
     }
 
-    pub fn remove(&self, key: KeyDigest) -> Result<bool> {
-        Ok(self.remove_batch(&[key])? == 1)
-    }
-
     pub fn remove_batch(&self, keys: &[KeyDigest]) -> Result<usize> {
         let mutation = mutex_lock(&self.mutations);
         let mut removed = 0;
         for key in keys.iter().copied() {
-            if self.lookup(key)?.is_none() {
+            // A possible SST value is hidden with a tombstone without reading it. Keep the
+            // cardinality charge when presence is unknown so the persisted count remains an upper
+            // bound rather than an admission-critical exact value.
+            let existing = self.lookup_memory(key)?;
+            if existing == EntryIndexMemoryLookup::Miss {
                 continue;
             }
             let mut state = write_lock(&self.state);
             state.active.insert(key, Mutation::remove());
-            state.live_count = state.live_count.saturating_sub(1);
+            if matches!(existing, EntryIndexMemoryLookup::Location(_)) {
+                state.indexed_count = state.indexed_count.saturating_sub(1);
+            }
             removed += 1;
         }
-        let live_count = read_lock(&self.state).live_count;
-        self.maybe_resize_frequency(live_count);
         drop(mutation);
         Ok(removed)
     }
 
+    #[cfg(test)]
     pub fn checkpoint(&self) -> Result<()> {
         let Some(checkpoint) = self.prepare_checkpoint()? else {
             return Ok(());
@@ -410,7 +394,7 @@ impl EntryIndex {
         state.frozen = Some(frozen.clone());
         Ok(Some(IndexCheckpoint {
             frozen,
-            live_count: state.live_count,
+            indexed_count: state.indexed_count,
         }))
     }
 
@@ -425,7 +409,7 @@ impl EntryIndex {
         }
         if let Err(error) = self
             .database
-            .write_with_user_state(&batch, WriteOptions::sync(), checkpoint.live_count)
+            .write_with_user_state(&batch, WriteOptions::sync(), checkpoint.indexed_count)
         {
             self.restore_checkpoint(checkpoint);
             return Err(fixed_error("persist checkpoint", error));
@@ -469,30 +453,17 @@ impl EntryIndex {
             state.active.entry(*key).or_insert(*mutation);
         }
     }
-
-    fn maybe_resize_frequency(&self, live_count: u64) {
-        let desired = frequency_counters_for_entries(live_count);
-        let current = read_lock(&self.frequency).counters();
-        if desired <= current && desired.saturating_mul(4) > current {
-            return;
-        }
-        let mut frequency = write_lock(&self.frequency);
-        let current = frequency.counters();
-        if desired > current || desired.saturating_mul(4) <= current {
-            // Frequency is an intentionally volatile heuristic. Resizing at power-of-two
-            // cardinality boundaries may forget history, but avoids carrying stale temperature
-            // across a radically different live set and keeps its aging window proportional.
-            *frequency = FrequencySketch::new(desired);
-        }
-    }
 }
 
-fn frequency_counters_for_entries(entries: u64) -> usize {
-    usize::try_from(entries / 4)
-        .unwrap_or(MAX_FREQUENCY_COUNTERS)
-        .clamp(MIN_FREQUENCY_COUNTERS, MAX_FREQUENCY_COUNTERS)
-        .next_power_of_two()
-        .min(MAX_FREQUENCY_COUNTERS)
+#[derive(Debug)]
+struct StaleLocationFilter {
+    pool: Arc<ExtentPool>,
+}
+
+impl fixed_lsm::CompactionFilter for StaleLocationFilter {
+    fn should_discard(&self, _key: &fixed_lsm::Key, value: &fixed_lsm::Value) -> bool {
+        EntryLocation::decode(value).is_some_and(|location| !self.pool.location_is_live(location))
+    }
 }
 
 fn decode_location(value: [u8; fixed_lsm::VALUE_SIZE]) -> Result<EntryLocation> {
@@ -517,10 +488,6 @@ fn advance_base_revision(state: &mut RuntimeState) {
 
 fn encode_key(key: KeyDigest) -> [u8; 24] {
     *key.as_bytes()
-}
-
-fn key_hash(key: KeyDigest) -> u64 {
-    XxHash3_64::oneshot_with_seed(HASH_SEED, &encode_key(key))
 }
 
 fn fixed_error(context: &'static str, error: fixed_lsm::Error) -> Error {
@@ -577,21 +544,7 @@ mod tests {
     }
 
     fn create(root: &Path) -> EntryIndex {
-        EntryIndex::create(root, 128, 1024 * 1024, 64 * 16, 1024 * 1024).unwrap()
-    }
-
-    #[test]
-    fn frequency_sketch_tracks_live_cardinality_instead_of_layout_capacity() {
-        assert_eq!(frequency_counters_for_entries(0), MIN_FREQUENCY_COUNTERS);
-        assert_eq!(
-            frequency_counters_for_entries((MIN_FREQUENCY_COUNTERS * 4) as u64),
-            MIN_FREQUENCY_COUNTERS
-        );
-        assert_eq!(
-            frequency_counters_for_entries((MIN_FREQUENCY_COUNTERS * 4 + 4) as u64),
-            MIN_FREQUENCY_COUNTERS * 2
-        );
-        assert_eq!(frequency_counters_for_entries(u64::MAX), MAX_FREQUENCY_COUNTERS);
+        EntryIndex::create(root, 1024 * 1024, 64 * 16, 1024 * 1024).unwrap()
     }
 
     #[test]
@@ -601,11 +554,11 @@ mod tests {
         let inserts = (0..32).map(|entry| (key(entry), location(entry))).collect::<Vec<_>>();
         index.insert_batch(&inserts).unwrap();
         index.checkpoint().unwrap();
-        assert_eq!(index.stats().live_entries, 32);
+        assert_eq!(index.stats().indexed_entries_upper_bound, 32);
         drop(index);
 
-        let index = EntryIndex::open(directory.path(), 128, 1024 * 1024, 64 * 16, 1024 * 1024).unwrap();
-        assert_eq!(index.stats().live_entries, 32);
+        let index = EntryIndex::open(directory.path(), 1024 * 1024, 64 * 16, 1024 * 1024).unwrap();
+        assert_eq!(index.stats().indexed_entries_upper_bound, 32);
         for entry in 0..32 {
             assert_eq!(index.peek(key(entry)).unwrap(), Some(location(entry)));
         }
@@ -634,6 +587,34 @@ mod tests {
     }
 
     #[test]
+    fn sst_mutations_keep_cardinality_soft_without_point_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let index = create(directory.path());
+        index
+            .insert_batch(&[(key(1), location(1)), (key(2), location(2))])
+            .unwrap();
+        index.checkpoint().unwrap();
+        index.database.flush().unwrap();
+        assert_eq!(index.lookup_memory(key(1)).unwrap(), EntryIndexMemoryLookup::Unknown);
+        assert_eq!(index.lookup_memory(key(2)).unwrap(), EntryIndexMemoryLookup::Unknown);
+
+        let before = index.io_read_stats();
+        let newer = EntryLocation {
+            extent_generation: 2,
+            ..location(1)
+        };
+        assert_eq!(
+            index.insert_batch(&[(key(1), newer)]).unwrap().outcomes,
+            vec![InsertOutcome::Inserted]
+        );
+        assert_eq!(index.remove_batch(&[key(2)]).unwrap(), 1);
+        assert_eq!(index.io_read_stats(), before);
+        assert_eq!(index.stats().indexed_entries_upper_bound, 3);
+        assert_eq!(index.peek(key(1)).unwrap(), Some(newer));
+        assert_eq!(index.peek(key(2)).unwrap(), None);
+    }
+
+    #[test]
     fn active_mutation_wins_over_inflight_checkpoint() {
         let directory = tempfile::tempdir().unwrap();
         let index = create(directory.path());
@@ -649,7 +630,7 @@ mod tests {
         index.checkpoint().unwrap();
         drop(index);
 
-        let index = EntryIndex::open(directory.path(), 128, 1024 * 1024, 64 * 16, 1024 * 1024).unwrap();
+        let index = EntryIndex::open(directory.path(), 1024 * 1024, 64 * 16, 1024 * 1024).unwrap();
         assert_eq!(index.peek(key(1)).unwrap(), Some(newer));
     }
 

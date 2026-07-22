@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io,
     sync::{
         Arc, Mutex,
@@ -308,43 +309,50 @@ pub fn sync_store(store: &ExtentStore, statistics: &Statistics, stats: &EngineSt
 
 fn process_commands(store: &ExtentStore, commands: &[Command]) -> crate::Result<ProcessResult> {
     let mut result = ProcessResult::default();
-    let mut position = 0;
-    while position < commands.len() {
+    let mut last_commands = HashMap::<&[u8], usize>::with_capacity(commands.len());
+    for (position, command) in commands.iter().enumerate() {
+        last_commands.insert(command_key(command), position);
+    }
+    let mut positions = last_commands.into_values().collect::<Vec<_>>();
+    positions.sort_unstable();
+
+    let mut put_keys = Vec::new();
+    let mut put_pieces = Vec::new();
+    let mut deletes = Vec::new();
+    for position in positions {
         match &commands[position] {
-            Command::Put { .. } => {
-                let start = position;
-                while position < commands.len() && matches!(&commands[position], Command::Put { .. }) {
-                    position += 1;
-                }
-                result.merge(persist_puts(store, &commands[start..position])?);
+            Command::Put { piece, .. } => {
+                put_keys.push(EntryKey::new(piece.key())?);
+                put_pieces.push(piece);
             }
-            Command::Delete { key, .. } => {
-                let key = EntryKey::new(key)?;
-                store.remove(&key)?;
-                position += 1;
-            }
+            Command::Delete { key, .. } => deletes.push(EntryKey::new(key)?),
         }
     }
+    if !put_keys.is_empty() {
+        let inserts = put_pieces
+            .iter()
+            .zip(&put_keys)
+            .map(|(piece, key)| EntryInsert::new(key, piece.value().value(), piece.value().priority()))
+            .collect::<Vec<_>>();
+        let inserted = store.insert_batch_with_stats(&inserts)?;
+        for (key, outcome) in put_keys.iter().zip(&inserted.outcomes) {
+            if *outcome == InsertOutcome::Rejected {
+                // A rejected update must not leave an older value visible after the in-memory
+                // replacement is evicted. Publish a tombstone for the stale disk entry.
+                deletes.push(key.clone());
+            }
+        }
+        result.merge(inserted);
+    }
+    store.remove_batch(&deletes)?;
     Ok(result)
 }
 
-fn persist_puts(store: &ExtentStore, commands: &[Command]) -> crate::Result<BatchInsertResult> {
-    let keys = commands
-        .iter()
-        .map(|command| match command {
-            Command::Put { piece, .. } => EntryKey::new(piece.key()),
-            Command::Delete { .. } => unreachable!("put run must contain only puts"),
-        })
-        .collect::<crate::Result<Vec<_>>>()?;
-    let inserts = commands
-        .iter()
-        .zip(&keys)
-        .map(|(command, key)| match command {
-            Command::Put { piece, .. } => EntryInsert::new(key, piece.value().value(), piece.value().priority()),
-            Command::Delete { .. } => unreachable!("put run must contain only puts"),
-        })
-        .collect::<Vec<_>>();
-    store.insert_batch_with_stats(&inserts)
+fn command_key(command: &Command) -> &[u8] {
+    match command {
+        Command::Put { piece, .. } => piece.key().as_ref(),
+        Command::Delete { key, .. } => key.as_ref(),
+    }
 }
 
 #[derive(Debug, Default)]

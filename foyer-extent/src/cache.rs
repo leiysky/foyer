@@ -97,14 +97,16 @@ impl Cache {
     /// Estimate the number of distinct entries visible from the hybrid cache.
     ///
     /// Memory entries normally overlap disk entries, so the larger tier count is a more stable
-    /// telemetry estimate than their sum. The estimate can undercount disjoint memory-only and
-    /// disk-only entries during write bursts and must not be used for correctness decisions.
+    /// telemetry estimate than their sum. Disk occupancy counts physical records and can include
+    /// overwritten keys within a live extent; the estimate must not be used for correctness.
     pub fn estimated_entry_count(&self) -> u64 {
         let memory_entries = u64::try_from(self.inner.memory().entries()).unwrap_or(u64::MAX);
-        let disk_entries = self
-            .engine_handle
-            .entry_index_stats()
-            .map_or(0, |stats| stats.live_entries);
+        let disk_entries = self.engine_handle.extent_occupancy().map_or(0, |occupancy| {
+            [CachePriority::Low, CachePriority::Normal, CachePriority::High]
+                .into_iter()
+                .map(|priority| occupancy.used_entries(priority))
+                .sum()
+        });
         memory_entries.max(disk_entries)
     }
 }

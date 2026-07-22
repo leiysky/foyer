@@ -22,8 +22,8 @@ use crate::{
 ///
 /// The store mutation mutex is held only while an immutable allocator/index epoch is detached.
 /// Payload synchronization and metadata persistence happen after that mutex is released. Reclaim
-/// uses `checkpoint_inline_locked` before generation reuse, so it cannot overlap durable metadata
-/// I/O or invalidate locations referenced by an in-flight epoch.
+/// waits for an already captured epoch to finish before generation reuse, so two allocator images
+/// can never race to publish the same state generation.
 pub struct CheckpointCoordinator {
     shared: Arc<CheckpointShared>,
     worker: Option<JoinHandle<()>>,
@@ -166,32 +166,20 @@ impl CheckpointCoordinator {
         self.wait_for(target)
     }
 
-    /// Persists the current epoch while the caller keeps the mutation lock.
+    /// Waits until metadata I/O for an already captured epoch has completed.
     ///
-    /// This path is reserved for reclaim because generation reuse cannot race an older immutable
-    /// epoch. Ordinary threshold and periodic checkpoints use the background worker.
-    pub fn checkpoint_inline_locked(&self) -> Result<()> {
-        let target = self.shared.published_epoch.load(Ordering::Acquire);
+    /// The caller keeps the store mutation lock, which prevents the background worker from
+    /// capturing another epoch before generation invalidation is durably published. This wait
+    /// does not create a checkpoint or add I/O to reclaim.
+    pub fn wait_for_idle_locked(&self) -> Result<()> {
         let mut state = mutex_lock(&self.shared.state);
         loop {
             check_state(&state)?;
             if state.in_flight_epoch.is_none() {
-                break;
+                return Ok(());
             }
             state = condvar_wait(&self.shared.changed, state);
         }
-        if state.durable_epoch >= target {
-            return Ok(());
-        }
-        state.requested_epoch = state.requested_epoch.max(target);
-        state.in_flight_epoch = Some(target);
-        drop(state);
-
-        let result = self.shared.prepare_epoch(target).and_then(|epoch| {
-            self.shared.dirty_bytes.store(0, Ordering::Relaxed);
-            self.shared.persist_epoch(epoch)
-        });
-        self.shared.complete(target, result)
     }
 
     pub fn ensure_healthy(&self) -> Result<()> {

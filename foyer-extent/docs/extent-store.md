@@ -47,8 +47,8 @@ The store directory contains:
 
 An Entry-directory record binds one allocation's byte offset to the key digest, extent generation,
 value length, 88-bit value-content digest, sequence, and priority. The record itself has a CRC.
-Reclaim enumerates this compact sidecar instead of reading the entire payload extent. Exact key
-validation remains in the Stored Entry.
+Recovery reads the directory only to discover the uncheckpointed tail of at most one current extent
+per priority. Reclaim does not read it. Exact key validation remains in the Stored Entry.
 
 The hard layout calculation includes the preallocated data file, a directory budget based on the
 4 KiB Entry planning charge, and both allocator-state copies. One extent is excluded from usable
@@ -78,20 +78,22 @@ durable-base revision, rechecks both overlays after I/O, and retries if a frozen
 meanwhile. This closes the miss race without invalidating readers for every unrelated active
 mutation.
 
-After a single-Entry index lookup, `ExtentPool` validates the extent generation, reads the indexed
-byte range in runs bounded by `read_run_size`, validates the Stored Entry header and seeded 88-bit
+After a single-Entry index lookup, `ExtentPool` validates the extent generation and used range from
+one lock-free atomic liveness word, reads the indexed byte range in runs bounded by `read_run_size`,
+validates the Stored Entry header and seeded 88-bit
 XXH3 value-content digest, compares the complete key, and rechecks the generation. The 2 MiB
 default keeps values through 1 MiB, including the Stored Entry metadata and alignment fragments, in
 one run. Direct I/O expands the read to the covering 4 KiB frame span; buffered I/O reads only the
 logical bytes. Frame counters describe pages covered, not separate I/O calls. This path does not
 read Entry-directory metadata, so a hot index lookup does not add a sidecar I/O.
-Directory records exist for reclaim and tail recovery, not foreground lookup. Any stale, torn, or
+Directory records exist for bounded current-tail recovery, not foreground lookup or reclaim. Any stale, torn, or
 mismatched location is a miss/error boundary, never an unverified hit. There is deliberately no
 second batch-read implementation beside Foyer's point-load interface.
 
-Reclaim and tail recovery read directory records in bounded 64 KiB runs and decode them in memory.
-The run bound prevents a high-cardinality extent from allocating an unbounded buffer while avoiding
-the former one-`pread`-per-Entry syscall pattern.
+Tail recovery reads directory records in bounded 64 KiB runs and stops at the first invalid record.
+Normal reopen therefore reads at most three current tails, independent of total payload size and
+sealed-extent count. Reclaim is a metadata-only generation transition and contributes no directory,
+index, or payload reads.
 
 Run limits are runtime syscall-batching controls, not persistent-layout boundaries. A point read
 allocates only the covering range for that Entry, capped per syscall; setting a 2 MiB maximum does
@@ -110,8 +112,9 @@ a read-quiescent point, but the read-priority interval is bounded (2 ms by defau
 arriving reads cannot starve cache publication or reclaim. Existing write concurrency remains the
 hard cap. A zero interval bypasses admission and accounting entirely.
 
-The scheduler does not own buffers, spawn I/O workers, reorder durability steps, or alter the disk
-format. The admitted caller executes the positional syscall directly. Allocator-state persistence
+The scheduler does not own buffers, reorder durability steps, or alter the disk format. Default
+single-concurrency writes execute inline with one reusable aligned buffer; explicitly parallel
+writes use an ExtentPool-owned persistent bounded worker pool. Allocator-state persistence
 and FixedRecordLSM remain outside this policy: allocator writes are serialized recovery-critical
 transitions, while an index lookup may be satisfied by its memory overlay or block cache without a
 physical I/O. Extending admission into FixedRecordLSM requires evidence of metadata-I/O contention,
@@ -133,7 +136,9 @@ under the mutation lock and releases it.
 
 The value-content digest is computed once on submission and stored in both the directory record and
 index location. A repeated key, encoded length, digest, and priority is idempotent without reading
-the old payload. The development-V4 CRC32 shortcut could suppress an update for an easily
+the old payload only when the index location is memory-resident and its allocator generation and
+range are still live. An SST-only or stale location is conservatively rewritten. The development-V4
+CRC32 shortcut could suppress an update for an easily
 constructed collision; development V5 introduced an 88-bit seeded XXH3 identity, retained by
 stable format 1, while keeping the same 32-byte location and 64-byte directory record sizes. The
 complete key is still compared on every returned hit.
@@ -143,7 +148,7 @@ Durable checkpoint order is:
 ```text
 payload + Entry directory sync
   -> alternating allocator-state copy
-  -> synced FixedRecordLSM batch + live-entry application state
+  -> synced FixedRecordLSM batch + indexed-cardinality upper bound
   -> frozen-overlay retirement
 ```
 
@@ -175,33 +180,41 @@ bounds, rounded up to reclaim-unit granularity, rather than preallocated partiti
 protection and all unreserved capacity remain borrowable. Low priority has no floor and can recycle
 only low-priority extents.
 
-Normal pressure reclaims low data first, then high occupancy above the high floor, then normal
-data. High pressure reclaims low data first, then normal occupancy above the normal floor, then
-high data. Thus stale historical high-priority data cannot starve normal demand, and high writes
-cannot consume normal's protected working set. Floor percentages are runtime policy and may change
-across reopen; extent ownership remains part of the durable allocator state.
+Normal pressure reclaims low data first. While normal occupancy is below its protected floor, it
+then repays high occupancy borrowed beyond the high floor; once normal's floor is satisfied, it
+reclaims normal's own oldest extent instead of evicting explicitly hotter data to grow into shared
+capacity. High pressure reclaims low data first, then normal occupancy above the normal floor, then
+high data. Thus stale historical high-priority data cannot starve normal's protected demand, while
+normal churn cannot erase a useful high-priority working set merely because high has grown beyond
+its minimum. Floor percentages are runtime policy and may change across reopen; extent ownership
+remains part of the durable allocator state.
 
-Within the selected class, valuable entries may be promoted into the reclaim target; others are
-removed from the index. Promotion is considered only for same-priority reclaim and is capped at the
-hottest one eighth of the source extent using `max(stored length, Entry charge)`, bounding both
-payload and directory pressure and keeping promotion-only write amplification near one seventh.
-Extent generation changes fence all stale locations.
+Once a victim is selected, reclaim waits only for an already captured metadata checkpoint to
+finish, verifies that previous payload writes are fenced, increments the victim generation, marks
+the extent free, and persists the alternating allocator-state copy. This is the complete normal
+reclaim transaction. It performs no directory scan, per-key index lookup, tombstone batch, payload
+read, payload copy, or index checkpoint. The allocator write and sync are required before the same
+physical bytes can be overwritten; the pre-I/O generation check makes every old location a miss.
 
 The concrete `Reclaimer` owns that complete transition. `ExtentStore` invokes it only from the
 ordered publication path while holding the mutation lock; it is deliberately not an independent
 background service or a pluggable policy interface.
 
-Reclaim is serialized with metadata persistence. Before a source generation can be reused, the
-store performs the required inline checkpoint and publishes removals/promotions. This is the
-exception to background checkpointing because generation reuse cannot race an older captured
-epoch.
+Reclaim is serialized with metadata persistence without forcing new metadata work. The store holds
+the mutation order while it waits for an older captured epoch, so the background coordinator cannot
+capture another allocator image before generation invalidation is durable. The wait has a separate
+latency metric and normally resolves immediately.
 
-Priority and temperature remain distinct:
+Priority is the explicit temperature and retention class supplied by the caller (`high`, `normal`,
+or `low`). Entries of one class are appended to class-owned extents, and victim selection works at
+that same physical granularity. ExtentStore does not infer hotness from foreground reads and does
+not turn hits into reclaim writes.
 
-- priority is supplied by the caller (`high`, `normal`, `low`);
-- temperature is the volatile TinyLFU-style reuse estimate;
-- capacity floors protect minimum physical residency without persisting temperature;
-- promotion requires the configured threshold for the entry's priority.
+Old index locations are intentionally left in place on the reclaim path. FixedRecordLSM checks
+their generation only while an existing non-trivial compaction is already rewriting those records;
+an invalid newest location becomes a tombstone, and a bottom-level compaction can drop it. Trivial
+moves remain zero-copy and do not rewrite a file merely for garbage collection. The persisted index
+cardinality is consequently an upper bound, never an admission limit or a correctness input.
 
 ## EntryIndex boundary
 
@@ -234,15 +247,19 @@ accounting, and rejected index implementations are specified in
   only for physical I/O frames.
 - **Cross-extent Entry descriptors** would reduce boundary waste but make reads, reclaim, and crash
   recovery span multiple generations. Extent seals the current cache extent instead.
-- **Payload scanning during reclaim or recovery** would remove the Entry directory at the cost of a
-  full payload read. The compact sidecar keeps these paths bounded without entering foreground
-  lookup.
+- **Payload or directory scanning during reclaim** would make eviction cost proportional to victim
+  cardinality and pollute the read path. Generation invalidation makes reclaim O(1). The directory
+  remains only because bounded current-tail recovery needs allocation boundaries without scanning
+  payload bytes.
 - **One directory record per page or slot** duplicates Entry identity and inflates index cardinality.
   The packed layout stores one directory record and one EntryIndex location per complete Entry.
 - **Fixed priority partitions** strand capacity when one class is idle. Borrowable floors preserve
   minimum residency while allowing repayment under later demand.
 - **An independent background reclaimer** would race the total mutation order and generation
   checkpointing. Reclaim remains an ordered ExtentStore transition.
+- **Access-frequency promotion during reclaim** converts cache hits into tracking overhead and
+  eviction into payload rewrite amplification. Callers classify hot and cold data explicitly;
+  Extent preserves that class in physical placement and evicts whole extents.
 - **A hard EntryIndex capacity limit** turns transient LSM amplification into a cache-health
   failure. The layout target is soft while usage remains exactly accounted.
 - **The former 64 KiB read-run maximum** came from the fixed-slot layout and split a common 64 KiB

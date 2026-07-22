@@ -1478,10 +1478,11 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
     }
     if let Some(stats) = handle.physical_write_stats() {
         println!(
-            "engine={} phase=extent_write physical_mib={:.1} physical_runs={} data_mib={:.1} data_runs={} data_syncs={} directory_mib={:.1} directory_runs={} directory_syncs={} index_mib={:.1} index_runs={} index_syncs={} allocator_mib={:.1} allocator_runs={} allocator_syncs={}",
+            "engine={} phase=extent_write physical_mib={:.1} physical_runs={} physical_syncs={} data_mib={:.1} data_runs={} data_syncs={} directory_mib={:.1} directory_runs={} directory_syncs={} index_mib={:.1} index_runs={} index_syncs={} index_wal_mib={:.1} index_wal_runs={} index_wal_syncs={} index_sst_mib={:.1} index_sst_runs={} index_sst_syncs={} index_manifest_kib={:.1} index_manifest_runs={} index_manifest_syncs={} index_flushes={} index_compactions={} index_compaction_input_mib={:.1} index_compaction_output_mib={:.1} allocator_mib={:.1} allocator_runs={} allocator_syncs={}",
             engine.label(),
             as_mib(stats.total_bytes()),
             stats.total_runs(),
+            stats.total_syncs(),
             as_mib(stats.data_bytes),
             stats.data_runs,
             stats.data_syncs,
@@ -1491,6 +1492,19 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
             as_mib(stats.index_bytes),
             stats.index_runs,
             stats.index_syncs,
+            as_mib(stats.index_wal_bytes),
+            stats.index_wal_runs,
+            stats.index_wal_syncs,
+            as_mib(stats.index_sst_bytes),
+            stats.index_sst_runs,
+            stats.index_sst_syncs,
+            stats.index_manifest_bytes as f64 / KIB as f64,
+            stats.index_manifest_runs,
+            stats.index_manifest_syncs,
+            stats.index_flushes,
+            stats.index_compactions,
+            as_mib(stats.index_compaction_input_bytes),
+            as_mib(stats.index_compaction_output_bytes),
             as_mib(stats.allocator_bytes),
             stats.allocator_runs,
             stats.allocator_syncs,
@@ -1506,19 +1520,13 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
     }
     if let Some(stats) = handle.reclaim_stats() {
         println!(
-            "engine={} phase=extent_reclaim extents={} scanned_entries={} directory_mib={:.1} directory_runs={} index_lookups={} preparation_ms={:.3} directory_ms={:.3} index_ms={:.3} transaction_ms={:.3} promotion_ms={:.3} publication_ms={:.3} total_ms={:.3}",
+            "engine={} phase=extent_reclaim extents={} invalidated_entries={} invalidated_mib={:.1} checkpoint_wait_ms={:.3} generation_invalidation_ms={:.3} total_ms={:.3}",
             engine.label(),
             stats.total_reclaimed_extents(),
-            stats.scanned_entries(),
-            as_mib(stats.directory_read_bytes()),
-            stats.directory_read_runs(),
-            stats.index_lookups(),
-            stats.preparation_nanos() as f64 / 1_000_000.0,
-            stats.directory_scan_nanos() as f64 / 1_000_000.0,
-            stats.index_lookup_nanos() as f64 / 1_000_000.0,
-            stats.transaction_nanos() as f64 / 1_000_000.0,
-            stats.promotion_nanos() as f64 / 1_000_000.0,
-            stats.publication_nanos() as f64 / 1_000_000.0,
+            stats.total_invalidated_entries(),
+            as_mib(stats.total_invalidated_bytes() as u64),
+            stats.checkpoint_wait_nanos() as f64 / 1_000_000.0,
+            stats.generation_invalidation_nanos() as f64 / 1_000_000.0,
             stats.total_nanos() as f64 / 1_000_000.0,
         );
     }
@@ -1540,16 +1548,15 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
     }
     if let Some(index) = handle.entry_index_stats() {
         println!(
-            "engine={} phase=extent_index live_entries={} wal_mib={:.1} sst_files={} sst_mib={:.1} cache_resident_mib={:.1} frequency_mib={:.1} frequency_counters={} frequency_sample_window={}",
+            "engine={} phase=extent_index indexed_entries_upper_bound={} wal_mib={:.1} sst_files={} sst_mib={:.1} cache_resident_mib={:.1} stale_location_checks={} stale_location_discards={}",
             engine.label(),
-            index.live_entries,
+            index.indexed_entries_upper_bound,
             as_mib(index.wal_bytes),
             index.sst_files,
             as_mib(index.sst_bytes),
             as_mib(index.cache_resident_bytes),
-            as_mib(index.frequency_bytes),
-            index.frequency_counters,
-            index.frequency_sample_window,
+            index.stale_location_checks,
+            index.stale_location_discards,
         );
     }
     if let Some(occupancy) = handle.extent_occupancy() {

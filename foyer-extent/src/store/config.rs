@@ -70,8 +70,6 @@ pub struct ExtentStoreOptions {
     pub index_write_buffer_size: usize,
     pub index_cache_size: usize,
     pub checkpoint_bytes: usize,
-    pub hot_frequency: u8,
-    pub low_hot_frequency: u8,
     pub priority_capacity_floors: PriorityCapacityFloors,
     pub direct_io: bool,
 }
@@ -87,8 +85,6 @@ impl Default for ExtentStoreOptions {
             index_write_buffer_size: DEFAULT_INDEX_WRITE_BUFFER_SIZE,
             index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
             checkpoint_bytes: DEFAULT_CHECKPOINT_BYTES,
-            hot_frequency: 2,
-            low_hot_frequency: 2,
             priority_capacity_floors: PriorityCapacityFloors::default(),
             direct_io: false,
         }
@@ -119,16 +115,6 @@ impl ExtentStoreOptions {
 
     pub fn with_checkpoint_bytes(mut self, bytes: usize) -> Self {
         self.checkpoint_bytes = bytes;
-        self
-    }
-
-    pub fn with_hot_frequency(mut self, frequency: u8) -> Self {
-        self.hot_frequency = frequency;
-        self
-    }
-
-    pub fn with_low_hot_frequency(mut self, frequency: u8) -> Self {
-        self.low_hot_frequency = frequency;
         self
     }
 

@@ -9,7 +9,8 @@ Extent's exact 24-byte key, 32-byte location, high-churn point-lookup workload.
 - Keys are exactly 24 bytes and values are exactly 32 bytes.
 - The only mutations are put and delete; a write batch becomes visible atomically.
 - A write batch may atomically carry one opaque `u64` application state. ExtentStore uses it for
-  the exact durable live-entry count, so recovery never scans keys to rebuild cardinality.
+  a durable indexed-cardinality upper bound, so recovery never scans keys merely to rebuild
+  telemetry.
 - Reads are exact point lookups. There is no public iterator, range API, snapshot, transaction,
   column family, merge operator, TTL, or compression policy.
 - Buffered and WAL-synced writes are supported. WAL-free writes exist only for a bulk load that is
@@ -82,9 +83,14 @@ mutations are caught by the overlay recheck without invalidating unrelated reads
 
 A checkpoint rotates the active overlay while holding ExtentStore's mutation lock, then persists
 payload, allocator state, and the frozen index batch in that order. The index batch uses a synced
-WAL frame and carries the captured live-entry count as application state. Retiring the frozen
+WAL frame and carries the captured indexed-cardinality upper bound as application state. Retiring the frozen
 overlay is only an in-memory step after that frame succeeds. A crash may leak allocator space, but
 cannot publish an index location whose payload and allocator generation are not already durable.
+
+Whole-extent generation invalidation can leave obsolete locations in the LSM. A lock-free
+compaction filter checks them only during an already non-trivial rewrite, converts an invalid newest
+location into a tombstone, and lets bottom-level compaction drop it. Trivial moves remain
+metadata-only, so garbage collection never schedules extra SST I/O.
 
 ExtentPool remains an ordinary physical payload store. It neither exposes range semantics to the index
 nor derives its payload layout from an index file. FixedRecordLSM is the sole EntryIndex backend;

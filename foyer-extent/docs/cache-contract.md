@@ -79,9 +79,10 @@ key or cache-extent generation.
 
 ## Priority and admission
 
-Cache priority represents caller importance; cache temperature is an independent volatile reuse
-estimate. Priority affects queue shedding and physical residency protection. Temperature is used
-only for bounded same-priority promotion during reclaim.
+Cache priority is the caller's explicit temperature and retention class. It affects queue shedding,
+physical extent placement, protected capacity floors, and victim selection. Foreground reads do not
+maintain a second frequency estimate, and reclaim never copies a hit merely to preserve it. Callers
+that know data is hot use high priority; cold or speculative data uses low priority.
 
 Admission is internal. A put can be queued, shed, dropped during shutdown, rejected by cache
 policy, or fail in the background without changing the method's return type. These outcomes are

@@ -57,7 +57,7 @@ type ExtentPiece = PieceRef<Bytes, EngineValue, HybridCacheProperties>;
 /// Configuration for installing Extent as a Foyer disk engine.
 ///
 /// Capacity is the only production static input. The format owns its entry charge and extent size and
-/// validates the effective layout when reopening. Queue, batching, I/O, checkpoint, frequency, and
+/// validates the effective layout when reopening. Queue, batching, I/O, checkpoint, priority, and
 /// index-cache settings are runtime tuning knobs and may change across reopens.
 #[derive(Debug)]
 pub struct ExtentEngineConfig {
@@ -150,18 +150,6 @@ impl ExtentEngineConfig {
     /// Set the maximum interval between metadata checkpoint requests.
     pub fn with_checkpoint_interval(mut self, interval: Duration) -> Self {
         self.checkpoint_interval = interval;
-        self
-    }
-
-    /// Set the reuse frequency required to promote normal/high-priority entries.
-    pub fn with_hot_frequency(mut self, frequency: u8) -> Self {
-        self.store.options.hot_frequency = frequency;
-        self
-    }
-
-    /// Set the reuse frequency required to promote low-priority entries.
-    pub fn with_low_hot_frequency(mut self, frequency: u8) -> Self {
-        self.store.options.low_hot_frequency = frequency;
         self
     }
 
@@ -997,6 +985,68 @@ mod tests {
         assert_eq!(physical.data_syncs, 1);
         assert_eq!(physical.entry_directory_syncs, 1);
         cache.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_persists_only_the_last_command_per_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = ExtentEngineConfig::new(directory.path(), 16 * 1024 * 1024)
+            .with_test_layout(4 * 1024, 32 * 1024)
+            .with_index_write_buffer_size(64 * 1024)
+            .with_index_cache_size(1024 * 1024)
+            .with_queue_capacity_bytes(1024 * 1024)
+            .with_queue_capacity_entries(128)
+            .with_write_batch_bytes(128 * 1024)
+            .with_write_batch_entries(32)
+            .with_write_batch_delay(Duration::from_millis(250));
+        let store_config = config.store;
+        let handle = config.handle();
+        let cache = HybridCache::builder()
+            .with_name("extent-mixed-write-batch")
+            .with_policy(HybridCachePolicy::WriteOnInsertion)
+            .with_flush_on_close(false)
+            .memory(1024 * 1024)
+            .storage()
+            .with_engine_config(Box::new(config) as Box<dyn EngineConfig<Bytes, EngineValue, HybridCacheProperties>>)
+            .with_recover_mode(RecoverMode::None)
+            .build()
+            .await
+            .unwrap();
+
+        let retained = Bytes::from_static(b"retained");
+        let deleted = Bytes::from_static(b"deleted");
+        cache.insert(
+            retained.clone(),
+            EngineValue::new(Bytes::from(vec![1; 4096]), crate::CachePriority::Normal).unwrap(),
+        );
+        cache.insert(
+            retained.clone(),
+            EngineValue::new(Bytes::from(vec![2; 4096]), crate::CachePriority::Normal).unwrap(),
+        );
+        cache.insert(
+            deleted.clone(),
+            EngineValue::new(Bytes::from(vec![3; 4096]), crate::CachePriority::Normal).unwrap(),
+        );
+        cache.remove(&deleted);
+        cache.storage().wait().await;
+
+        let writes = handle.write_stats().unwrap();
+        assert_eq!(writes.accepted_commands, 4);
+        assert_eq!(writes.completed_commands, 4);
+        assert_eq!(writes.completed_batches, 1);
+        let physical = handle.physical_write_stats().unwrap();
+        assert_eq!(physical.data_syncs, 1);
+        assert_eq!(physical.entry_directory_syncs, 1);
+        assert_eq!(physical.entry_directory_bytes, crate::store::ENTRY_OWNER_SIZE as u64);
+
+        cache.close().await.unwrap();
+        drop(cache);
+        let reopened = open_store(directory.path(), store_config, RecoverMode::Strict).unwrap();
+        assert_eq!(
+            reopened.store.get(&EntryKey::new(&retained).unwrap()).unwrap(),
+            Some(vec![2; 4096])
+        );
+        assert_eq!(reopened.store.get(&EntryKey::new(&deleted).unwrap()).unwrap(), None);
     }
 
     #[tokio::test]

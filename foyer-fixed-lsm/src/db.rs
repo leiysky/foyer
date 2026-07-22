@@ -165,6 +165,7 @@ pub struct FixedLsmStats {
     pub wal_bytes: u64,
     pub wal_write_operations: u64,
     pub wal_write_bytes: u64,
+    pub wal_sync_operations: u64,
     pub recovered_records: u64,
     pub discarded_wal_tail_bytes: u64,
     pub level_files: [u64; LEVEL_COUNT],
@@ -181,6 +182,10 @@ pub struct FixedLsmStats {
     pub table_read_bytes: u64,
     pub table_write_operations: u64,
     pub table_write_bytes: u64,
+    pub table_sync_operations: u64,
+    pub manifest_write_operations: u64,
+    pub manifest_write_bytes: u64,
+    pub manifest_sync_operations: u64,
     pub point_filter_checks: u64,
     pub point_filter_positives: u64,
     pub point_data_cache_hits: u64,
@@ -192,6 +197,8 @@ pub struct FixedLsmStats {
     pub compaction_input_bytes: u64,
     pub compaction_output_bytes: u64,
     pub trivial_move_operations: u64,
+    pub compaction_filter_checks: u64,
+    pub compaction_filter_discards: u64,
 }
 
 /// Lightweight cumulative table-read counters.
@@ -212,6 +219,17 @@ pub enum FixedLsmMemoryLookup {
     Unknown,
 }
 
+/// Decides whether the newest value for a key is already logically obsolete.
+///
+/// The filter is consulted only while a non-trivial compaction is already rewriting records. A
+/// discarded value first becomes a tombstone, preventing an older value in a deeper level from
+/// becoming visible; bottom-level compaction may then omit that tombstone. Implementors should
+/// keep this callback fast and must not perform I/O.
+pub trait CompactionFilter: std::fmt::Debug + Send + Sync + 'static {
+    /// Returns `true` when `value` can be treated as a deletion for `key`.
+    fn should_discard(&self, key: &Key, value: &Value) -> bool;
+}
+
 #[derive(Debug, Default)]
 struct MaintenanceCounters {
     flush_operations: AtomicU64,
@@ -220,6 +238,11 @@ struct MaintenanceCounters {
     compaction_input_bytes: AtomicU64,
     compaction_output_bytes: AtomicU64,
     trivial_move_operations: AtomicU64,
+    manifest_write_operations: AtomicU64,
+    manifest_write_bytes: AtomicU64,
+    manifest_sync_operations: AtomicU64,
+    compaction_filter_checks: AtomicU64,
+    compaction_filter_discards: AtomicU64,
 }
 
 impl MaintenanceCounters {
@@ -237,6 +260,18 @@ impl MaintenanceCounters {
         if trivial_move {
             self.trivial_move_operations.fetch_add(1, AtomicOrdering::Relaxed);
         }
+    }
+
+    fn record_manifest_write(&self, bytes: u64) {
+        self.manifest_write_operations.fetch_add(1, AtomicOrdering::Relaxed);
+        self.manifest_write_bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
+        self.manifest_sync_operations.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    fn record_compaction_filter(&self, checks: u64, discards: u64) {
+        self.compaction_filter_checks.fetch_add(checks, AtomicOrdering::Relaxed);
+        self.compaction_filter_discards
+            .fetch_add(discards, AtomicOrdering::Relaxed);
     }
 }
 
@@ -461,12 +496,14 @@ struct Inner {
     state: RwLock<ReadState>,
     writer: Mutex<WriterState>,
     maintenance: Mutex<()>,
+    compaction_filter: RwLock<Option<Arc<dyn CompactionFilter>>>,
     next_file_id: AtomicU64,
     recovered_records: u64,
     discarded_wal_tail_bytes: u64,
     writes: AtomicU64,
     wal_write_operations: AtomicU64,
     wal_write_bytes: AtomicU64,
+    wal_sync_operations: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -533,12 +570,14 @@ impl FixedLsm {
                 wal,
             }),
             maintenance: Mutex::new(()),
+            compaction_filter: RwLock::new(None),
             next_file_id: AtomicU64::new(1),
             recovered_records: 0,
             discarded_wal_tail_bytes: 0,
             writes: AtomicU64::new(0),
             wal_write_operations: AtomicU64::new(0),
             wal_write_bytes: AtomicU64::new(0),
+            wal_sync_operations: AtomicU64::new(0),
         })
     }
 
@@ -636,12 +675,14 @@ impl FixedLsm {
                 wal,
             }),
             maintenance: Mutex::new(()),
+            compaction_filter: RwLock::new(None),
             next_file_id: AtomicU64::new(next_file_id),
             recovered_records: recovered.records.len() as u64,
             discarded_wal_tail_bytes: recovered.discarded_tail_bytes,
             writes: AtomicU64::new(0),
             wal_write_operations: AtomicU64::new(0),
             wal_write_bytes: AtomicU64::new(0),
+            wal_sync_operations: AtomicU64::new(0),
         })
     }
 
@@ -705,7 +746,7 @@ impl FixedLsm {
                 let bytes = writer
                     .wal
                     .append(&records, user_state, options.durability == Durability::Sync)?;
-                self.record_wal_write(bytes);
+                self.record_wal_write(bytes, options.durability == Durability::Sync);
             }
             let mutable = rwlock_read(&self.inner.state).mutable.clone();
             mutable.apply(&records, writer.user_state);
@@ -738,7 +779,7 @@ impl FixedLsm {
                 let bytes = writer
                     .wal
                     .append(&records, user_state, options.durability == Durability::Sync)?;
-                self.record_wal_write(bytes);
+                self.record_wal_write(bytes, options.durability == Durability::Sync);
             }
             let mutable = rwlock_read(&self.inner.state).mutable.clone();
             mutable.apply(&records, user_state);
@@ -754,6 +795,14 @@ impl FixedLsm {
 
     pub fn user_state(&self) -> u64 {
         mutex_lock(&self.inner.writer).user_state
+    }
+
+    /// Installs or clears the filter used by future non-trivial compactions.
+    ///
+    /// Trivial file moves deliberately bypass the filter so installing one never forces an SST
+    /// rewrite merely to discover obsolete records.
+    pub fn set_compaction_filter(&self, filter: Option<Arc<dyn CompactionFilter>>) {
+        *rwlock_write(&self.inner.compaction_filter) = filter;
     }
 
     /// Return the bytes currently charged to the database disk budget.
@@ -836,6 +885,7 @@ impl FixedLsm {
             wal_bytes: total_wal_bytes(&self.inner.directory),
             wal_write_operations: self.inner.wal_write_operations.load(AtomicOrdering::Relaxed),
             wal_write_bytes: self.inner.wal_write_bytes.load(AtomicOrdering::Relaxed),
+            wal_sync_operations: self.inner.wal_sync_operations.load(AtomicOrdering::Relaxed),
             recovered_records: self.inner.recovered_records,
             discarded_wal_tail_bytes: self.inner.discarded_wal_tail_bytes,
             level_files,
@@ -852,6 +902,22 @@ impl FixedLsm {
             table_read_bytes: io.read_bytes,
             table_write_operations: io.write_operations,
             table_write_bytes: io.write_bytes,
+            table_sync_operations: io.sync_operations,
+            manifest_write_operations: self
+                .inner
+                .maintenance_counters
+                .manifest_write_operations
+                .load(AtomicOrdering::Relaxed),
+            manifest_write_bytes: self
+                .inner
+                .maintenance_counters
+                .manifest_write_bytes
+                .load(AtomicOrdering::Relaxed),
+            manifest_sync_operations: self
+                .inner
+                .maintenance_counters
+                .manifest_sync_operations
+                .load(AtomicOrdering::Relaxed),
             point_filter_checks: cache.filter_accesses,
             point_filter_positives: cache.filter_positives,
             point_data_cache_hits: cache.data_hits,
@@ -886,6 +952,16 @@ impl FixedLsm {
                 .inner
                 .maintenance_counters
                 .trivial_move_operations
+                .load(AtomicOrdering::Relaxed),
+            compaction_filter_checks: self
+                .inner
+                .maintenance_counters
+                .compaction_filter_checks
+                .load(AtomicOrdering::Relaxed),
+            compaction_filter_discards: self
+                .inner
+                .maintenance_counters
+                .compaction_filter_discards
                 .load(AtomicOrdering::Relaxed),
         }
     }
@@ -939,7 +1015,7 @@ impl FixedLsm {
                     user_state,
                     options.durability == Durability::Sync,
                 )?;
-                self.record_wal_write(bytes);
+                self.record_wal_write(bytes, options.durability == Durability::Sync);
             }
             let mutable = rwlock_read(&self.inner.state).mutable.clone();
             mutable.apply(std::slice::from_ref(&record), writer.user_state);
@@ -955,9 +1031,12 @@ impl FixedLsm {
         self.inner.disk_budget.reserve(bytes)
     }
 
-    fn record_wal_write(&self, bytes: u64) {
+    fn record_wal_write(&self, bytes: u64, synced: bool) {
         self.inner.wal_write_operations.fetch_add(1, AtomicOrdering::Relaxed);
         self.inner.wal_write_bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
+        if synced {
+            self.inner.wal_sync_operations.fetch_add(1, AtomicOrdering::Relaxed);
+        }
     }
 
     fn maybe_schedule_flush(&self, mutation_bytes: u64) -> Result<()> {
@@ -1199,6 +1278,9 @@ fn run_compaction(inner: &Inner, current: Arc<Version>, plan: CompactionPlan) ->
         return Ok(());
     }
     let input_bytes = plan.inputs.iter().map(|table| table.meta().file_size).sum();
+    for table in &plan.inputs {
+        table.advise_sequential();
+    }
     let mut iterators = plan.inputs.iter().map(Table::iterator).collect::<Vec<_>>();
     let mut heap = BinaryHeap::new();
     for (source, iterator) in iterators.iter_mut().enumerate() {
@@ -1212,6 +1294,9 @@ fn run_compaction(inner: &Inner, current: Arc<Version>, plan: CompactionPlan) ->
     let mut outputs = Vec::new();
     let output_fences = compaction_output_fences(&current, plan.target_level);
     let mut output_fence = 0;
+    let compaction_filter = rwlock_read(&inner.compaction_filter).clone();
+    let mut filter_checks = 0_u64;
+    let mut filter_discards = 0_u64;
     while let Some(entry) = heap.pop() {
         let key = entry.record.key;
         let mut newest = entry.record;
@@ -1222,6 +1307,13 @@ fn run_compaction(inner: &Inner, current: Arc<Version>, plan: CompactionPlan) ->
                 newest = entry.record;
             }
             advance_source(entry.source, &mut iterators, &mut heap)?;
+        }
+        if let (Some(filter), Some(value)) = (&compaction_filter, newest.value) {
+            filter_checks = filter_checks.saturating_add(1);
+            if filter.should_discard(&newest.key, &value) {
+                newest.value = None;
+                filter_discards = filter_discards.saturating_add(1);
+            }
         }
         if newest.value.is_none() && plan.drop_tombstones {
             continue;
@@ -1242,6 +1334,9 @@ fn run_compaction(inner: &Inner, current: Arc<Version>, plan: CompactionPlan) ->
     if !pending.is_empty() {
         outputs.push(write_compaction_table(inner, plan.target_level, &pending)?);
     }
+    for table in &plan.inputs {
+        table.advise_dont_need();
+    }
     #[cfg(test)]
     crash_if_requested("fixed_lsm_after_compaction_tables");
     let output_bytes = outputs.iter().map(|table| table.meta().file_size).sum();
@@ -1249,6 +1344,9 @@ fn run_compaction(inner: &Inner, current: Arc<Version>, plan: CompactionPlan) ->
     inner
         .maintenance_counters
         .record_compaction(input_bytes, output_bytes, false);
+    inner
+        .maintenance_counters
+        .record_compaction_filter(filter_checks, filter_discards);
     Ok(())
 }
 
@@ -1337,11 +1435,13 @@ fn create_table(inner: &Inner, file_id: u64, level: u32, records: &[Record]) -> 
 
 fn persist_manifest(inner: &Inner, manifest: &Manifest) -> Result<()> {
     let replaced_bytes = manifest.replaced_file_size(&inner.directory)?;
-    let reservation = inner.disk_budget.reserve(manifest.encoded_size(LEVEL_COUNT)?)?;
+    let manifest_bytes = manifest.encoded_size(LEVEL_COUNT)?;
+    let reservation = inner.disk_budget.reserve(manifest_bytes)?;
     // The temporary manifest may survive any failed I/O after creation. Keep its reservation on
     // error; callers poison the background/checkpoint path and reopen reconciles exact usage.
     reservation.commit();
     manifest.persist(&inner.directory, LEVEL_COUNT)?;
+    inner.maintenance_counters.record_manifest_write(manifest_bytes);
     inner.disk_budget.release(replaced_bytes);
     Ok(())
 }
@@ -1666,7 +1766,7 @@ mod tests {
 
     use crate::{
         db::{
-            FixedLsm, FixedLsmMemoryLookup, FixedLsmOptions, MemValue, WriteBatch, WriteOptions,
+            CompactionFilter, FixedLsm, FixedLsmMemoryLookup, FixedLsmOptions, MemValue, WriteBatch, WriteOptions,
             database_storage_bytes, dynamic_level_targets_for_bottom_bytes, mutex_lock, overlap_ratio_order,
         },
         error::Error,
@@ -1693,6 +1793,15 @@ mod tests {
         value[..8].copy_from_slice(&index.to_le_bytes());
         value[8..16].copy_from_slice(&generation.to_le_bytes());
         value
+    }
+
+    #[derive(Debug)]
+    struct DiscardKey([u8; 24]);
+
+    impl CompactionFilter for DiscardKey {
+        fn should_discard(&self, key: &[u8; 24], _value: &[u8; 32]) -> bool {
+            *key == self.0
+        }
     }
 
     fn test_options() -> FixedLsmOptions {
@@ -2052,6 +2161,28 @@ mod tests {
         let db = FixedLsm::open(directory.path(), test_options()).unwrap();
         assert_eq!(db.get(&key(1)).unwrap(), None);
         assert_eq!(db.stats().level_files.iter().sum::<u64>(), 0);
+    }
+
+    #[test]
+    fn compaction_filter_tombstones_stale_values_without_resurrecting_older_versions() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = FixedLsm::create(directory.path(), test_options()).unwrap();
+        db.set_compaction_filter(Some(Arc::new(DiscardKey(key(3)))));
+        for generation in 1..=5 {
+            let mut batch = WriteBatch::with_capacity(16);
+            for index in 0..16 {
+                batch.put(key(index), value(index, generation));
+            }
+            db.write(&batch, WriteOptions::buffered()).unwrap();
+            db.flush().unwrap();
+        }
+        db.compact().unwrap();
+
+        assert_eq!(db.get(&key(3)).unwrap(), None);
+        assert_eq!(db.get(&key(2)).unwrap(), Some(value(2, 5)));
+        let stats = db.stats();
+        assert!(stats.compaction_filter_checks > 0);
+        assert!(stats.compaction_filter_discards > 0);
     }
 
     #[test]

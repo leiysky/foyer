@@ -18,22 +18,27 @@ extent capacity floors; low priority uses unprotected capacity. Physical reads h
 `2 * available_parallelism` admission limit. The synchronous payload I/O scheduler gives an active
 entry-payload read a bounded 2 ms head start over newly admitted writes; reads never wait behind writes, and
 writes proceed after the bound so sustained reads cannot starve publication. This is a cooperative
-admission layer: the calling thread retains the buffer and executes `pread`, `pwrite`, or
-`fdatasync`; no extra executor or io_uring dependency is involved. Set the read-priority duration
-to zero for a full runtime bypass.
+admission layer: reads, syncs, and default single-concurrency writes execute on the calling thread;
+parallel-write configurations use one persistent bounded pool rather than per-batch OS threads.
+No io_uring dependency is involved. Set the read-priority duration to zero for a full runtime bypass.
 
 Low- and normal-priority writes are progressively shed before the queue is full, with earlier
 shedding while reads are active; high-priority puts retain the hard queue budget. Ordered deletes
 may temporarily overcommit that budget so a rejected update cannot leave an older value visible;
-pending queue gauges expose the overcommit instead of blocking the caller. An
+pending queue gauges expose the overcommit instead of blocking the caller. An ordered worker batch
+retains only the final command per complete key, coalesces all surviving puts
+behind one ordinary payload fence, and tombstones a stale disk value when a replacement is
+rejected. Reclaim reuses that payload fence and adds one recovery-critical generation-state sync;
+it does not scan the victim or copy retained payload. An
 `ExtentEngineHandle` exposes queue depth, publication/durability frontiers, asynchronous write
 outcomes, active read admission, scheduler waits, physical I/O, reclaim work, and the first sticky
 background failure. These observations do not turn fire-and-forget puts into acknowledged writes.
 The public `Cache` facade exposes this handle directly through `engine_handle()`, together with
 `storage_usage()` and the shared Foyer `statistics()`, so a production canary does not need to retain
 an internal builder config solely for observability. `estimated_entry_count()` returns the larger
-of the memory-resident count and the disk index's live count. It avoids systematic overlap
-double-counting and is intended only as a low-cost telemetry estimate.
+of the memory-resident count and live extents' physical record count. It avoids systematic
+memory/disk overlap double-counting but can include overwritten records inside an extent, so it is
+telemetry rather than an exact cardinality.
 
 The Foyer-facing queue, pipeline, and recovery state is also exported through its metrics registry as
 `foyer_storage_engine_command_total`, `foyer_storage_engine_batch_total`,
@@ -47,7 +52,8 @@ periodic checkpoint tick. `storage_usage()` is an O(1) snapshot over a fixed fil
 allocated blocks for the preallocated data/state files and sparse directory with
 FixedRecordLSM's atomic disk-budget counter.
 The shared physical-I/O counters include both payload and index reads, including reads that finish
-as a validated cache miss, and all payload, checkpoint, and index writes. Cumulative FixedRecordLSM
+as a validated cache miss, and all payload, checkpoint, and index writes. Index counters split WAL,
+SST, and manifest writes/syncs and report flush and compaction bytes. Cumulative FixedRecordLSM
 counters are reconciled exactly once so concurrent lookups cannot double-count index I/O.
 
 Stored Entries occupy contiguous byte ranges packed within cache extents. Adjacent allocations in
@@ -64,7 +70,7 @@ The sparse directory address space and EntryIndex target may exceed their plans 
 pressure without rejecting a cache write. Changing these choices, layout derivation, record
 encoding, or an incompatible embedded-index format requires an `EXTENT_FORMAT_VERSION` bump.
 Layout overrides remain available only as a test and benchmark escape hatch. Runtime I/O, queue,
-batching, checkpoint, frequency, and index-memory settings can change across reopens.
+batching, checkpoint, priority-floor, and index-memory settings can change across reopens.
 
 The durable exact index is the workspace-private `foyer-fixed-lsm` crate. RocksDB support is gated
 behind the `rocksdb-benchmark` feature and exists only as an industrial comparison point.
