@@ -124,9 +124,8 @@ The disk format is versioned as one layout: payload representation, allocator st
 FixedRecordLSM compatibility move together. Format 1 may be replaced in place before its first
 production freeze because development cache images are expendable. After that freeze, an
 incompatible change advances `EXTENT_FORMAT_VERSION`; Extent rejects the old cache and may recreate
-it because the authoritative copy remains outside the cache. Stable numbering starts at format 1.
-A distinct stable-family magic prevents a development format with the same numeric version from
-being accepted. There is no selectable legacy format or in-place migration path.
+it because the authoritative copy remains outside the cache. The family magic and format number
+must both match exactly. There is no compatibility decoder or in-place migration path.
 
 The Foyer engine boundary is separately guarded by a compile-time API version assertion. Extent and
 the workspace-pinned Foyer fork are upgraded together.
@@ -151,6 +150,6 @@ discouraged aliases used to keep ownership boundaries explicit.
 - Replacing Foyer's memory cache or hybrid coordination.
 - Acting as an authoritative KV database, object store, or application range store.
 - General transactions, iteration, range queries, or strong invalidation.
-- Runtime selection among legacy layouts, durable index backends, or reclaim implementations.
+- Runtime selection among persisted layouts, durable index backends, or reclaim implementations.
 - Recovery by payload scan or all-key rebuild.
 - Hidden device-specific defaults or benchmark-only production modes.

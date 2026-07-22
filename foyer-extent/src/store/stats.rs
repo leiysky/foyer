@@ -9,12 +9,10 @@ use crate::model::CachePriority;
 pub struct ExtentLayoutStats {
     pub configured_capacity_bytes: u64,
     pub planned_file_bytes: u64,
-    pub data_file_bytes: u64,
-    pub usable_payload_bytes: u64,
+    pub payload_capacity_bytes: u64,
     pub index_soft_capacity_bytes: u64,
     pub extent_size_bytes: u64,
-    pub physical_extents: u64,
-    pub usable_extents: u64,
+    pub extent_count: u64,
     pub entry_charge_bytes: u64,
     pub planned_live_entries: u64,
     pub maximum_live_entries: u64,
@@ -23,7 +21,7 @@ pub struct ExtentLayoutStats {
 /// A point-in-time view of physical extent ownership by cache priority.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ExtentOccupancy {
-    usable_extents: u32,
+    extent_count: u32,
     entries_per_extent: u32,
     occupied_extents: [u32; 3],
     used_entries: [u64; 3],
@@ -33,7 +31,7 @@ pub struct ExtentOccupancy {
 
 impl ExtentOccupancy {
     pub(crate) const fn new(
-        usable_extents: u32,
+        extent_count: u32,
         entries_per_extent: u32,
         occupied_extents: [u32; 3],
         used_entries: [u64; 3],
@@ -41,7 +39,7 @@ impl ExtentOccupancy {
         capacity_floor_extents: [u32; 3],
     ) -> Self {
         Self {
-            usable_extents,
+            extent_count,
             entries_per_extent,
             occupied_extents,
             used_entries,
@@ -50,8 +48,8 @@ impl ExtentOccupancy {
         }
     }
 
-    pub const fn usable_extents(self) -> u32 {
-        self.usable_extents
+    pub const fn extent_count(self) -> u32 {
+        self.extent_count
     }
 
     pub const fn entries_per_extent(self) -> u32 {

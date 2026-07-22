@@ -95,11 +95,9 @@ discards the unstarted queue tail, and publishes one final durable checkpoint. T
 is explicitly counted. This bounds shutdown by one batch plus checkpoint work without exposing a
 partially published entry; cache writes remain best effort and the source remains authoritative.
 
-Compatibility CI reconstructs a frozen complete development-V3 store image and verifies that Format
-1 rejects it and can recreate the expendable cache without leaving its legacy owner file behind.
-The stable-family magic prevents development formats V1-V6 from colliding with its version
-numbering. Current-format round-trip, checkpoint-tail-discard, and process-crash tests cover the
-payload, allocator, checkpoint, and reclaim publication paths.
+Current-format round-trip, invalid-magic/version, checkpoint-tail-discard, and process-crash tests
+cover the payload, allocator, checkpoint, and reclaim publication paths. Extent has one persisted
+layout and no compatibility reader or migration path.
 
 Design documentation is organized by boundary:
 

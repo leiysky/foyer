@@ -124,7 +124,7 @@ performed by `wait` or close.
 `EXTENT_BENCH_IO_READ_PRIORITY_US` controls Extent's cooperative payload-I/O policy and accepts
 zero as a complete bypass. The benchmark prints `extent_io_scheduler` records with the number and
 duration of actual write-admission waits. For scheduler A/B runs, keep initial payload plus the
-write wave within usable extent capacity and require the same hit set and comparable physical I/O
+write wave within payload capacity and require the same hit set and comparable physical I/O
 on both sides. A run that also changes eviction, accepted writes, or hit ratio measures a different
 workload and cannot establish scheduler latency benefit.
 
@@ -135,7 +135,7 @@ reports payload, index, and allocator run and sync counts separately so a write-
 not attribute metadata calls to payload splitting. `EXTENT_BENCH_WRITE_BATCH_DELAY_US`
 controls the optional sparse-arrival data-write microbatch window and defaults to zero; compare a
 nonzero candidate with zero under the same seeds and alternating run order before enabling it. The
-`extent_layout` record separates usable payload from the soft Index target. The write record also
+`extent_layout` record separates payload capacity from the soft Index target. The write record also
 splits index WAL, SST, and manifest calls/bytes/syncs and reports compaction input/output bytes;
 these counters describe userspace and FixedRecordLSM operations rather than device-internal write
 amplification. `extent_reclaim` reports invalidated extents/bytes, time waiting for an already

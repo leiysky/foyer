@@ -1,6 +1,4 @@
 mod checkpoint;
-#[cfg(test)]
-mod compatibility_tests;
 mod config;
 mod core;
 mod format;

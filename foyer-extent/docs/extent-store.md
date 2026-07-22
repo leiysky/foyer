@@ -49,10 +49,12 @@ discards allocations newer than the last allocator/index checkpoint instead of m
 per-Entry ownership sidecar.
 
 The hard layout calculation includes the preallocated data file and both allocator-state copies.
-One extent is excluded from usable payload capacity as reclaim headroom, and fewer than five
-physical extents are rejected. The 4 KiB Entry planning charge derives only the EntryIndex capacity
-target, which is deliberately excluded from the hard calculation: it plans one steady-state index
-copy, one atomic compaction output copy, and one WAL/L0 write tail, but remains a soft target.
+Every physical extent contributes payload capacity; metadata-only generation reclaim does
+not require a permanently empty target. Fewer than four physical extents are rejected so the
+default high and normal floors can both be represented at whole-extent granularity. The 4 KiB Entry
+planning charge derives only the EntryIndex capacity target, which is deliberately excluded from
+the hard calculation: it plans one steady-state index copy, one atomic compaction output copy, and
+one WAL/L0 write tail, but remains a soft target.
 
 Physical allocation is bounded by packed payload bytes, not by the planning charge. The theoretical
 Entry-count bound follows from the smallest valid Stored Entry, while small Entries may exceed
@@ -118,7 +120,7 @@ runtime tuning signals rather than acknowledged-write semantics.
 
 ## Insert and checkpoint
 
-An insert validates the Entry and reserves an exact byte range plus one in-memory entry ordinal.
+An insert validates the Entry and reserves an exact byte range.
 Adjacent same-extent allocations in a store batch are packed into page-aligned write frames; only
 the final frame is padded. The store writes payload, advances the extent cursor to the frame
 boundary, installs locations in the active overlay, and advances a logical published epoch without
@@ -130,9 +132,8 @@ The value-content digest is computed once on submission and stored in the index 
 recompute it from the Stored Entry value. A repeated key, encoded length, digest, and priority is
 idempotent without reading the old payload only when the index location is memory-resident and its
 allocator generation and range are still live. An SST-only or stale location is conservatively
-rewritten. The development-V4 CRC32 shortcut could suppress an update for an easily
-constructed collision; development V5 introduced an 88-bit seeded XXH3 identity, retained by
-stable format 1. The complete key is still compared on every returned hit.
+rewritten. The 88-bit seeded XXH3 content identity keeps this shortcut independent of payload I/O;
+the complete key is still compared on every returned hit.
 
 Durable checkpoint order is:
 
@@ -169,9 +170,9 @@ The checkpoint protocol maintains these invariants:
 
 Allocation is append-oriented within the current extent. Under pressure, priority capacity floors
 first select a reclaimable class, then age selects a victim extent. The default protects 10% of
-usable extents for high-priority data and 70% for normal-priority data; these are logical lower
+extents for high-priority data and 70% for normal-priority data; these are logical lower
 bounds, rounded up to reclaim-unit granularity, rather than preallocated partitions. Empty
-protection and all unreserved capacity remain borrowable. Low priority has no floor and can recycle
+protection and all shared capacity remain borrowable. Low priority has no floor and can recycle
 only low-priority extents.
 
 Normal pressure reclaims low data first. While normal occupancy is below its protected floor, it
@@ -186,7 +187,7 @@ remains part of the durable allocator state.
 Once a victim is selected, reclaim waits only for an already captured metadata checkpoint to
 finish, increments the victim generation, marks the extent free, and persists the alternating
 allocator-state copy before the bytes can be reused. It does not synchronize unrelated dirty
-payload. This is the complete normal reclaim transaction. It performs no ownership scan, per-key
+payload. This is the complete reclaim transition. It performs no ownership scan, per-key
 index lookup, tombstone batch, payload read, payload copy, or index checkpoint. The allocator write
 and sync are required before the same
 physical bytes can be overwritten; the pre-I/O generation check makes every old location a miss.
@@ -232,11 +233,8 @@ accounting, and rejected index implementations are specified in
 
 ## Failure model
 
-- A frozen development-V3 fixture covers the former payload, owner, allocator, manifest, and WAL
-  layout. Stable format 1 must reject it and the explicit recreate path must remove legacy owned
-  files before creating the current layout. The stable family magic also rejects development
-  formats that used the same numeric version. Current-format tests separately cover append, reopen,
-  checkpoint-tail discard, reclaim, and process abort.
+- Current-format tests cover append, reopen, invalid magic/version rejection, checkpoint-tail
+  discard, reclaim, and process abort. There is no compatibility decoder or migration path.
 - Incomplete final WAL frames are ignored; corruption inside the durable prefix is an error.
 - The newest invalid allocator or manifest copy falls back to the older valid copy.
 - New SSTs are synced before a manifest can reference them.
@@ -248,9 +246,8 @@ accounting, and rejected index implementations are specified in
 
 ## Design rationale and rejected alternatives
 
-- **Fixed allocation slots** simplified alignment but imposed severe tail padding on small Entries.
-  The packed layout prototyped in development V5 and retained by stable format 1 uses page alignment
-  only for physical I/O frames.
+- **Fixed allocation slots** simplify alignment but impose severe tail padding on small Entries.
+  The packed layout uses page alignment only for physical I/O frames.
 - **Cross-extent Entry descriptors** would reduce boundary waste but make reads, reclaim, and crash
   recovery span multiple generations. Extent seals the current cache extent instead.
 - **Payload or ownership-sidecar scanning during reclaim** would make eviction cost proportional to
@@ -268,9 +265,9 @@ accounting, and rejected index implementations are specified in
   Extent preserves that class in physical placement and evicts whole extents.
 - **A hard EntryIndex capacity limit** turns transient LSM amplification into a cache-health
   failure. The layout target is soft while usage remains exactly accounted.
-- **The former 64 KiB read-run maximum** came from the fixed-slot layout and split a common 64 KiB
-  value once its header, key, and direct-I/O alignment were included. A 2 MiB maximum makes the
-  bounded 1 MiB value workload one payload call per hit while preserving an explicit upper bound.
+- **A 64 KiB read-run maximum** splits a common 64 KiB value once its header, key, and direct-I/O
+  alignment are included. The 2 MiB default makes the bounded 1 MiB value workload one payload call
+  per hit while preserving an explicit upper bound.
 - **Larger 4 MiB and 8 MiB write runs** reduce syscall count but did not materially improve
   throughput in the bounded large-value validation and raised peak RSS. Writes remain capped at
   1 MiB unless a production device demonstrates a different throughput/latency tradeoff.
@@ -280,7 +277,7 @@ accounting, and rejected index implementations are specified in
 
 ## Deliberate non-goals
 
-- No selectable legacy layout or index implementation.
+- One persisted layout; no runtime format, index-backend, or reclaim-strategy selection.
 - No payload scan or all-key rebuild during recovery.
 - No range parsing or cross-Entry assembly in the store.
 - No general-purpose Rust RocksDB clone.

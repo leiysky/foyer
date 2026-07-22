@@ -118,8 +118,8 @@ by an earlier WAL acknowledgement.
 
 Online `HybridCache::clear()` is unsupported. Correct reset requires a new cache incarnation rather
 than an O(live entries) tombstone pass. Close and reopen with non-recovery mode removes only
-Extent-owned files beneath the configured directory, including legacy owned paths; unrelated caller
-files are never recursively deleted.
+the current Extent-owned paths beneath the configured root; unrelated caller files are never
+recursively deleted.
 
 ## Compatibility boundary
 

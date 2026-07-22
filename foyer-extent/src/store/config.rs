@@ -36,15 +36,13 @@ impl PriorityCapacityFloors {
         self.normal_percent
     }
 
-    pub fn extent_floors(self, usable_extents: u32) -> [u32; 3] {
+    pub fn extent_floors(self, extent_count: u32) -> [u32; 3] {
         let floor = |percent: u8| {
             if percent == 0 {
                 0
             } else {
-                let extents = u64::from(usable_extents)
-                    .saturating_mul(u64::from(percent))
-                    .div_ceil(100);
-                u32::try_from(extents).expect("a capacity floor cannot exceed the usable extent count")
+                let extents = u64::from(extent_count).saturating_mul(u64::from(percent)).div_ceil(100);
+                u32::try_from(extents).expect("a capacity floor cannot exceed the extent count")
             }
         };
         [0, floor(self.normal_percent), floor(self.high_percent)]

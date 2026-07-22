@@ -41,7 +41,7 @@ impl<'a> Reclaimer<'a> {
         stored_len: usize,
         protected_extents: &HashSet<u32>,
     ) -> Result<AllocationDecision> {
-        let mut reclaimed = ReclaimResult::default();
+        let mut reclaimed = ReclaimStats::default();
         loop {
             match self.pool.allocate(priority, stored_len)? {
                 AllocationResult::Allocated(allocation) => {
@@ -68,18 +68,7 @@ impl<'a> Reclaimer<'a> {
         }
     }
 
-    /// Completes an interrupted Format 1 reclaim transaction left by an older process without
-    /// scanning its source. The persisted target cursor remains authoritative, and source
-    /// locations become generation-invalid cache misses.
-    pub fn recover_pending(&self) -> Result<()> {
-        let Some(transaction) = self.pool.pending_reclaim() else {
-            return Ok(());
-        };
-        self.checkpoints.wait_for_idle_locked()?;
-        self.pool.finish_reclaim(transaction)
-    }
-
-    fn reclaim(&self, victim: ExtentVictim) -> Result<ReclaimResult> {
+    fn reclaim(&self, victim: ExtentVictim) -> Result<ReclaimStats> {
         let started = Instant::now();
         let checkpoint_wait_started = Instant::now();
         self.checkpoints.wait_for_idle_locked()?;
@@ -98,33 +87,15 @@ impl<'a> Reclaimer<'a> {
             duration_nanos(invalidation_started.elapsed()),
             duration_nanos(started.elapsed()),
         );
-        Ok(ReclaimResult {
-            stats,
-            ..ReclaimResult::default()
-        })
+        Ok(stats)
     }
 }
 
 #[derive(Debug)]
 pub enum AllocationDecision {
-    Allocated(EntryAllocation, ReclaimResult),
-    FlushRequired(ReclaimResult),
-    Rejected(ReclaimResult),
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ReclaimResult {
-    pub stats: ReclaimStats,
-    pub write_runs: usize,
-    pub written_bytes: usize,
-}
-
-impl ReclaimResult {
-    pub fn merge(&mut self, other: Self) {
-        self.stats.merge(other.stats);
-        self.write_runs = self.write_runs.saturating_add(other.write_runs);
-        self.written_bytes = self.written_bytes.saturating_add(other.written_bytes);
-    }
+    Allocated(EntryAllocation, ReclaimStats),
+    FlushRequired(ReclaimStats),
+    Rejected(ReclaimStats),
 }
 
 fn duration_nanos(duration: std::time::Duration) -> u64 {

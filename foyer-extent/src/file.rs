@@ -25,7 +25,7 @@ pub(crate) fn open_cache_file(path: &Path, create: bool, direct_io: bool) -> std
     options.open(path)
 }
 
-pub(crate) fn reserve_cache_file(file: &File, len: u64) -> std::io::Result<()> {
+pub(crate) fn preallocate_cache_file(file: &File, len: u64) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         rustix::fs::fallocate(file, rustix::fs::FallocateFlags::empty(), 0, len)
@@ -37,9 +37,9 @@ pub(crate) fn reserve_cache_file(file: &File, len: u64) -> std::io::Result<()> {
     }
 }
 
-pub(crate) fn ensure_cache_file_reserved(file: &File, len: u64) -> std::io::Result<()> {
+pub(crate) fn ensure_cache_file_preallocated(file: &File, len: u64) -> std::io::Result<()> {
     if allocated_file_size(file)? < len {
-        reserve_cache_file(file, len)?;
+        preallocate_cache_file(file, len)?;
     }
     Ok(())
 }

@@ -11,8 +11,6 @@ pub const LOCATION_RECORD_SIZE: usize = 32;
 const STATE_ENTRY_SIZE: usize = 24;
 const STATE_HEADER_SIZE: usize = 64;
 const STATE_CHECKSUM_SIZE: usize = size_of::<u32>();
-// Stable Extent formats use their own family magic so the first stable format can start at 1
-// without colliding with any development layout that used the former SCSEGST1 magic.
 const STATE_MAGIC: [u8; 8] = *b"FOYEXT01";
 /// Compatibility identity for every persisted Extent layout and encoding choice.
 ///
@@ -78,10 +76,9 @@ impl StoreLayout {
         let maximum_extents = config.capacity_bytes / extent_size as u64;
         let maximum_extents = u32::try_from(maximum_extents).unwrap_or(u32::MAX);
 
-        for extent_count in (5..=maximum_extents).rev() {
-            let planned_physical_entry_records = u64::from(extent_count) * u64::from(planned_entries_per_extent);
-            let planned_max_entries = planned_physical_entry_records - u64::from(planned_entries_per_extent);
-            let maximum_entries = u64::from(extent_count - 1)
+        for extent_count in (4..=maximum_extents).rev() {
+            let planned_max_entries = u64::from(extent_count) * u64::from(planned_entries_per_extent);
+            let maximum_entries = u64::from(extent_count)
                 .checked_mul(u64::from(maximum_entries_per_extent))
                 .ok_or_else(|| invalid_layout("maximum Entry count overflows u64"))?;
             let index_capacity_bytes = index_capacity_for_entries(planned_max_entries)?;
@@ -113,7 +110,7 @@ impl StoreLayout {
         }
 
         Err(Error::InvalidConfig(format!(
-            "extent store capacity must fit at least five {extent_size}-byte extents and their allocator metadata"
+            "extent store capacity must fit at least four {extent_size}-byte extents and their allocator metadata"
         )))
     }
 
@@ -138,8 +135,8 @@ impl StoreLayout {
         let extent_count = get_u32(state_copy, 12);
         let planned_entries_per_extent = get_u32(state_copy, 16);
         let entry_charge = usize::try_from(get_u32(state_copy, 20)).ok()?;
-        let extent_size = usize::try_from(get_u64(state_copy, 56)).ok()?;
-        if extent_count < 5
+        let extent_size = usize::try_from(get_u64(state_copy, 52)).ok()?;
+        if extent_count < 4
             || planned_entries_per_extent == 0
             || entry_charge < PAGE_SIZE
             || !entry_charge.is_multiple_of(PAGE_SIZE)
@@ -150,10 +147,8 @@ impl StoreLayout {
         }
 
         let maximum_entries_per_extent = u32::try_from(extent_size / MIN_STORED_ENTRY_SIZE).ok()?;
-        let planned_physical_entry_records =
-            u64::from(extent_count).checked_mul(u64::from(planned_entries_per_extent))?;
-        let planned_max_entries = planned_physical_entry_records.checked_sub(u64::from(planned_entries_per_extent))?;
-        let maximum_entries = u64::from(extent_count - 1).checked_mul(u64::from(maximum_entries_per_extent))?;
+        let planned_max_entries = u64::from(extent_count).checked_mul(u64::from(planned_entries_per_extent))?;
+        let maximum_entries = u64::from(extent_count).checked_mul(u64::from(maximum_entries_per_extent))?;
         let expected_index = index_capacity_for_entries(planned_max_entries).ok()?;
         let expected_data = u64::from(extent_count).checked_mul(extent_size as u64)?;
         let state_copy_size = state_copy_size(extent_count).ok()?;
@@ -208,22 +203,16 @@ fn invalid_layout(message: &str) -> Error {
 #[repr(u8)]
 pub enum ExtentRole {
     Free = 0,
-    Reserve = 1,
-    Current = 2,
-    Sealed = 3,
-    ReclaimSource = 4,
-    ReclaimTarget = 5,
+    Current = 1,
+    Sealed = 2,
 }
 
 impl ExtentRole {
     fn from_byte(value: u8) -> Option<Self> {
         match value {
             0 => Some(Self::Free),
-            1 => Some(Self::Reserve),
-            2 => Some(Self::Current),
-            3 => Some(Self::Sealed),
-            4 => Some(Self::ReclaimSource),
-            5 => Some(Self::ReclaimTarget),
+            1 => Some(Self::Current),
+            2 => Some(Self::Sealed),
             _ => None,
         }
     }
@@ -234,7 +223,7 @@ pub struct ExtentState {
     pub generation: u32,
     pub used_bytes: u32,
     pub entries: u32,
-    pub sequence: u64,
+    pub activation_sequence: u64,
     pub priority: CachePriority,
     pub role: ExtentRole,
 }
@@ -245,7 +234,7 @@ impl ExtentState {
             generation: 1,
             used_bytes: 0,
             entries: 0,
-            sequence: 0,
+            activation_sequence: 0,
             priority: CachePriority::Low,
             role: ExtentRole::Free,
         }
@@ -255,23 +244,19 @@ impl ExtentState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtentPoolState {
     pub state_generation: u64,
-    pub next_sequence: u64,
+    pub next_activation_sequence: u64,
     pub current: [Option<u32>; 3],
-    pub reserve: u32,
     pub extents: Vec<ExtentState>,
     pub active_page: u8,
 }
 
 impl ExtentPoolState {
     pub fn empty(layout: StoreLayout) -> Self {
-        let mut extents = vec![ExtentState::free(); layout.extent_count as usize];
-        extents[0].role = ExtentRole::Reserve;
         Self {
             state_generation: 1,
-            next_sequence: 1,
+            next_activation_sequence: 1,
             current: [None; 3],
-            reserve: 0,
-            extents,
+            extents: vec![ExtentState::free(); layout.extent_count as usize],
             active_page: 0,
         }
     }
@@ -289,21 +274,20 @@ impl ExtentPoolState {
             u32::try_from(layout.entry_charge).map_err(|_| invalid_layout("entry charge does not fit u32"))?,
         );
         put_u64(&mut output, 24, self.state_generation);
-        put_u64(&mut output, 32, self.next_sequence);
+        put_u64(&mut output, 32, self.next_activation_sequence);
         for (index, current) in self.current.iter().enumerate() {
             put_u32(&mut output, 40 + index * size_of::<u32>(), current.unwrap_or(NO_EXTENT));
         }
-        put_u32(&mut output, 52, self.reserve);
         put_u64(
             &mut output,
-            56,
+            52,
             u64::try_from(layout.extent_size).map_err(|_| invalid_layout("extent size does not fit u64"))?,
         );
         for (index, state) in self.extents.iter().enumerate() {
             let offset = STATE_HEADER_SIZE + index * STATE_ENTRY_SIZE;
             put_u32(&mut output, offset, state.generation);
             put_u32(&mut output, offset + 4, state.used_bytes);
-            put_u64(&mut output, offset + 8, state.sequence);
+            put_u64(&mut output, offset + 8, state.activation_sequence);
             output[offset + 16] = state.priority.to_byte();
             output[offset + 17] = state.role as u8;
             put_u32(&mut output, offset + 20, state.entries);
@@ -322,7 +306,7 @@ impl ExtentPoolState {
             || get_u32(input, 12) != layout.extent_count
             || get_u32(input, 16) != layout.planned_entries_per_extent
             || get_u32(input, 20) as usize != layout.entry_charge
-            || get_u64(input, 56) != layout.extent_size as u64
+            || get_u64(input, 52) != layout.extent_size as u64
         {
             return None;
         }
@@ -337,19 +321,18 @@ impl ExtentPoolState {
                 generation: get_u32(input, offset),
                 used_bytes: get_u32(input, offset + 4),
                 entries: get_u32(input, offset + 20),
-                sequence: get_u64(input, offset + 8),
+                activation_sequence: get_u64(input, offset + 8),
                 priority: CachePriority::from_byte(input[offset + 16])?,
                 role: ExtentRole::from_byte(input[offset + 17])?,
             });
         }
         let state = Self {
             state_generation: get_u64(input, 24),
-            next_sequence: get_u64(input, 32),
+            next_activation_sequence: get_u64(input, 32),
             current: std::array::from_fn(|index| {
                 let extent = get_u32(input, 40 + index * size_of::<u32>());
                 (extent != NO_EXTENT).then_some(extent)
             }),
-            reserve: get_u32(input, 52),
             extents,
             active_page,
         };
@@ -357,15 +340,12 @@ impl ExtentPoolState {
     }
 
     fn validate(&self, layout: StoreLayout) -> Result<()> {
-        if self.state_generation == 0 || self.next_sequence == 0 {
+        if self.state_generation == 0 || self.next_activation_sequence == 0 {
             return Err(invalid_layout("extent allocator generations must be positive"));
         }
-        if self.extents.len() != layout.extent_count as usize || self.reserve >= layout.extent_count {
-            return Err(invalid_layout("extent allocator reserve is invalid"));
+        if self.extents.len() != layout.extent_count as usize {
+            return Err(invalid_layout("extent allocator length is invalid"));
         }
-        let mut reserves = 0;
-        let mut reclaim_sources = 0;
-        let mut reclaim_targets = 0;
         for (extent, state) in self.extents.iter().enumerate() {
             if state.generation == 0
                 || state.used_bytes as usize > layout.extent_size
@@ -374,27 +354,31 @@ impl ExtentPoolState {
             {
                 return Err(invalid_layout("extent allocator entry is invalid"));
             }
-            reserves += usize::from(state.role == ExtentRole::Reserve);
-            reclaim_sources += usize::from(state.role == ExtentRole::ReclaimSource);
-            reclaim_targets += usize::from(state.role == ExtentRole::ReclaimTarget);
-            if state.role == ExtentRole::Current
-                && self.current[state.priority.to_byte() as usize] != Some(extent as u32)
-            {
-                return Err(invalid_layout("extent current pointer is inconsistent"));
+            match state.role {
+                ExtentRole::Free => {
+                    if state.used_bytes != 0
+                        || state.entries != 0
+                        || state.activation_sequence != 0
+                        || state.priority != CachePriority::Low
+                    {
+                        return Err(invalid_layout("free extent carries allocated state"));
+                    }
+                }
+                ExtentRole::Current | ExtentRole::Sealed => {
+                    if state.used_bytes == 0
+                        || state.entries == 0
+                        || state.activation_sequence == 0
+                        || state.activation_sequence >= self.next_activation_sequence
+                    {
+                        return Err(invalid_layout("allocated extent state is invalid"));
+                    }
+                    if state.role == ExtentRole::Current
+                        && self.current[state.priority.to_byte() as usize] != Some(extent as u32)
+                    {
+                        return Err(invalid_layout("extent current pointer is inconsistent"));
+                    }
+                }
             }
-        }
-        let normal = reserves == 1 && reclaim_sources == 0 && reclaim_targets == 0;
-        let reclaiming = reserves == 0
-            && reclaim_sources == 1
-            && reclaim_targets == 1
-            && self.extents[self.reserve as usize].role == ExtentRole::ReclaimTarget;
-        if !normal && !reclaiming {
-            return Err(invalid_layout(
-                "extent allocator reserve or reclaim transaction is invalid",
-            ));
-        }
-        if normal && self.extents[self.reserve as usize].role != ExtentRole::Reserve {
-            return Err(invalid_layout("extent allocator reserve pointer is invalid"));
         }
         for (priority, current) in self.current.iter().enumerate() {
             if let Some(extent) = current {
@@ -486,18 +470,18 @@ mod tests {
     }
 
     #[test]
-    fn layout_reserves_one_extent_and_fits_the_capacity() {
+    fn layout_uses_every_extent_and_fits_the_capacity() {
         let layout = layout();
-        assert!(layout.extent_count >= 5);
+        assert!(layout.extent_count >= 4);
         assert_eq!(layout.planned_entries_per_extent, 64);
         assert_eq!(
             layout.maximum_entries_per_extent,
             u32::try_from(layout.extent_size / MIN_STORED_ENTRY_SIZE).unwrap()
         );
-        assert_eq!(layout.planned_max_entries, u64::from(layout.extent_count - 1) * 64);
+        assert_eq!(layout.planned_max_entries, u64::from(layout.extent_count) * 64);
         assert_eq!(
             layout.maximum_entries,
-            u64::from(layout.extent_count - 1) * u64::from(layout.maximum_entries_per_extent)
+            u64::from(layout.extent_count) * u64::from(layout.maximum_entries_per_extent)
         );
         assert!(layout.total_file_size <= 16 * 1024 * 1024);
         assert_eq!(
@@ -511,6 +495,23 @@ mod tests {
         );
         assert_eq!(layout.locate_data_offset((PAGE_SIZE * 64 + 1) as u64), Some((1, 1)));
         assert_eq!(layout.data_offset(1, 1), Some((PAGE_SIZE * 64 + 1) as u64));
+    }
+
+    #[test]
+    fn layout_accepts_four_complete_extents_without_hidden_headroom() {
+        let extent_size = PAGE_SIZE * 64;
+        let capacity = (extent_size * 4 + PAGE_SIZE * 2) as u64;
+        let config = |capacity_bytes| {
+            ExtentStoreConfig::new(capacity_bytes)
+                .with_entry_charge(PAGE_SIZE)
+                .with_options(ExtentStoreOptions::default().with_extent_size(extent_size))
+        };
+
+        let layout = StoreLayout::create(config(capacity)).unwrap();
+        assert_eq!(layout.extent_count, 4);
+        assert_eq!(layout.data_file_size, (extent_size * 4) as u64);
+        assert_eq!(layout.total_file_size, capacity);
+        assert!(StoreLayout::create(config(capacity - 1)).is_err());
     }
 
     #[test]
@@ -531,21 +532,17 @@ mod tests {
             StoreLayout::discover(&encoded, layout.data_file_size, (layout.state_copy_size * 2) as u64),
             Some(layout)
         );
-        let mut development_family = encoded.clone();
-        development_family[..8].copy_from_slice(b"SCSEGST1");
+        let mut wrong_magic = encoded.clone();
+        wrong_magic[0] ^= 0xff;
         assert_eq!(
-            StoreLayout::discover(
-                &development_family,
-                layout.data_file_size,
-                (layout.state_copy_size * 2) as u64,
-            ),
+            StoreLayout::discover(&wrong_magic, layout.data_file_size, (layout.state_copy_size * 2) as u64,),
             None
         );
-        let mut previous_version = encoded.clone();
-        put_u32(&mut previous_version, 8, EXTENT_FORMAT_VERSION - 1);
+        let mut wrong_version = encoded.clone();
+        put_u32(&mut wrong_version, 8, EXTENT_FORMAT_VERSION + 1);
         assert_eq!(
             StoreLayout::discover(
-                &previous_version,
+                &wrong_version,
                 layout.data_file_size,
                 (layout.state_copy_size * 2) as u64,
             ),

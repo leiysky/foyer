@@ -14,8 +14,8 @@ use rayon::prelude::*;
 use crate::{
     error::{Error, Result},
     file::{
-        AlignedBuffer, allocated_file_size, ensure_cache_file_reserved, open_cache_file, read_exact_at,
-        reserve_cache_file, write_all_at,
+        AlignedBuffer, allocated_file_size, ensure_cache_file_preallocated, open_cache_file, preallocate_cache_file,
+        read_exact_at, write_all_at,
     },
     format::{
         ContentDigest, PAGE_SIZE, copy_stored_entry_range, decode_entry_value, encoded_entry_value_digest,
@@ -30,7 +30,6 @@ use crate::{
 };
 
 pub(crate) const DATA_FILE: &str = "data";
-pub(crate) const LEGACY_SLOT_OWNER_FILE: &str = "owners";
 pub(crate) const STATE_FILE: &str = "state";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,11 +37,9 @@ pub struct EntryAllocation {
     pub data_offset: u64,
     pub extent: u32,
     pub extent_offset: u32,
-    pub entry_ordinal: u32,
     pub stored_len: u32,
     pub extent_generation: u32,
     pub priority: CachePriority,
-    pub sequence: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,7 +84,7 @@ pub struct ExtentVictim {
     pub used_bytes: u32,
     pub entries: u32,
     pub priority: CachePriority,
-    pub sequence: u64,
+    pub activation_sequence: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -105,7 +102,9 @@ impl ReclaimCandidates {
     pub fn oldest(self, priority: CachePriority) -> Option<(ExtentVictim, bool)> {
         let priority = priority as usize;
         match (self.sealed[priority], self.current[priority]) {
-            (Some(sealed), Some(current)) if (current.sequence, current.extent) < (sealed.sequence, sealed.extent) => {
+            (Some(sealed), Some(current))
+                if (current.activation_sequence, current.extent) < (sealed.activation_sequence, sealed.extent) =>
+            {
                 Some((current, true))
             }
             (Some(sealed), _) => Some((sealed, false)),
@@ -113,14 +112,6 @@ impl ReclaimCandidates {
             (None, None) => None,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReclaimTransaction {
-    pub source: ExtentVictim,
-    pub target: u32,
-    pub target_generation: u32,
-    pub priority: CachePriority,
 }
 
 /// An immutable allocator image captured at one store publication boundary.
@@ -191,13 +182,13 @@ impl ExtentPool {
         fs::create_dir_all(root).map_err(|error| Error::io("create extent cache directory", error))?;
         let data = open_cache_file(&root.join(DATA_FILE), true, direct_io)
             .map_err(|error| Error::io("create extent data file", error))?;
-        reserve_cache_file(&data, layout.data_file_size)
-            .map_err(|error| Error::io("reserve extent data file", error))?;
+        preallocate_cache_file(&data, layout.data_file_size)
+            .map_err(|error| Error::io("preallocate extent data file", error))?;
         let state_file = open_cache_file(&root.join(STATE_FILE), true, false)
             .map_err(|error| Error::io("create extent state file", error))?;
         let state_file_size = state_file_size(layout)?;
-        reserve_cache_file(&state_file, state_file_size)
-            .map_err(|error| Error::io("reserve extent state file", error))?;
+        preallocate_cache_file(&state_file, state_file_size)
+            .map_err(|error| Error::io("preallocate extent state file", error))?;
 
         let state = ExtentPoolState::empty(layout);
         let liveness = liveness_table(&state);
@@ -279,10 +270,10 @@ impl ExtentPool {
         else {
             return Err(invalid_state("both allocator state copies are invalid"));
         };
-        ensure_cache_file_reserved(&data, layout.data_file_size)
-            .map_err(|error| Error::io("verify extent data reservation", error))?;
-        ensure_cache_file_reserved(&state_file, state_file_size(layout)?)
-            .map_err(|error| Error::io("verify extent state reservation", error))?;
+        ensure_cache_file_preallocated(&data, layout.data_file_size)
+            .map_err(|error| Error::io("verify extent data allocation", error))?;
+        ensure_cache_file_preallocated(&state_file, state_file_size(layout)?)
+            .map_err(|error| Error::io("verify extent state allocation", error))?;
         let io = PayloadIoScheduler::new(write_concurrency, io_read_priority_duration)
             .map_err(|error| Error::io("configure extent I/O scheduler", error))?;
         let write_pool = data_write_pool(write_concurrency)?;
@@ -345,16 +336,10 @@ impl ExtentPool {
                 let remaining = (self.layout.extent_size as u32).saturating_sub(current.used_bytes);
                 if remaining >= stored_len && current.entries < self.layout.maximum_entries_per_extent {
                     let extent_offset = current.used_bytes;
-                    let entry_ordinal = current.entries;
                     let extent_generation = state.extents[entry_index].generation;
                     state.extents[entry_index].used_bytes += stored_len;
                     state.extents[entry_index].entries += 1;
                     let extent_state = state.extents[entry_index];
-                    let sequence = state.next_sequence;
-                    state.next_sequence = state
-                        .next_sequence
-                        .checked_add(1)
-                        .ok_or_else(|| invalid_state("extent allocation sequence is exhausted"))?;
                     let data_offset = self
                         .layout
                         .data_offset(extent, extent_offset)
@@ -364,11 +349,9 @@ impl ExtentPool {
                         data_offset,
                         extent,
                         extent_offset,
-                        entry_ordinal,
                         stored_len,
                         extent_generation,
                         priority,
-                        sequence,
                     }));
                 }
                 state.extents[entry_index].role = ExtentRole::Sealed;
@@ -380,11 +363,15 @@ impl ExtentPool {
                 return Ok(AllocationResult::ReclaimRequired);
             };
             let extent = u32::try_from(extent).map_err(|_| invalid_state("free extent index does not fit u32"))?;
-            let sequence = state.next_sequence;
+            let activation_sequence = state.next_activation_sequence;
+            state.next_activation_sequence = state
+                .next_activation_sequence
+                .checked_add(1)
+                .ok_or_else(|| invalid_state("extent activation sequence is exhausted"))?;
             let extent_state = &mut state.extents[extent as usize];
             extent_state.used_bytes = 0;
             extent_state.entries = 0;
-            extent_state.sequence = sequence;
+            extent_state.activation_sequence = activation_sequence;
             extent_state.priority = priority;
             extent_state.role = ExtentRole::Current;
             state.current[priority_index] = Some(extent);
@@ -416,7 +403,6 @@ impl ExtentPool {
                 return Err(invalid_state("extent allocation does not match the value length"));
             };
             if end as usize > self.layout.extent_size
-                || write.allocation.entry_ordinal >= self.layout.maximum_entries_per_extent
                 || self
                     .layout
                     .data_offset(write.allocation.extent, write.allocation.extent_offset)
@@ -435,12 +421,8 @@ impl ExtentPool {
                     .ok_or_else(|| invalid_state("extent allocation is outside allocator state"))?;
                 if extent.generation != allocation.extent_generation
                     || extent.priority != allocation.priority
-                    || extent.entries <= allocation.entry_ordinal
                     || extent.used_bytes < allocation.extent_offset.saturating_add(allocation.stored_len)
-                    || matches!(
-                        extent.role,
-                        ExtentRole::Free | ExtentRole::Reserve | ExtentRole::ReclaimSource
-                    )
+                    || !matches!(extent.role, ExtentRole::Current | ExtentRole::Sealed)
                 {
                     return Err(invalid_state("extent allocation is no longer writable"));
                 }
@@ -587,10 +569,7 @@ impl ExtentPool {
         let mut candidates = ReclaimCandidates::default();
         for (index, extent) in state.extents.iter().enumerate() {
             let priority = extent.priority as usize;
-            if matches!(
-                extent.role,
-                ExtentRole::Current | ExtentRole::Sealed | ExtentRole::ReclaimSource
-            ) {
+            if matches!(extent.role, ExtentRole::Current | ExtentRole::Sealed) {
                 candidates.occupied_extents[priority] = candidates.occupied_extents[priority].saturating_add(1);
             }
             let target = match extent.role {
@@ -604,9 +583,11 @@ impl ExtentPool {
                 used_bytes: extent.used_bytes,
                 entries: extent.entries,
                 priority: extent.priority,
-                sequence: extent.sequence,
+                activation_sequence: extent.activation_sequence,
             };
-            if target.is_none_or(|current| (victim.sequence, victim.extent) < (current.sequence, current.extent)) {
+            if target.is_none_or(|current| {
+                (victim.activation_sequence, victim.extent) < (current.activation_sequence, current.extent)
+            }) {
                 *target = Some(victim);
             }
         }
@@ -619,10 +600,7 @@ impl ExtentPool {
         let mut used_entries = [0u64; 3];
         let mut used_bytes = [0u64; 3];
         for extent in &state.extents {
-            if !matches!(
-                extent.role,
-                ExtentRole::Current | ExtentRole::Sealed | ExtentRole::ReclaimSource
-            ) {
+            if !matches!(extent.role, ExtentRole::Current | ExtentRole::Sealed) {
                 continue;
             }
             let priority = extent.priority as usize;
@@ -631,7 +609,7 @@ impl ExtentPool {
             used_bytes[priority] = used_bytes[priority].saturating_add(u64::from(extent.used_bytes));
         }
         ExtentOccupancy::new(
-            self.layout.extent_count.saturating_sub(1),
+            self.layout.extent_count,
             self.layout.planned_entries_per_extent,
             occupied_extents,
             used_entries,
@@ -653,7 +631,7 @@ impl ExtentPool {
             || extent.used_bytes != victim.used_bytes
             || extent.entries != victim.entries
             || extent.priority != victim.priority
-            || extent.sequence != victim.sequence
+            || extent.activation_sequence != victim.activation_sequence
             || state.current[priority] != Some(victim.extent)
         {
             return Err(invalid_state("current reclaim victim changed before seal"));
@@ -661,124 +639,6 @@ impl ExtentPool {
         state.extents[victim.extent as usize].role = ExtentRole::Sealed;
         state.current[priority] = None;
         Ok(victim)
-    }
-
-    #[cfg(test)]
-    pub fn begin_reclaim(&self, victim: ExtentVictim) -> Result<ReclaimTransaction> {
-        let mut state = mutex_lock(&self.state);
-        let source = state
-            .extents
-            .get(victim.extent as usize)
-            .copied()
-            .ok_or_else(|| invalid_state("reclaim source is out of range"))?;
-        if source.role != ExtentRole::Sealed
-            || source.generation != victim.generation
-            || source.used_bytes != victim.used_bytes
-            || source.entries != victim.entries
-            || source.priority != victim.priority
-            || state.current[usize::from(victim.priority.to_byte())].is_some()
-        {
-            return Err(invalid_state("reclaim source is not a stable sealed extent"));
-        }
-        let target = state.reserve;
-        let target_state = state.extents[target as usize];
-        if target_state.role != ExtentRole::Reserve || target == victim.extent {
-            return Err(invalid_state("reclaim target reserve is invalid"));
-        }
-
-        // Build the complete next image separately. If metadata I/O fails, the live allocator and
-        // lock-free liveness table must continue to describe the last successfully published
-        // image rather than a half-applied transition.
-        let mut next = state.clone();
-        next.extents[victim.extent as usize].role = ExtentRole::ReclaimSource;
-        let sequence = next.next_sequence;
-        let target_state = &mut next.extents[target as usize];
-        target_state.used_bytes = 0;
-        target_state.entries = 0;
-        target_state.sequence = sequence;
-        target_state.priority = victim.priority;
-        target_state.role = ExtentRole::ReclaimTarget;
-        let target_generation = target_state.generation;
-        self.persist_state_locked(&mut next)?;
-        *state = next;
-        Ok(ReclaimTransaction {
-            source: victim,
-            target,
-            target_generation,
-            priority: victim.priority,
-        })
-    }
-
-    pub fn pending_reclaim(&self) -> Option<ReclaimTransaction> {
-        let state = mutex_lock(&self.state);
-        let (source, source_state) = state
-            .extents
-            .iter()
-            .enumerate()
-            .find(|(_, extent)| extent.role == ExtentRole::ReclaimSource)?;
-        let (target, target_state) = state
-            .extents
-            .iter()
-            .enumerate()
-            .find(|(_, extent)| extent.role == ExtentRole::ReclaimTarget)?;
-        Some(ReclaimTransaction {
-            source: ExtentVictim {
-                extent: u32::try_from(source).ok()?,
-                generation: source_state.generation,
-                used_bytes: source_state.used_bytes,
-                entries: source_state.entries,
-                priority: source_state.priority,
-                sequence: source_state.sequence,
-            },
-            target: u32::try_from(target).ok()?,
-            target_generation: target_state.generation,
-            priority: target_state.priority,
-        })
-    }
-
-    pub fn finish_reclaim(&self, transaction: ReclaimTransaction) -> Result<()> {
-        let mut state = mutex_lock(&self.state);
-        let source = state.extents[transaction.source.extent as usize];
-        let target = state.extents[transaction.target as usize];
-        if source.role != ExtentRole::ReclaimSource
-            || source.generation != transaction.source.generation
-            || target.role != ExtentRole::ReclaimTarget
-            || target.generation != transaction.target_generation
-            || target.priority != transaction.priority
-        {
-            return Err(invalid_state("reclaim transaction changed before commit"));
-        }
-
-        let mut next = state.clone();
-        let source = &mut next.extents[transaction.source.extent as usize];
-        source.generation = source
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| invalid_state("extent generation is exhausted"))?;
-        source.used_bytes = 0;
-        source.entries = 0;
-        source.sequence = 0;
-        source.priority = CachePriority::Low;
-        source.role = ExtentRole::Reserve;
-        next.reserve = transaction.source.extent;
-
-        let target = &mut next.extents[transaction.target as usize];
-        if (target.used_bytes as usize) < self.layout.extent_size
-            && target.entries < self.layout.maximum_entries_per_extent
-        {
-            target.role = ExtentRole::Current;
-            next.current[usize::from(transaction.priority.to_byte())] = Some(transaction.target);
-        } else {
-            target.role = ExtentRole::Sealed;
-        }
-        self.persist_state_locked(&mut next)?;
-        *state = next;
-        self.publish_liveness(
-            transaction.source.extent,
-            state.extents[transaction.source.extent as usize],
-        );
-        self.publish_liveness(transaction.target, state.extents[transaction.target as usize]);
-        Ok(())
     }
 
     pub fn release(&self, victim: ExtentVictim) -> Result<()> {
@@ -799,7 +659,7 @@ impl ExtentPool {
             .ok_or_else(|| invalid_state("extent generation is exhausted"))?;
         extent.used_bytes = 0;
         extent.entries = 0;
-        extent.sequence = 0;
+        extent.activation_sequence = 0;
         extent.priority = CachePriority::Low;
         extent.role = ExtentRole::Free;
         self.persist_state_locked(&mut next)?;
@@ -1159,6 +1019,19 @@ mod tests {
     }
 
     #[test]
+    fn activation_sequence_advances_once_per_extent() {
+        let dir = tempdir().unwrap();
+        let pool = create_pool(dir.path());
+        let first = allocated(pool.allocate(CachePriority::Normal, 1).unwrap());
+        let second = allocated(pool.allocate(CachePriority::Normal, 1).unwrap());
+        let state = pool.state_snapshot();
+
+        assert_eq!(second.extent, first.extent);
+        assert_eq!(state.extents[first.extent as usize].activation_sequence, 1);
+        assert_eq!(state.next_activation_sequence, 2);
+    }
+
+    #[test]
     fn batch_write_read_checkpoint_and_reopen() {
         let dir = tempdir().unwrap();
         let pool = create_pool(dir.path());
@@ -1423,7 +1296,6 @@ mod tests {
         let next = allocated(reopened.allocate(CachePriority::High, stored_len).unwrap());
         assert_eq!(next.extent, tail.extent);
         assert_eq!(next.extent_offset, tail.extent_offset);
-        assert_eq!(next.entry_ordinal, tail.entry_ordinal);
     }
 
     #[test]

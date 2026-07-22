@@ -1458,16 +1458,14 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
     if let Some(layout) = handle.layout_stats() {
         let allocated = handle.allocated_size().unwrap_or_default();
         println!(
-            "engine={} phase=extent_layout configured_mib={:.1} allocated_mib={:.1} planned_file_mib={:.1} data_file_mib={:.1} usable_payload_mib={:.1} index_soft_mib={:.1} physical_extents={} usable_extents={} extent_mib={:.1} entry_charge_kib={:.1} planned_entries={} maximum_entries={}",
+            "engine={} phase=extent_layout configured_mib={:.1} allocated_mib={:.1} planned_file_mib={:.1} payload_capacity_mib={:.1} index_soft_mib={:.1} extent_count={} extent_mib={:.1} entry_charge_kib={:.1} planned_entries={} maximum_entries={}",
             engine.label(),
             as_mib(layout.configured_capacity_bytes),
             as_mib(allocated),
             as_mib(layout.planned_file_bytes),
-            as_mib(layout.data_file_bytes),
-            as_mib(layout.usable_payload_bytes),
+            as_mib(layout.payload_capacity_bytes),
             as_mib(layout.index_soft_capacity_bytes),
-            layout.physical_extents,
-            layout.usable_extents,
+            layout.extent_count,
             as_mib(layout.extent_size_bytes),
             layout.entry_charge_bytes as f64 / KIB as f64,
             layout.planned_live_entries,
@@ -1548,9 +1546,9 @@ fn print_extent_write_stats(engine: DiskEngine, handle: &Option<ExtentEngineHand
     }
     if let Some(occupancy) = handle.extent_occupancy() {
         println!(
-            "engine={} phase=extent_priority usable_extents={} high_extents={} high_floor={} high_borrowed={} high_mib={:.1} normal_extents={} normal_floor={} normal_borrowed={} normal_mib={:.1} low_extents={} low_mib={:.1}",
+            "engine={} phase=extent_priority extent_count={} high_extents={} high_floor={} high_borrowed={} high_mib={:.1} normal_extents={} normal_floor={} normal_borrowed={} normal_mib={:.1} low_extents={} low_mib={:.1}",
             engine.label(),
-            occupancy.usable_extents(),
+            occupancy.extent_count(),
             occupancy.occupied_extents(CachePriority::High),
             occupancy.capacity_floor_extents(CachePriority::High),
             occupancy.borrowed_extents(CachePriority::High),
