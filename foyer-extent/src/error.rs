@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, path::PathBuf};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -11,6 +11,7 @@ pub enum Error {
     },
     InvalidConfig(String),
     InvalidSuperblock(String),
+    DatabaseLocked(PathBuf),
     Index(String),
     CheckpointFailed(String),
     StoredEntryTooLarge {
@@ -49,6 +50,9 @@ impl fmt::Display for Error {
             Self::InvalidSuperblock(message) => {
                 write!(f, "invalid ExtentStore superblock: {message}")
             }
+            Self::DatabaseLocked(path) => {
+                write!(f, "ExtentStore is already open at {}", path.display())
+            }
             Self::Index(message) => write!(f, "EntryIndex error: {message}"),
             Self::CheckpointFailed(message) => {
                 write!(f, "ExtentStore checkpoint failed: {message}")
@@ -76,6 +80,7 @@ impl std::error::Error for Error {
             | Self::KeyTooLarge { .. }
             | Self::InvalidConfig(_)
             | Self::InvalidSuperblock(_)
+            | Self::DatabaseLocked(_)
             | Self::Index(_)
             | Self::CheckpointFailed(_)
             | Self::StoredEntryTooLarge { .. }

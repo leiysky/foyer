@@ -512,6 +512,7 @@ fn index_db_error(context: &'static str, error: index_db::Error) -> Error {
         index_db::Error::Corruption { path, reason } => {
             Error::InvalidSuperblock(format!("IndexDB {context}: corrupt {}: {reason}", path.display()))
         }
+        index_db::Error::DatabaseLocked(path) => Error::DatabaseLocked(path),
         index_db::Error::Io {
             context: io_context,
             source,
