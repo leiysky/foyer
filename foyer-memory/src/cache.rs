@@ -1151,6 +1151,7 @@ mod tests {
     use foyer_common::error::Error;
     use futures_util::future::join_all;
     use itertools::Itertools;
+    use mea::oneshot;
     use rand::{RngExt, SeedableRng, rngs::StdRng, seq::SliceRandom};
 
     use super::*;
@@ -1161,6 +1162,16 @@ mod tests {
     const RANGE: Range<u64> = 0..1000;
     const OPS: usize = 10000;
     const CONCURRENCY: usize = 8;
+
+    struct DropSignal(Option<oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
 
     fn fifo() -> Cache<u64, u64> {
         CacheBuilder::new(CAPACITY)
@@ -1246,6 +1257,38 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[tokio::test]
+    async fn insert_wins_over_an_inflight_fetch() {
+        let cache = fifo();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+
+        let fetched = cache.get_or_fetch(&42, move || async move {
+            let _drop_signal = DropSignal(Some(dropped_tx));
+            started_tx.send(()).expect("fetch start receiver must remain alive");
+            release_rx.await.expect("fetch release sender must remain alive");
+            Ok::<_, Error>(1)
+        });
+        started_rx.await.expect("inflight fetch must start");
+
+        let inserted = cache.insert(42, 2);
+        assert_eq!(*inserted.value(), 2);
+        drop(inserted);
+
+        let fetched = fetched.await.expect("inflight waiter must observe the insert");
+        assert_eq!(*fetched.value(), 2);
+        drop(fetched);
+
+        release_tx.send(()).expect("inflight fetch must remain alive");
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("cancelled inflight fetch must stop")
+            .expect("inflight drop receiver must remain alive");
+
+        assert_eq!(*cache.get(&42).expect("inserted value must remain").value(), 2);
     }
 
     async fn case(cache: Cache<u64, u64>) {
