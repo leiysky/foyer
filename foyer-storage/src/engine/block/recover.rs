@@ -49,10 +49,10 @@ impl RecoverRunner {
         recover_mode: RecoverMode,
         blob_index_size: usize,
         blocks: Vec<BlockId>,
-        sequence: &AtomicSequence,
-        indexer: &Indexer,
-        block_manager: &BlockManager,
-        tombstones: &[Tombstone],
+        sequence: Arc<AtomicSequence>,
+        indexer: Indexer,
+        block_manager: BlockManager,
+        tombstones: Vec<Tombstone>,
         spawner: Spawner,
         metrics: Arc<Metrics>,
     ) -> Result<()> {
@@ -66,8 +66,7 @@ impl RecoverRunner {
         }))
         .buffered(recover_concurrency)
         .try_collect::<Vec<_>>()
-        .await
-        .unwrap();
+        .await?;
 
         // Return error is there is.
         let (total, errs): (Vec<_>, Vec<_>) = total.into_iter().partition(|res| res.is_ok());
@@ -79,6 +78,23 @@ impl RecoverRunner {
             return Err(e);
         }
 
+        let total = total.into_iter().map(|r| r.unwrap()).collect_vec();
+        spawner
+            .spawn_blocking(move || Self::apply(total, sequence, indexer, block_manager, tombstones, metrics, now))
+            .await?;
+
+        Ok(())
+    }
+
+    fn apply(
+        total: Vec<Vec<EntryInfo>>,
+        sequence: Arc<AtomicSequence>,
+        indexer: Indexer,
+        block_manager: BlockManager,
+        tombstones: Vec<Tombstone>,
+        metrics: Arc<Metrics>,
+        now: Instant,
+    ) {
         #[derive(Debug)]
         enum EntryAddressOrTombstone {
             EntryAddress(EntryAddress),
@@ -104,7 +120,7 @@ impl RecoverRunner {
                     entry.insert((sequence, addr));
                 }
             };
-        for (block, infos) in total.into_iter().map(|r| r.unwrap()).enumerate() {
+        for (block, infos) in total.into_iter().enumerate() {
             let block = block as BlockId;
 
             if infos.is_empty() {
@@ -153,8 +169,6 @@ impl RecoverRunner {
         metrics
             .storage_block_engine_recover_duration
             .record(elapsed.as_secs_f64());
-
-        Ok(())
     }
 }
 

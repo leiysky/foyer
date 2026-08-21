@@ -118,6 +118,13 @@ pub enum RecoverMode {
     Quiet,
     /// Recover disk cache and panic on errors.
     Strict,
+    /// Recover disk cache in the background.
+    ///
+    /// Store construction initializes the device and block manager, but returns without waiting for disk recovery.
+    /// Disk loads and membership checks behave as cache misses until recovery finishes. Disk writes and deletes are
+    /// ignored while recovering, so an old disk entry can become visible again after recovery. Block-local scan errors
+    /// are skipped as in [`RecoverMode::Quiet`]. Use [`crate::Store::wait_recovery`] to observe fatal recovery errors.
+    Background,
 }
 
 /// Context for building the disk cache engine.
@@ -184,6 +191,13 @@ where
 
     /// Delete all cached entries of the disk cache.
     fn destroy(&self) -> BoxFuture<'static, Result<()>>;
+
+    /// Wait for disk recovery to finish.
+    ///
+    /// Engines without asynchronous recovery return immediately.
+    fn wait_recovery(&self) -> BoxFuture<'static, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
 
     /// Wait for the ongoing flush and reclaim tasks to finish.
     fn wait(&self) -> BoxFuture<'static, ()>;

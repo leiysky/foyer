@@ -36,10 +36,10 @@ use foyer_common::{
 use futures_core::future::BoxFuture;
 use futures_util::{
     FutureExt,
-    future::{join_all, try_join_all},
+    future::{Shared, join_all, ready, try_join_all},
 };
 use itertools::Itertools;
-use mea::mpsc::UnboundedReceiver;
+use mea::{mpsc::UnboundedReceiver, oneshot};
 
 use super::{
     flusher::{Flusher, InvalidStats, Submission},
@@ -52,7 +52,7 @@ use crate::{
     Device, Load, RejectAll, StorageFilter, StorageFilterResult,
     compress::Compression,
     engine::{
-        Engine, EngineBuildContext, EngineConfig, Populated,
+        Engine, EngineBuildContext, EngineConfig, Populated, RecoverMode,
         block::{
             eviction::{EvictionPicker, FifoPicker, InvalidRatioPicker},
             manager::{BlockId, BlockManager},
@@ -66,6 +66,54 @@ use crate::{
     keeper::PieceRef,
     serde::EntryDeserializer,
 };
+
+#[derive(Debug)]
+struct Recovery {
+    ready: AtomicBool,
+    wait: Shared<BoxFuture<'static, Result<()>>>,
+}
+
+impl Recovery {
+    fn ready() -> Self {
+        Self {
+            ready: AtomicBool::new(true),
+            wait: ready(Ok(())).boxed().shared(),
+        }
+    }
+
+    fn background() -> (Self, oneshot::Sender<Result<()>>) {
+        let (tx, rx) = oneshot::channel();
+        let wait = async move {
+            rx.await.unwrap_or_else(|_| {
+                Err(Error::new(
+                    ErrorKind::TaskCancelled,
+                    "background block engine recovery task was cancelled",
+                ))
+            })
+        }
+        .boxed()
+        .shared();
+        (
+            Self {
+                ready: AtomicBool::new(false),
+                wait,
+            },
+            tx,
+        )
+    }
+
+    fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    fn mark_ready(&self) {
+        self.ready.store(true, Ordering::Release);
+    }
+
+    async fn wait(&self) -> Result<()> {
+        self.wait.clone().await
+    }
+}
 
 /// Config for the block-based disk cache engine.
 ///
@@ -100,6 +148,8 @@ where
     flush_switch: Switch,
     #[cfg(any(test, feature = "test_utils"))]
     load_holder: Holder,
+    #[cfg(any(test, feature = "test_utils"))]
+    recover_holder: Holder,
     marker: PhantomData<(K, V, P)>,
 }
 
@@ -158,6 +208,8 @@ where
             flush_switch: Switch::default(),
             #[cfg(any(test, feature = "test_utils"))]
             load_holder: Holder::default(),
+            #[cfg(any(test, feature = "test_utils"))]
+            recover_holder: Holder::default(),
             marker: PhantomData,
         }
     }
@@ -320,6 +372,13 @@ where
         self
     }
 
+    /// Pass the recovery holder for test.
+    #[cfg(any(test, feature = "test_utils"))]
+    pub fn with_recover_holder(mut self, recover_holder: Holder) -> Self {
+        self.recover_holder = recover_holder;
+        self
+    }
+
     /// Build the block-based disk cache engine with the given configurations.
     pub async fn build(
         self: Box<Self>,
@@ -330,15 +389,31 @@ where
             recover_mode,
         }: EngineBuildContext,
     ) -> Result<Arc<BlockEngine<K, V, P>>> {
+        if self.block_size < PAGE
+            || self.blob_index_size < PAGE
+            || self.blob_index_size >= self.block_size
+            || self.indexer_shards == 0
+            || self.recover_concurrency == 0
+            || self.flushers == 0
+            || self.reclaimers == 0
+        {
+            return Err(Error::new(
+                ErrorKind::Config,
+                "invalid block engine sizes or worker counts",
+            ));
+        }
+        if self.buffer_pool_size / self.flushers < PAGE {
+            return Err(Error::new(
+                ErrorKind::Config,
+                "block engine buffer pool must provide at least one page per flusher",
+            ));
+        }
+
         let device = self.device;
         let block_size = self.block_size;
 
-        let mut tombstones = vec![];
-
-        let tombstone_log = if self.enable_tombstone_log {
+        let tombstone_partitions = if self.enable_tombstone_log {
             // TODO(MrCroxx): The tombstone log support multiples partitions for multiple device support.
-            let mut partitions = vec![];
-
             let max_entries = device.capacity() / PAGE;
             let pages = max_entries / TombstoneLog::SLOTS_PER_PAGE
                 + if max_entries.is_multiple_of(TombstoneLog::SLOTS_PER_PAGE) {
@@ -347,12 +422,9 @@ where
                     1
                 };
             let partition = device.create_partition(pages * PAGE)?;
-            partitions.push(partition);
-
-            let tombstone_log = TombstoneLog::open(partitions, io_engine.clone(), &mut tombstones).await?;
-            Some(tombstone_log)
+            vec![partition]
         } else {
-            None
+            vec![]
         };
 
         let indexer = Indexer::new(self.indexer_shards);
@@ -375,7 +447,7 @@ where
 
         let block_manager = BlockManager::open(
             device.clone(),
-            io_engine,
+            io_engine.clone(),
             block_size,
             self.eviction_pickers,
             reclaimer,
@@ -394,62 +466,115 @@ where
             );
         }
 
-        let sequence = AtomicSequence::default();
+        let background = recover_mode == RecoverMode::Background;
+        let (recovery, recovery_tx) = if background {
+            let (recovery, tx) = Recovery::background();
+            (recovery, Some(tx))
+        } else {
+            (Recovery::ready(), None)
+        };
 
-        RecoverRunner::run(
-            self.recover_concurrency,
-            recover_mode,
-            self.blob_index_size,
-            (0..blocks as BlockId).collect_vec(),
-            &sequence,
-            &indexer,
-            &block_manager,
-            &tombstones,
-            runtime.clone(),
-            metrics.clone(),
-        )
-        .await?;
-
-        let io_buffer_size = self.buffer_pool_size / self.flushers;
-        for (flusher, rx) in flushers.iter().zip(rxs) {
-            flusher.run(
-                rx,
-                block_size,
-                io_buffer_size,
-                self.blob_index_size,
-                self.compression,
-                indexer.clone(),
-                block_manager.clone(),
-                tombstone_log.clone(),
-                metrics.clone(),
-                &runtime,
-                #[cfg(any(test, feature = "test_utils"))]
-                self.flush_switch.clone(),
-            )?;
-        }
-
-        let admission_filter = self.admission_filter.with_condition(IoThrottle);
-
+        #[cfg(any(test, feature = "test_utils"))]
+        let recovery_flush_switch = self.flush_switch.clone();
+        #[cfg(any(test, feature = "test_utils"))]
+        let recovery_holder = self.recover_holder;
         let inner = BlockEngineInner {
-            admission_filter,
+            admission_filter: self.admission_filter.with_condition(IoThrottle),
             device,
             indexer,
             block_manager,
             flushers,
             submit_queue_size,
             submit_queue_size_threshold: self.submit_queue_size_threshold,
-            sequence,
-            _spawner: runtime,
+            sequence: Arc::new(AtomicSequence::default()),
+            recovery,
+            _spawner: runtime.clone(),
             active: AtomicBool::new(true),
-            metrics,
+            metrics: metrics.clone(),
             #[cfg(any(test, feature = "test_utils"))]
             flush_switch: self.flush_switch,
             #[cfg(any(test, feature = "test_utils"))]
             load_holder: self.load_holder,
         };
         let inner = Arc::new(inner);
-        let engine = BlockEngine { inner };
-        let engine = Arc::new(engine);
+        let engine = Arc::new(BlockEngine { inner: inner.clone() });
+
+        let recover_mode = if background { RecoverMode::Quiet } else { recover_mode };
+        let recover_concurrency = self.recover_concurrency;
+        let blob_index_size = self.blob_index_size;
+        let buffer_pool_size = self.buffer_pool_size;
+        let flusher_count = self.flushers;
+        let compression = self.compression;
+        let task_inner = inner.clone();
+        let recovery_runtime = runtime.clone();
+        let recovery_task = async move {
+            #[cfg(any(test, feature = "test_utils"))]
+            if background {
+                recovery_holder.wait().await;
+            }
+
+            let mut tombstones = vec![];
+            let tombstone_log = if tombstone_partitions.is_empty() {
+                None
+            } else {
+                Some(TombstoneLog::open(tombstone_partitions, io_engine, &mut tombstones).await?)
+            };
+
+            RecoverRunner::run(
+                recover_concurrency,
+                recover_mode,
+                blob_index_size,
+                (0..blocks as BlockId).collect_vec(),
+                task_inner.sequence.clone(),
+                task_inner.indexer.clone(),
+                task_inner.block_manager.clone(),
+                tombstones,
+                recovery_runtime.clone(),
+                metrics.clone(),
+            )
+            .await?;
+
+            let io_buffer_size = buffer_pool_size / flusher_count;
+            for (flusher, rx) in task_inner.flushers.iter().zip(rxs) {
+                flusher.run(
+                    rx,
+                    block_size,
+                    io_buffer_size,
+                    blob_index_size,
+                    compression,
+                    task_inner.indexer.clone(),
+                    task_inner.block_manager.clone(),
+                    tombstone_log.clone(),
+                    metrics.clone(),
+                    &recovery_runtime,
+                    #[cfg(any(test, feature = "test_utils"))]
+                    recovery_flush_switch.clone(),
+                )?;
+            }
+
+            Ok(())
+        };
+
+        if let Some(recovery_tx) = recovery_tx {
+            let recovery_inner = inner.clone();
+            runtime.spawn(async move {
+                tracing::info!("[block engine]: start background recovery");
+                let result = recovery_task.await;
+                match &result {
+                    Ok(()) => {
+                        recovery_inner.recovery.mark_ready();
+                        tracing::info!("[block engine]: background recovery finished");
+                    }
+                    Err(error) => {
+                        tracing::error!(?error, "[block engine]: background recovery failed");
+                    }
+                }
+                let _ = recovery_tx.send(result);
+            });
+        } else {
+            recovery_task.await?;
+        }
+
         Ok(engine)
     }
 }
@@ -515,7 +640,8 @@ where
     submit_queue_size: Arc<AtomicUsize>,
     submit_queue_size_threshold: usize,
 
-    sequence: AtomicSequence,
+    sequence: Arc<AtomicSequence>,
+    recovery: Recovery,
 
     _spawner: Spawner,
 
@@ -549,12 +675,24 @@ where
     V: StorageValue,
     P: Properties,
 {
+    fn wait_recovery(&self) -> impl Future<Output = Result<()>> + Send + 'static {
+        let inner = self.inner.clone();
+        async move { inner.recovery.wait().await }
+    }
+
+    async fn wait_inner(inner: Arc<BlockEngineInner<K, V, P>>) -> Result<()> {
+        inner.recovery.wait().await?;
+        join_all(inner.flushers.iter().map(|flusher| flusher.wait())).await;
+        inner.block_manager.wait_reclaim().await;
+        Ok(())
+    }
+
     fn wait(&self) -> impl Future<Output = ()> + Send + 'static {
-        let flushers = self.inner.flushers.clone();
-        let block_manager = self.inner.block_manager.clone();
+        let inner = self.inner.clone();
         async move {
-            join_all(flushers.iter().map(|flusher| flusher.wait())).await;
-            block_manager.wait_reclaim().await;
+            if let Err(error) = Self::wait_inner(inner).await {
+                tracing::error!(?error, "[block engine]: wait failed");
+            }
         }
     }
 
@@ -562,8 +700,7 @@ where
         let this = self.clone();
         async move {
             this.inner.active.store(false, Ordering::Relaxed);
-            this.wait().await;
-            Ok(())
+            Self::wait_inner(this.inner).await
         }
         .boxed()
     }
@@ -572,6 +709,11 @@ where
     fn enqueue(&self, piece: PieceRef<K, V, P>, estimated_size: usize) {
         if !self.inner.active.load(Ordering::Relaxed) {
             tracing::warn!("cannot enqueue new entry after closed");
+            return;
+        }
+
+        if !self.inner.recovery.is_ready() {
+            self.inner.metrics.storage_block_engine_enqueue_skip.increase(1);
             return;
         }
 
@@ -609,11 +751,16 @@ where
         #[cfg(any(test, feature = "test_utils"))]
         let load_holer = self.inner.load_holder.wait();
 
+        let recovery_ready = self.inner.recovery.is_ready();
         let indexer = self.inner.indexer.clone();
         let metrics = self.inner.metrics.clone();
         let block_manager = self.inner.block_manager.clone();
 
         let load = async move {
+            if !recovery_ready {
+                return Ok(Load::Miss);
+            }
+
             #[cfg(any(test, feature = "test_utils"))]
             load_holer.await;
 
@@ -726,6 +873,10 @@ where
             return;
         }
 
+        if !self.inner.recovery.is_ready() {
+            return;
+        }
+
         let sequence = self.inner.sequence.fetch_add(1, Ordering::Relaxed);
         let stats = self
             .inner
@@ -736,16 +887,14 @@ where
                 size: bits::align_up(PAGE, addr.len as usize),
             });
 
-        let this = self.clone();
-
-        this.inner.flushers[hash as usize % this.inner.flushers.len()].submit(Submission::Tombstone {
+        self.inner.flushers[hash as usize % self.inner.flushers.len()].submit(Submission::Tombstone {
             tombstone: Tombstone { hash, sequence },
             stats,
         });
     }
 
     fn may_contains(&self, hash: u64) -> bool {
-        self.inner.indexer.get(hash).is_some()
+        self.inner.recovery.is_ready() && self.inner.indexer.get(hash).is_some()
     }
 
     fn destroy(&self) -> BoxFuture<'static, Result<()>> {
@@ -754,6 +903,8 @@ where
             if !this.inner.active.load(Ordering::Relaxed) {
                 return Err(Error::new(ErrorKind::Closed, "cannot delete entry after closed"));
             }
+
+            this.inner.recovery.wait().await?;
 
             // Write a tombstone to clear tombstone log by increase the max sequence.
             let sequence = this.inner.sequence.fetch_add(1, Ordering::Relaxed);
@@ -832,6 +983,10 @@ where
 
     fn destroy(&self) -> BoxFuture<'static, Result<()>> {
         self.destroy()
+    }
+
+    fn wait_recovery(&self) -> BoxFuture<'static, Result<()>> {
+        BlockEngine::wait_recovery(self).boxed()
     }
 
     fn wait(&self) -> BoxFuture<'static, ()> {
@@ -919,6 +1074,7 @@ mod tests {
             submit_queue_size_threshold: 16 * 1024 * 1024 * 2,
             flush_switch: Switch::default(),
             load_holder: Holder::default(),
+            recover_holder: Holder::default(),
             marker: PhantomData,
         };
 
@@ -936,6 +1092,14 @@ mod tests {
 
     async fn store_for_test_with_tombstone_log(
         dir: impl AsRef<Path>,
+    ) -> Arc<BlockEngine<u64, Vec<u8>, TestProperties>> {
+        store_for_test_with_tombstone_log_and_recovery(dir, RecoverMode::Strict, Holder::default()).await
+    }
+
+    async fn store_for_test_with_tombstone_log_and_recovery(
+        dir: impl AsRef<Path>,
+        recover_mode: RecoverMode,
+        recover_holder: Holder,
     ) -> Arc<BlockEngine<u64, Vec<u8>, TestProperties>> {
         let device = FsDeviceBuilder::new(dir)
             .with_capacity(ByteSize::kib(64).as_u64() as usize + ByteSize::kib(4).as_u64() as usize)
@@ -962,6 +1126,7 @@ mod tests {
             submit_queue_size_threshold: 16 * 1024 * 1024 * 2,
             flush_switch: Switch::default(),
             load_holder: Holder::default(),
+            recover_holder,
             marker: PhantomData,
         };
         let builder = Box::new(builder);
@@ -970,7 +1135,7 @@ mod tests {
                 io_engine,
                 metrics,
                 spawner,
-                recover_mode: RecoverMode::Strict,
+                recover_mode,
             })
             .await
             .unwrap()
@@ -1077,6 +1242,97 @@ mod tests {
         assert_eq!(r5, (5, vec![5; 11 * KB]));
         let r6 = store.load(memory.hash(&6)).await.unwrap().kv().unwrap();
         assert_eq!(r6, (6, vec![6; 7 * KB]));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_background_recovery_cancellation_is_reported() {
+        let (recovery, tx) = Recovery::background();
+        drop(tx);
+
+        assert_eq!(recovery.wait().await.unwrap_err().kind(), ErrorKind::TaskCancelled);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_background_recovery_rejects_invalid_config_before_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = FsDeviceBuilder::new(dir.path())
+            .with_capacity(ByteSize::kib(64).as_u64() as usize)
+            .build()
+            .unwrap();
+        let spawner = Spawner::current();
+        let io_engine = io_engine_for_test(spawner.clone()).await;
+        let builder = BlockEngineConfig::<u64, Vec<u8>, TestProperties>::new(device.clone())
+            .with_block_size(16 * KB)
+            .with_flushers(0);
+
+        let error = Box::new(builder)
+            .build(EngineBuildContext {
+                io_engine,
+                metrics: Arc::new(Metrics::noop()),
+                spawner,
+                recover_mode: RecoverMode::Background,
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::Config);
+        assert_eq!(device.partitions(), 0);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_background_recovery_serves_misses_and_ignores_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = cache_for_test();
+
+        let store = store_for_test_with_tombstone_log(dir.path()).await;
+        let e1 = memory.insert(1, vec![1; 3 * KB]);
+        let e2 = memory.insert(2, vec![2; 3 * KB]);
+        enqueue(&store, e1);
+        enqueue(&store, e2);
+        store.wait().await;
+        store.close().await.unwrap();
+        drop(store);
+
+        let recover_holder = Holder::default();
+        recover_holder.hold();
+        let store =
+            store_for_test_with_tombstone_log_and_recovery(dir.path(), RecoverMode::Background, recover_holder.clone())
+                .await;
+
+        assert_eq!(store.load(memory.hash(&1)).await.unwrap().kv(), None);
+        assert!(!store.may_contains(memory.hash(&1)));
+
+        let e3 = memory.insert(3, vec![3; 3 * KB]);
+        enqueue(&store, e3);
+        store.delete(memory.hash(&1));
+
+        recover_holder.unhold();
+        store.wait_recovery().await.unwrap();
+        store.wait().await;
+
+        assert_eq!(
+            store.load(memory.hash(&1)).await.unwrap().kv(),
+            Some((1, vec![1; 3 * KB]))
+        );
+        assert_eq!(
+            store.load(memory.hash(&2)).await.unwrap().kv(),
+            Some((2, vec![2; 3 * KB]))
+        );
+        assert_eq!(store.load(memory.hash(&3)).await.unwrap().kv(), None);
+
+        store.close().await.unwrap();
+        drop(store);
+
+        let store = store_for_test_with_tombstone_log(dir.path()).await;
+        assert_eq!(
+            store.load(memory.hash(&1)).await.unwrap().kv(),
+            Some((1, vec![1; 3 * KB]))
+        );
+        assert_eq!(
+            store.load(memory.hash(&2)).await.unwrap().kv(),
+            Some((2, vec![2; 3 * KB]))
+        );
+        assert_eq!(store.load(memory.hash(&3)).await.unwrap().kv(), None);
     }
 
     #[test_log::test(tokio::test)]

@@ -295,7 +295,14 @@ where
         &self.inner.spawner
     }
 
+    /// Wait for disk recovery to finish and return any recovery error.
+    pub async fn wait_recovery(&self) -> Result<()> {
+        self.inner.engine.wait_recovery().await
+    }
+
     /// Wait for the ongoing flush and reclaim tasks to finish.
+    ///
+    /// Recovery errors are logged and ignored. Use [`Store::wait_recovery`] to observe them.
     pub async fn wait(&self) {
         self.inner.engine.wait().await
     }
